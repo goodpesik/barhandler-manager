@@ -174,9 +174,18 @@ async def print_lines(
 
 
 class KitchenItem(BaseModel):
+    """One physical item that needs cooking. Each row prints as its own
+    self-contained block with position number, name+measurement, table
+    and guest — so the kitchen can detach individual items if multiple
+    cooks are working the same order."""
+
     name: str
     qty: int = 1
     note: Optional[str] = None
+    position: Optional[int] = None
+    measurement: Optional[str] = None
+    table: Optional[str] = None
+    guest: Optional[str] = None
 
 
 class KitchenTicket(BaseModel):
@@ -193,30 +202,57 @@ async def print_kitchen(
     request: Request,
     printer_id: Optional[str] = Query(default=None),
 ):
-    """Kitchen ticket — large item names, no totals, no fiscal block.
+    """Kitchen ticket — one self-contained block per physical item so
+    the kitchen can clip / tear off rows. Order number is the prominent
+    header; the trailing padding is generous (10 blank lines) because
+    short tickets curl up on the rail otherwise.
+
     Defaults to the first registered printer with kind=kitchen."""
     reg, device = await _resolve_printer(request, printer_id, PrinterKind.kitchen)
     chars = reg.chars_per_line
+    sep = "=" * chars
 
     async def _job(esc):
+        # --- order header (big & bold) ---
+        esc.set(align="left", bold=False, double_height=False, double_width=False)
+        esc.text(sep + "\n")
         esc.set(align="center", bold=True, double_height=True, double_width=False)
         esc.text(f"#{payload.order_number}\n")
-        esc.set(align="left", bold=False, double_height=False)
-        if payload.table:
-            esc.text(f"Стіл: {payload.table}\n")
-        if payload.guest:
-            esc.text(f"Гість: {payload.guest}\n")
-        esc.text("-" * chars + "\n")
-        for item in payload.items:
-            esc.set(bold=True, double_height=True)
-            esc.text(f"{item.qty}x {item.name}\n")
-            esc.set(bold=False, double_height=False)
+        esc.set(align="left", bold=False, double_height=False, double_width=False)
+        esc.text(sep + "\n")
+
+        # --- one block per item ---
+        for index, item in enumerate(payload.items, start=1):
+            position = item.position if item.position is not None else index
+            esc.set(align="center", bold=False, double_height=True, double_width=False)
+            esc.text(f"{position}\n")
+            # Item name + measurement big bold left so the cook reads it
+            # from across the line.
+            esc.set(align="left", bold=True, double_height=True, double_width=False)
+            measurement = item.measurement or "--"
+            esc.text(f"{item.name} -- {measurement}\n")
+            esc.set(align="left", bold=False, double_height=False, double_width=False)
+            esc.text(sep + "\n")
+            table = item.table or payload.table or "--"
+            esc.text(f"Стіл: {table}\n")
+            esc.text(sep + "\n")
+            guest = item.guest or payload.guest or "--"
+            esc.text(f"Гість: {guest}\n")
             if item.note:
-                esc.text(f"  {item.note}\n")
+                esc.text(sep + "\n")
+                esc.text(f"Коментар: {item.note}\n")
+            # Two separators close the block — visually distinct from the
+            # single-line separators inside it.
+            esc.text(sep + "\n")
+            esc.text(sep + "\n")
+
         if payload.comment:
-            esc.text("-" * chars + "\n")
-            esc.text(payload.comment + "\n")
-        esc.text("\n\n")
+            esc.text(f"Коментар: {payload.comment}\n")
+            esc.text(sep + "\n")
+
+        # Tear-off padding — the rail clip needs ~3 cm of blank paper to
+        # hold the ticket up, otherwise a 1-item ticket curls under.
+        esc.text("\n\n\n\n\n\n\n\n\n\n")
         esc.cut()
 
     try:
