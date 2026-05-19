@@ -1,10 +1,10 @@
-"""GET /health — no auth, used by web apps to probe for the manager.
+"""GET /health — no auth, used by web apps to probe for the manager and
+to render per-printer status pills in their UI.
 
-Returns the live status of each configured device:
-- `connected`     — device responds; printing should work
-- `not_configured` — `enabled: false` in config.yaml
-- `unavailable`   — enabled but failed to connect (hardware unplugged,
-                    wrong vendor/product id, driver missing, etc.)
+For each registered printer we report:
+  - `connected`     — device is reachable
+  - `disconnected`  — registered but not currently open (lazy connect)
+  - `unavailable`   — open attempt failed (hardware unplugged / busy)
 """
 
 from fastapi import APIRouter, Request
@@ -12,25 +12,33 @@ from fastapi import APIRouter, Request
 router = APIRouter()
 
 
-def _device_status(app_state, key: str, cfg_key: str) -> str:
-    cfg = (app_state.config.get("devices") or {}).get(cfg_key) or {}
-    if not cfg.get("enabled"):
-        return "not_configured"
-    device = getattr(app_state, f"{cfg_key}_printer", None)
-    if device is None:
-        return "unavailable"
-    return "connected" if device.is_connected() else "unavailable"
-
-
 @router.get("/health")
 async def health(request: Request):
     state = request.app.state
+    registry = getattr(state, "registry", None)
+    printers = []
+    if registry is not None:
+        for reg in registry.all_registrations():
+            device = registry._devices.get(reg.descriptor.id)  # noqa: SLF001
+            if device is None:
+                status = "disconnected"
+            elif device.is_connected():
+                status = "connected"
+            else:
+                status = "unavailable"
+            printers.append({
+                "id": reg.descriptor.id,
+                "kind": reg.kind.value if hasattr(reg.kind, "value") else reg.kind,
+                "label": reg.nickname or reg.descriptor.label,
+                "transport": (
+                    reg.descriptor.transport.value
+                    if hasattr(reg.descriptor.transport, "value")
+                    else reg.descriptor.transport
+                ),
+                "status": status,
+            })
     return {
         "status": "ok",
-        "version": "0.1.0",
-        "devices": {
-            "receipt": _device_status(state, "receipt", "receipt"),
-            "label": _device_status(state, "label", "label"),
-            "terminal": _device_status(state, "terminal", "terminal"),
-        },
+        "version": "0.2.0",
+        "printers": printers,
     }

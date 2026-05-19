@@ -11,9 +11,13 @@ devices:
     enabled: true
     type: receipt
     connection: usb        # usb | network
-    # USB connection (used when connection == usb)
-    vendor_id: null        # e.g. 0x04b8 for Epson, 0x0519 for Star, find via GET /devices/scan
-    product_id: null       # e.g. 0x0202
+    # USB connection. Leave vendor_id/product_id/in_ep/out_ep null —
+    # the manager auto-detects any USB printer-class device on the bus.
+    # Set explicitly only when several printers are attached.
+    vendor_id: null
+    product_id: null
+    in_ep: null
+    out_ep: null
     # Network connection (used when connection == network)
     host: null             # e.g. "192.168.1.100"
     port: 9100             # standard raw ESC/POS port

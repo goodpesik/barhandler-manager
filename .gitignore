@@ -19,3 +19,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Runtime registry — per-machine printer assignments
+printers.json

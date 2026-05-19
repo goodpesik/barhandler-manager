@@ -129,14 +129,25 @@ class PrinterDevice:
             if not host:
                 raise ValueError("network printer requires host")
             return Network(host=host, port=port, profile=self._config.get("profile"))
-        # default USB
+
+        # USB — PrinterRegistry supplies fully-resolved vendor/product/
+        # endpoints from a discovered descriptor, so we never need to scan
+        # here. Missing values are a configuration bug, not a runtime
+        # condition.
         vendor_id = self._coerce_hex(self._config.get("vendor_id"))
         product_id = self._coerce_hex(self._config.get("product_id"))
-        if vendor_id is None or product_id is None:
-            raise ValueError("usb printer requires vendor_id and product_id (see GET /devices/scan)")
+        in_ep = self._coerce_hex(self._config.get("in_ep"))
+        out_ep = self._coerce_hex(self._config.get("out_ep"))
+        if vendor_id is None or product_id is None or in_ep is None or out_ep is None:
+            raise ValueError(
+                "usb printer requires vendor_id, product_id, in_ep and out_ep — "
+                "register the printer via POST /devices/register first"
+            )
         return Usb(
             idVendor=vendor_id,
             idProduct=product_id,
+            in_ep=in_ep,
+            out_ep=out_ep,
             profile=self._config.get("profile"),
         )
 
@@ -153,10 +164,14 @@ class PrinterDevice:
         while True:
             job, done = await self._queue.get()
             try:
-                # Set code page once per job so cyrillic prints correctly
-                # regardless of which printer firmware variant is attached.
-                with suppress(Exception):
-                    self._printer.charcode(self.code_page.upper())
+                # Let python-escpos' MagicEncode pick the right code page per
+                # character — calling `charcode()` manually disables that.
+                # If the printer keeps printing '?' for Ukrainian letters,
+                # the printer firmware lacks the required page; switch to
+                # a specific page via `code_page` config (cp866/cp1251).
+                if self._config.get("code_page"):
+                    with suppress(Exception):
+                        self._printer.magic.force_encoding(self.code_page)
                 await job(self._printer)
                 if not done.done():
                     done.set_result(None)
