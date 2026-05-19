@@ -34,8 +34,19 @@ def _registry(request: Request):
 
 @router.post("/discover")
 async def discover(request: Request) -> dict:
-    """Scan every supported transport and return the candidates."""
-    descriptors: list[PrinterDescriptor] = _registry(request).discover()
+    """Scan every supported transport and return the candidates.
+
+    Discovery blocks — zeroconf, pyusb, and the socket port-scan all
+    hold the calling thread for ~2-3 seconds. Hand it off to the
+    default executor so the FastAPI event loop stays responsive for
+    health probes from the frontend during the sweep.
+    """
+    import asyncio
+
+    registry = _registry(request)
+    descriptors: list[PrinterDescriptor] = await asyncio.to_thread(
+        registry.discover,
+    )
     return {"printers": [d.model_dump() for d in descriptors]}
 
 
