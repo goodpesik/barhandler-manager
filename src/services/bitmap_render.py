@@ -62,38 +62,48 @@ def render_line(
 ) -> Image.Image:
     """Render a single line of text as a 1-bit B&W image `width_px` wide.
 
+    The text is always rasterised at `BASE_FONT_PX` so the glyph advance
+    is constant — this matches ESC/POS semantics where `double_height`
+    multiplies pixel height but leaves the column advance unchanged, and
+    `double_width` is the column-advance multiplier. We then stretch the
+    final bitmap with PIL.resize() to apply the requested scale.
+
     Empty `text` still yields an image (a blank line at the current font
     height) so the caller can preserve line spacing.
     """
-    # `scale_width` stretches horizontally only — we render at base width
-    # and resize the final bitmap after for ESC/POS double-width semantics.
-    font_scale = scale_height
-    font = _font(bold=bold, scale=font_scale)
+    font = _font(bold=bold, scale=1.0)
     ascent, descent = font.getmetrics()
     line_h = ascent + descent + padding_y * 2
 
     if not text:
-        return Image.new("1", (width_px, line_h), 1)
-
-    # Render onto an oversized canvas to measure, then crop to width_px.
-    text_w, _ = measure(text, bold=bold, scale=font_scale)
-    canvas = Image.new("1", (max(width_px, text_w + 4), line_h), 1)
-    draw = ImageDraw.Draw(canvas)
-
-    if align == "right":
-        x = max(0, width_px - text_w)
-    elif align == "center":
-        x = max(0, (width_px - text_w) // 2)
+        canvas = Image.new("1", (width_px, line_h), 1)
     else:
-        x = 0
-    draw.text((x, padding_y), text, font=font, fill=0)
+        text_w, _ = measure(text, bold=bold, scale=1.0)
+        canvas = Image.new("1", (max(width_px, text_w + 4), line_h), 1)
+        draw = ImageDraw.Draw(canvas)
+        if align == "right":
+            x = max(0, width_px - text_w)
+        elif align == "center":
+            x = max(0, (width_px - text_w) // 2)
+        else:
+            x = 0
+        draw.text((x, padding_y), text, font=font, fill=0)
+        canvas = canvas.crop((0, 0, width_px, line_h))
 
-    # Hard-clip to printer's pixel width — long lines get truncated.
-    out = canvas.crop((0, 0, width_px, line_h))
+    # Apply double-height as a pure vertical stretch — glyphs grow taller
+    # but the column advance is unchanged, so a full-width 32-char line
+    # still fits exactly on 58mm paper at double-height.
+    if scale_height != 1.0:
+        canvas = canvas.resize((canvas.width, max(1, int(canvas.height * scale_height))))
+    # Double-width: horizontal stretch. The caller is responsible for
+    # supplying a short-enough layout because doubling 32 chars overflows
+    # the paper width — we crop instead of scaling glyphs sideways.
     if scale_width != 1.0:
-        new_w = width_px
-        out = out.resize((new_w, line_h))  # placeholder: ESC/POS handles double-width via state
-    return out
+        new_w = max(1, int(canvas.width * scale_width))
+        canvas = canvas.resize((new_w, canvas.height))
+        if canvas.width > width_px:
+            canvas = canvas.crop((0, 0, width_px, canvas.height))
+    return canvas
 
 
 def render_paragraph(

@@ -37,7 +37,11 @@ printed by Vchasno Kasa). We try to match that layout as closely as a
 
 from __future__ import annotations
 
+import qrcode
+from PIL import Image
+
 from src.models.fiscal_receipt import FiscalReceipt, FiscalReceiptItem
+from src.services.bitmap_render import dots_for, image_to_gs_v_0
 
 
 def _format_money(value: float) -> str:
@@ -52,14 +56,11 @@ def _two_col(left: str, right: str, width: int) -> str:
     return f"{left:<{left_budget}} {right:>{right_len}}"
 
 
-def _center(text: str, width: int) -> str:
-    if len(text) >= width:
-        return text
-    pad = (width - len(text)) // 2
-    return " " * pad + text
-
-
-def _wrap_centered(text: str, width: int) -> list[str]:
+def _wrap_lines(text: str, width: int) -> list[str]:
+    """Word-wrap text into rows ≤ `width` columns. Caller handles
+    centering via `printer.set(align="center")` — we never pad with
+    spaces because the bitmap renderer would then center the padded
+    string and the line would drift further right."""
     words = text.split()
     lines: list[str] = []
     current = ""
@@ -73,7 +74,7 @@ def _wrap_centered(text: str, width: int) -> list[str]:
             current = word
     if current:
         lines.append(current)
-    return [_center(line, width) for line in lines]
+    return lines
 
 
 def _separator(width: int, char: str = "-") -> str:
@@ -103,17 +104,18 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
     width = chars_per_line
 
     # ---- Header banner ----
-    printer.set(align="center", bold=True, double_height=True, double_width=False)
-    printer.text("*" * (width // 2) + "\n")
-    printer.text(receipt.receipt_type + "\n")
-    printer.text("*" * (width // 2) + "\n")
     printer.set(align="center", bold=True, double_height=False, double_width=False)
+    printer.text("*" * width + "\n")
+    printer.set(align="center", bold=True, double_height=True, double_width=False)
+    printer.text(receipt.receipt_type + "\n")
+    printer.set(align="center", bold=True, double_height=False, double_width=False)
+    printer.text("*" * width + "\n")
     if receipt.business_name:
-        for line in _wrap_centered(receipt.business_name, width):
+        for line in _wrap_lines(receipt.business_name, width):
             printer.text(line + "\n")
     printer.set(align="center", bold=False)
     for text in filter(None, (receipt.point_name, receipt.address, receipt.tax_id)):
-        for line in _wrap_centered(text, width):
+        for line in _wrap_lines(text, width):
             printer.text(line + "\n")
 
     # ---- Establishment (venue header) ----
@@ -151,7 +153,7 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
     # ---- Total — emphasised ----
     printer.text(_separator(width) + "\n")
     printer.set(bold=True, double_height=True, double_width=False)
-    printer.text(_two_col("СУМА", _format_money(receipt.total_sum), width // 2) + "\n")
+    printer.text(_two_col("СУМА", _format_money(receipt.total_sum), width) + "\n")
     printer.set(bold=False, double_height=False, double_width=False)
 
     # ---- Tax breakdown ----
@@ -171,7 +173,7 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
     if receipt.footer:
         printer.text(_separator(width) + "\n")
         printer.set(align="center")
-        for line in _wrap_centered(receipt.footer, width):
+        for line in _wrap_lines(receipt.footer, width):
             printer.text(line + "\n")
         printer.set(align="left")
 
@@ -186,13 +188,22 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
     # ---- QR code ----
     if receipt.qr_url:
         printer.text("\n")
-        printer.set(align="center")
-        try:
-            printer.qr(receipt.qr_url, size=8)
-        except Exception:
-            # Some firmware variants don't accept QR commands — degrade gracefully.
-            printer.text(receipt.qr_url + "\n")
-        printer.set(align="left")
+        # Render the QR through PIL + the bitmap pipeline so it lands on the
+        # paper centred regardless of the current alignment command — the
+        # native printer.qr() bypasses our bitmap patch and was always
+        # left-justified on this hardware.
+        paper_w = 576 if width >= 48 else 384
+        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=2)
+        qr.add_data(receipt.qr_url)
+        qr.make(fit=True)
+        qr_img = qr.make_image(fill_color="black", back_color="white").convert("1")
+        if qr_img.width > paper_w:
+            scale = paper_w / qr_img.width
+            qr_img = qr_img.resize((paper_w, int(qr_img.height * scale)))
+        canvas = Image.new("1", (paper_w, qr_img.height), 1)
+        canvas.paste(qr_img, ((paper_w - qr_img.width) // 2, 0))
+        printer._raw(image_to_gs_v_0(canvas))
+        printer._raw(b"\n")
 
     # ---- Pos footer ----
     printer.text(_separator(width) + "\n")
