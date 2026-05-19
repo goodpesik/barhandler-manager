@@ -72,7 +72,8 @@ class PrinterRegistration(BaseModel):
     kind: PrinterKind = PrinterKind.receipt
     nickname: Optional[str] = None         # e.g. "Бар-чек" / "Кухня"
     paper_width: int = 58                  # mm: 58 (32 chars) or 80 (48 chars)
-    code_page: Optional[str] = None        # "cp866" / "cp1251" / None for auto
+    render_mode: str = "bitmap"            # "bitmap" (default) | "native"
+    code_page: Optional[str] = None        # only used when render_mode=native
     drawer_pin: Optional[int] = 0          # 0 / 1 / None to disable
 
     @property
@@ -88,6 +89,7 @@ class RegistrationRequest(BaseModel):
     kind: PrinterKind = PrinterKind.receipt
     nickname: Optional[str] = None
     paper_width: int = 58
+    render_mode: str = "bitmap"
     code_page: Optional[str] = None
     drawer_pin: Optional[int] = 0
 

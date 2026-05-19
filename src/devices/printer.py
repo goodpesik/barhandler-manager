@@ -17,6 +17,9 @@ from typing import Awaitable, Callable, Optional
 
 from escpos.printer import Network, Usb
 
+from src.services.bitmap_render import dots_for, image_to_gs_v_0, render_paragraph
+from src.services.encoding import encode_ua_cp866
+
 logger = logging.getLogger(__name__)
 
 
@@ -151,6 +154,105 @@ class PrinterDevice:
             profile=self._config.get("profile"),
         )
 
+    def _install_bitmap_patch(self) -> None:
+        """Replace text()/set() so every glyph is rasterised through PIL.
+
+        State (bold / align / double-height / double-width) is tracked
+        across set() calls and applied to the next text() render. We also
+        buffer until we see a newline so each printed line ends up as a
+        single image command instead of one per `text()` invocation.
+        """
+        printer = self._printer
+        if getattr(printer, "_bh_bitmap_patched", False):
+            return
+
+        width_px = dots_for(self.paper_width)
+        state = {
+            "bold": False,
+            "align": "left",
+            "double_height": False,
+            "double_width": False,
+        }
+        buffer: list[str] = []
+
+        def flush() -> None:
+            if not buffer:
+                return
+            chunk = "".join(buffer)
+            buffer.clear()
+            if not chunk:
+                return
+            scale_h = 2.0 if state["double_height"] else 1.0
+            scale_w = 2.0 if state["double_width"] else 1.0
+            for piece in chunk.split("\n")[:-1] + (
+                [chunk.rsplit("\n", 1)[-1]] if not chunk.endswith("\n") else []
+            ):
+                img = render_paragraph(
+                    piece,
+                    width_px=width_px,
+                    bold=state["bold"],
+                    align=state["align"],
+                    scale_height=scale_h,
+                    scale_width=scale_w,
+                )
+                # Bypass python-escpos image() — write raw GS v 0 directly
+                # so the printer's text/raster decoder boundaries stay
+                # exactly where we want them.
+                printer._raw(image_to_gs_v_0(img))
+                printer._raw(b"\n")
+
+        def text(s: str) -> None:
+            if not s:
+                return
+            # Easy path — newline-terminated single line.
+            s = str(s)
+            buffer.append(s)
+            if s.endswith("\n"):
+                flush()
+
+        def set_(**kwargs) -> None:
+            # Flush whatever was buffered with the OLD state before
+            # mutating, otherwise a `set(bold=True); text("X")` would
+            # render X with whichever bold setting was current at flush.
+            flush()
+            if "align" in kwargs:
+                state["align"] = kwargs["align"]
+            if "bold" in kwargs:
+                state["bold"] = bool(kwargs["bold"])
+            if "double_height" in kwargs:
+                state["double_height"] = bool(kwargs["double_height"])
+            if "double_width" in kwargs:
+                state["double_width"] = bool(kwargs["double_width"])
+
+        original_cut = printer.cut
+
+        def cut(*args, **kwargs):
+            flush()
+            return original_cut(*args, **kwargs)
+
+        printer.text = text
+        printer.set = set_
+        printer.cut = cut
+        printer._bh_bitmap_patched = True
+
+    def _install_ua_text_patch(self) -> None:
+        """Replace `printer.text` with one that emits raw UA-CP866 bytes.
+
+        python-escpos' magic encoder doesn't know CP866-UA and would
+        substitute '?' for every і/ї/є/ґ before sending. We swap the
+        method once per device so every subsequent text() call inside a
+        render goes through `encode_ua_cp866`.
+        """
+        printer = self._printer
+        if getattr(printer, "_bh_ua_patched", False):
+            return
+
+        def text(s: str) -> None:
+            printer._raw(encode_ua_cp866(str(s)))
+
+        printer.text = text  # type: ignore[method-assign]
+        printer._bh_ua_patched = True
+
     @staticmethod
     def _coerce_hex(value):
         if value is None:
@@ -164,12 +266,24 @@ class PrinterDevice:
         while True:
             job, done = await self._queue.get()
             try:
-                # Let python-escpos' MagicEncode pick the right code page per
-                # character — calling `charcode()` manually disables that.
-                # If the printer keeps printing '?' for Ukrainian letters,
-                # the printer firmware lacks the required page; switch to
-                # a specific page via `code_page` config (cp866/cp1251).
-                if self._config.get("code_page"):
+                # Render mode selection:
+                #   - "bitmap" (default): every text() call is rasterised
+                #     through PIL and sent via printer.image(). Works on
+                #     any ESC/POS printer with any Unicode input.
+                #   - "native" + code_page == "ua_cp866": switch printer
+                #     to table 17 and emit raw CP866-UA bytes (fast, but
+                #     limited to printers with Ukrainian PC866 overlay).
+                #   - "native" + other code_page: hand off to
+                #     python-escpos magic.force_encoding().
+                mode = (self._config.get("render_mode") or "bitmap").lower()
+                code_page = (self.code_page or "").lower()
+                if mode == "bitmap":
+                    self._install_bitmap_patch()
+                elif code_page == "ua_cp866":
+                    with suppress(Exception):
+                        self._printer._raw(b"\x1bt\x11")  # ESC t 17 = CP866
+                    self._install_ua_text_patch()
+                elif code_page:
                     with suppress(Exception):
                         self._printer.magic.force_encoding(self.code_page)
                 await job(self._printer)

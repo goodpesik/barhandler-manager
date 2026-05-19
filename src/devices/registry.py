@@ -109,6 +109,7 @@ class PrinterRegistry:
             kind=req.kind,
             nickname=req.nickname,
             paper_width=req.paper_width,
+            render_mode=req.render_mode,
             code_page=req.code_page,
             drawer_pin=req.drawer_pin,
         )
@@ -157,6 +158,7 @@ class PrinterRegistry:
         cfg: dict = {
             "enabled": True,
             "paper_width": reg.paper_width,
+            "render_mode": reg.render_mode,
             "code_page": reg.code_page,
             "drawer_pin": reg.drawer_pin,
         }

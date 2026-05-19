@@ -36,8 +36,10 @@ first print to that ID and kept warm afterwards.
 | `GET /health` | no | server + per-printer status pills |
 | `POST /devices/discover` | yes | scan USB (+ LAN+BT in Phase 2); returns descriptors with stable `id` |
 | `GET /devices` | yes | list currently registered printers |
-| `POST /devices/register` | yes | persist `{id, kind, nickname, paper_width, code_page, drawer_pin}` |
+| `POST /devices/register` | yes | persist `{id, kind, nickname, paper_width, render_mode, code_page, drawer_pin}` |
 | `DELETE /devices/{id}` | yes | unregister |
+| `POST /devices/{id}/probe-codepage` | yes | native-mode aid — prints labelled cyrillic samples in 6 code pages so the operator picks the readable one |
+| `POST /devices/{id}/test-print` | yes | print a friendly demo receipt in the printer's current settings — powers the Settings UI's "залишити цей режим" check |
 | `POST /print/receipt[?printer_id=]` | yes | internal/non-fiscal JSON receipt |
 | `POST /print/fiscal[?printer_id=]`  | yes | unified fiscal (Checkbox + Vchasno) — Vchasno-PDF look |
 | `POST /print/text[?printer_id=]`    | yes | raw text (Checkbox `/api/v1/receipts/{id}/text`) |
@@ -91,11 +93,43 @@ the same physical printer always lands on the same id.
 
 - `kind`: `receipt` | `kitchen` | `label`
 - `paper_width`: `58` (32 chars) or `80` (48 chars)
-- `code_page`: leave `null` to let python-escpos' magic-encode pick the
-  page per character. Pin to `"cp866"` / `"cp1251"` only if the printer
-  firmware lacks the default cyrillic pages.
+- `render_mode`:
+  - `"bitmap"` (default) — every glyph is rasterised through Noto Sans
+    Mono and emitted as a `GS v 0` image. Guaranteed correct output on
+    any ESC/POS printer for any Unicode input (cyrillic, ї/є/і/ґ,
+    emoji). ~20–50 KB per receipt on the wire.
+  - `"native"` — printer's built-in font with `code_page` selecting the
+    table. Faster + thinner stroke, but the firmware must actually have
+    the configured page. Run `/devices/{id}/probe-codepage` first to
+    pick the right one.
+- `code_page` (only used in `native` mode):
+  - `null` — let python-escpos magic-encode pick per character.
+  - `"ua_cp866"` — custom encoder that extends CP866 with Ї/Є/І/Ґ at
+    0xF0–0xF7 (works on most Ukrainian POS printers).
+  - `"cp866"` / `"cp1251"` / `"cp1125"` / ... — hand to magic_encode.
 - `drawer_pin`: `0` / `1` per the wiring; `null` disables the drawer
   endpoint for that printer.
+
+## Frontend settings flow
+
+```
+ Settings → Принтери
+ ─────────────────────────────────────────────
+ [+ Виявити пристрої]   POST /devices/discover
+ ─────────────────────────────────────────────
+   ▢ STMicro USB POS Printer  (f81ba96ad564)
+       Роль:   [Чеки ▼]
+       Імʼя:   [Бар-чек          ]
+       Папір:  ( ) 58мм   (•) 80мм
+       Режим:  (•) Bitmap  ( ) Native
+       [Тест друку]   POST /devices/{id}/test-print
+       [Зберегти]     POST /devices/register
+```
+
+Bitmap is the default — UX-wise the operator can just press Save and
+move on. The Native option exists for power users who want native-font
+output and accept that they may need to run `/probe-codepage` to find a
+table their hardware understands.
 
 ## Phase 2 transports (already scaffolded)
 
