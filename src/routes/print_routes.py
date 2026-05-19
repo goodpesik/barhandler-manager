@@ -11,7 +11,7 @@ Connections are opened lazily by PrinterRegistry and reused across prints.
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from src.devices.printer import PrinterUnavailable
 from src.devices.registry import UnknownPrinter
@@ -111,7 +111,58 @@ async def print_text(
 
     async def _job(esc):
         esc.set(align="left", bold=False, double_height=False, double_width=False)
+        esc.text("\n\n")  # leading padding so the printer's cutter doesn't shave the header
         esc.text(payload.text.rstrip() + "\n\n\n")
+        esc.cut()
+        _maybe_open_drawer(esc, reg, payload.open_drawer)
+
+    try:
+        await device.enqueue(_job)
+    except PrinterUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {"status": "printed", "printer_id": reg.descriptor.id}
+
+
+class FormattedLine(BaseModel):
+    text: str = ""
+    align: str = "left"  # "left" | "center" | "right"
+    bold: bool = False
+    double_height: bool = False
+    double_width: bool = False
+
+
+class LinesPayload(BaseModel):
+    """Structured-line variant of /print/text — caller hands us per-line
+    formatting (bold / align / double_*) instead of pre-formatted ASCII.
+
+    Useful when the frontend wants to emphasise a header (#0003, СУМА)
+    or centre a block without manually padding spaces."""
+
+    lines: list[FormattedLine] = Field(default_factory=list)
+    open_drawer: bool = False
+
+
+@router.post("/lines")
+async def print_lines(
+    payload: LinesPayload,
+    request: Request,
+    printer_id: Optional[str] = Query(default=None),
+):
+    reg, device = await _resolve_printer(request, printer_id, PrinterKind.receipt)
+
+    async def _job(esc):
+        esc.set(align="left", bold=False, double_height=False, double_width=False)
+        esc.text("\n\n")  # leading padding — same rationale as /text
+        for line in payload.lines:
+            esc.set(
+                align=line.align,
+                bold=line.bold,
+                double_height=line.double_height,
+                double_width=line.double_width,
+            )
+            esc.text((line.text or "") + "\n")
+        esc.set(align="left", bold=False, double_height=False, double_width=False)
+        esc.text("\n\n\n")
         esc.cut()
         _maybe_open_drawer(esc, reg, payload.open_drawer)
 
