@@ -1,0 +1,22 @@
+server:
+  port: 9999
+  api_key: "change-me"
+
+devices:
+  receipt:
+    enabled: true
+    type: receipt
+    connection: usb
+    vendor_id: null   # e.g. 0x04b8 for Epson
+    product_id: null  # e.g. 0x0202
+    paper_width: 80   # mm: 58 or 80
+
+  label:
+    enabled: false
+    type: label
+    connection: usb
+    vendor_id: null
+    product_id: null
+    protocol: tspl    # tspl or zpl
+    label_width: 40   # mm
+    label_height: 30  # mm
