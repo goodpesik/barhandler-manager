@@ -1,0 +1,41 @@
+{
+  "receipt_type": "ФІСКАЛЬНИЙ ЧЕК",
+  "business_name": "ФОП ЛЕВИНЕЦЬ МАКСИМ СЕРГІЙОВИЧ",
+  "point_name": "Кафе Ромашка",
+  "address": "м. Львів, Площа Ринок, 1",
+  "tax_id": "ІД 3179210933",
+  "establishment": "BarHandler — Тестовий заклад",
+  "items": [
+    {
+      "name": "Деруни",
+      "quantity": 2,
+      "price": 100.00,
+      "sum": 200.00,
+      "tax_symbol": "А",
+      "uktzed": "1905"
+    },
+    {
+      "name": "Реберця",
+      "quantity": 1,
+      "price": 300.00,
+      "sum": 300.00,
+      "tax_symbol": "А",
+      "uktzed": "0203"
+    }
+  ],
+  "payment_name": "Готівка",
+  "operation": "Оплата",
+  "paid_sum": 500.00,
+  "total_sum": 500.00,
+  "taxes": [
+    { "name": "ПДВ", "symbol": "А", "rate": 20, "value": 83.33 }
+  ],
+  "fiscal_number": "DA9F7K35WB6Z",
+  "fiscal_date": "2026-05-19T14:32:11",
+  "pos_fiscal_number": "4000123456789012",
+  "cashier": "Super Admin",
+  "online_mode": true,
+  "footer": "ДЯКУЄМО ЗА ПОКУПКУ",
+  "qr_url": "https://check.checkbox.ua/DA9F7K35WB6Z",
+  "operator": "checkbox"
+}

@@ -2,21 +2,39 @@ server:
   port: 9999
   api_key: "change-me"
 
+# All devices below speak generic ESC/POS — any printer compatible with
+# the protocol works (tested with E 582 R 58mm thermal printer, but Epson,
+# Star, Citizen, Bixolon and most generic Chinese ESC/POS printers should
+# work the same way). Just point vendor_id/product_id at your hardware.
 devices:
   receipt:
     enabled: true
     type: receipt
-    connection: usb
-    vendor_id: null   # e.g. 0x04b8 for Epson
-    product_id: null  # e.g. 0x0202
-    paper_width: 80   # mm: 58 or 80
+    connection: usb        # usb | network
+    # USB connection (used when connection == usb)
+    vendor_id: null        # e.g. 0x04b8 for Epson, 0x0519 for Star, find via GET /devices/scan
+    product_id: null       # e.g. 0x0202
+    # Network connection (used when connection == network)
+    host: null             # e.g. "192.168.1.100"
+    port: 9100             # standard raw ESC/POS port
+    # Paper + encoding
+    paper_width: 58        # mm: 58 (32 chars/line) or 80 (48 chars/line)
+    code_page: "cp866"     # cyrillic encoding; some printers want "cp1251" or "utf-8"
+    # Cash drawer connector on the printer (sends DLE DC4 pulse). Set
+    # `pin: 0` (or 1) to match wiring; null disables drawer endpoint.
+    drawer_pin: 0
 
   label:
-    enabled: false
+    enabled: false         # Phase 2
     type: label
     connection: usb
     vendor_id: null
     product_id: null
-    protocol: tspl    # tspl or zpl
-    label_width: 40   # mm
-    label_height: 30  # mm
+    protocol: tspl         # tspl | zpl
+    label_width: 40        # mm
+    label_height: 30       # mm
+
+  terminal:
+    enabled: false         # Phase 2 — Monobank acquiring, Ethernet
+    host: null
+    port: null

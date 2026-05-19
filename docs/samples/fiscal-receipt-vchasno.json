@@ -1,0 +1,36 @@
+{
+  "receipt_type": "ТЕСТОВИЙ ЧЕК",
+  "business_name": "ФОП ЛЕВИНЕЦЬ МАКСИМ СЕРГІЙОВИЧ",
+  "point_name": "Тестова торгова точка",
+  "address": "Україна, м.Київ, вул. Хрещатик, 99",
+  "tax_id": "ІД 3179210933",
+  "establishment": "Тестовий заклад\nУКРАЇНА, М.ЛЬВІВ ГАЛИЦЬКИЙ Р-Н, Площа Ринок, 1",
+  "items": [
+    {
+      "name": "Бурбон 50",
+      "quantity": 1,
+      "price": 263.00,
+      "sum": 263.00,
+      "tax_symbol": "Ж",
+      "uktzed": "12345"
+    }
+  ],
+  "payment_name": "Безготівкова",
+  "operation": "Оплата",
+  "paid_sum": 263.00,
+  "total_sum": 263.00,
+  "taxes": [
+    { "name": "Без ПДВ + акциз", "symbol": "Ж", "rate": 5, "value": 0.00 },
+    { "name": "Акцизний податок",  "symbol": "Ж", "rate": 5, "value": 12.52 }
+  ],
+  "acquirer": {
+    "paysys": "Картка"
+  },
+  "fiscal_number": "TEST_e5rHVICc6weYAQ",
+  "fiscal_date": "2026-04-21T09:15:42",
+  "pos_fiscal_number": "9999993179210933",
+  "online_mode": true,
+  "footer": "ДЯКУЄМО ЗА ПОКУПКУ",
+  "qr_url": "https://kasa.vchasno.com.ua/check/TEST_e5rHVICc6weYAQ",
+  "operator": "vchasno_kasa"
+}
