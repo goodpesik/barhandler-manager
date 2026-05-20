@@ -13,6 +13,7 @@ from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 
+from src.constants import DEFAULT_API_KEY
 from src.devices.registry import PrinterRegistry
 from src.routes import devices, drawer, health, print_routes, terminal
 
@@ -22,7 +23,10 @@ API_KEY_HEADER = APIKeyHeader(name="X-Api-Key", auto_error=False)
 
 
 def create_app(config: dict) -> FastAPI:
-    api_key = config["server"]["api_key"]
+    # The handshake key is the embedded constant — `config.yaml` may
+    # override it for shops running multiple isolated POS apps on one
+    # host, but the default ships with every install.
+    api_key = config["server"].get("api_key") or DEFAULT_API_KEY
     registry_path = Path(config["server"].get("registry_path", "printers.json"))
     registry = PrinterRegistry(path=registry_path)
 

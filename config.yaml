@@ -1,6 +1,9 @@
 server:
   port: 9999
-  api_key: "change-me"
+  # api_key is the shared constant from src/constants.py — uncomment
+  # and set a custom value only if you're running multiple isolated
+  # POS apps on the same host and need them to use different keys.
+  # api_key: "..."
 
 # All devices below speak generic ESC/POS — any printer compatible with
 # the protocol works (tested with E 582 R 58mm thermal printer, but Epson,

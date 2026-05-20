@@ -171,8 +171,8 @@ case "$PLATFORM" in
     <key>WorkingDirectory</key><string>${INSTALL_DIR}</string>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>${INSTALL_DIR}/bhm.log</string>
-    <key>StandardErrorPath</key><string>${INSTALL_DIR}/bhm.log</string>
+    <key>StandardOutPath</key><string>${INSTALL_DIR}/bhm.boot.log</string>
+    <key>StandardErrorPath</key><string>${INSTALL_DIR}/bhm.boot.log</string>
 </dict>
 </plist>
 EOF
@@ -193,8 +193,8 @@ User=${USER}
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/.venv/bin/python ${INSTALL_DIR}/main.py
 Restart=on-failure
-StandardOutput=append:${INSTALL_DIR}/bhm.log
-StandardError=append:${INSTALL_DIR}/bhm.log
+StandardOutput=append:${INSTALL_DIR}/bhm.boot.log
+StandardError=append:${INSTALL_DIR}/bhm.boot.log
 
 [Install]
 WantedBy=multi-user.target
