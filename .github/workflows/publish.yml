@@ -81,7 +81,13 @@ jobs:
             RANGE="${PREV_TAG}..HEAD"
           fi
           {
-            echo "## Changes"
+            # If CHANGELOG.md has an [Unreleased] section, surface that
+            # first — it's the human-curated story of the release.
+            if [ -f CHANGELOG.md ] && grep -q '## \[Unreleased\]' CHANGELOG.md; then
+              awk '/^## \[Unreleased\]/{flag=1;next} /^## \[/{flag=0} flag' CHANGELOG.md
+              echo
+            fi
+            echo "## Commits"
             git log "$RANGE" --pretty=format:'- %s (%h)' --no-merges
             echo
             echo
