@@ -1,0 +1,124 @@
+# Release pipeline.
+#
+# `production` is release-only; every push to it (typically a merge
+# from `main` via PR) cuts a new GitHub Release with the source
+# tarball, source zip, and the three installers as downloadable
+# assets — that's what install.sh / install.ps1 fetch from the
+# /releases/latest/download/ path.
+#
+# Version comes from VERSION at the repo root. Bump it in the PR
+# that lands the release; CI tags the commit with v<X.Y.Z> after
+# publishing.
+
+name: publish
+
+on:
+  push:
+    branches: [production]
+
+permissions:
+  contents: write  # create releases + push tags
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history so we can read prior tags + commit messages
+
+      - name: Read version
+        id: version
+        run: |
+          if [ ! -f VERSION ]; then
+            echo "::error::VERSION file missing — bump it in the PR before merging"
+            exit 1
+          fi
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          if [ -z "$VERSION" ]; then
+            echo "::error::VERSION file is empty"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION"    >> "$GITHUB_OUTPUT"
+
+      - name: Check tag is fresh
+        run: |
+          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "::error::tag v${{ steps.version.outputs.version }} already exists — bump VERSION"
+            exit 1
+          fi
+
+      - name: Build source archives
+        run: |
+          mkdir -p dist
+          VERSION="${{ steps.version.outputs.version }}"
+          tar --exclude='./dist' \
+              --exclude='./.git' \
+              --exclude='./.venv' \
+              --exclude='./__pycache__' \
+              --exclude='*.pyc' \
+              --exclude='./printers.json' \
+              --exclude='./terminals.json' \
+              -czf "dist/barhandler-manager-${VERSION}.tar.gz" .
+          zip -rq "dist/barhandler-manager-${VERSION}.zip" . \
+              -x 'dist/*' '.git/*' '.venv/*' '*.pyc' '__pycache__/*' \
+              'printers.json' 'terminals.json'
+
+      - name: Stage installers as named assets
+        run: |
+          cp installers/install.sh         dist/install.sh
+          cp installers/install-android.sh dist/install-android.sh
+          cp installers/install.ps1        dist/install.ps1
+          chmod +x dist/install.sh dist/install-android.sh
+
+      - name: Generate release notes
+        run: |
+          PREV_TAG=$(git tag --sort=-creatordate | head -n1)
+          if [ -z "$PREV_TAG" ]; then
+            RANGE=HEAD
+          else
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+          {
+            echo "## Changes"
+            git log "$RANGE" --pretty=format:'- %s (%h)' --no-merges
+            echo
+            echo
+            echo "## Install"
+            echo
+            echo "**macOS / Linux / Raspberry Pi**"
+            echo '```bash'
+            echo "curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.sh | bash"
+            echo '```'
+            echo
+            echo "**Windows**"
+            echo '```powershell'
+            echo "irm https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.ps1 | iex"
+            echo '```'
+            echo
+            echo "**Android (Termux)**"
+            echo '```bash'
+            echo "curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install-android.sh | bash"
+            echo '```'
+          } > dist/notes.md
+
+      - name: Tag the commit
+        run: |
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body_path: dist/notes.md
+          draft: false
+          prerelease: false
+          files: |
+            dist/barhandler-manager-${{ steps.version.outputs.version }}.tar.gz
+            dist/barhandler-manager-${{ steps.version.outputs.version }}.zip
+            dist/install.sh
+            dist/install-android.sh
+            dist/install.ps1
