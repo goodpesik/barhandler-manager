@@ -71,7 +71,12 @@ async def print_receipt(
     try:
         await device.enqueue(_job)
     except PrinterUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        # Surface the structured code so the frontend can switch on it
+        # ("out_of_paper" → "Закінчився папір", "cover_open" → "Закрийте кришку").
+        raise HTTPException(
+            status_code=503,
+            detail={"code": getattr(exc, "code", "unavailable"), "message": str(exc)},
+        )
     return {"status": "printed", "printer_id": reg.descriptor.id}
 
 
@@ -91,7 +96,12 @@ async def print_fiscal(
     try:
         await device.enqueue(_job)
     except PrinterUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        # Surface the structured code so the frontend can switch on it
+        # ("out_of_paper" → "Закінчився папір", "cover_open" → "Закрийте кришку").
+        raise HTTPException(
+            status_code=503,
+            detail={"code": getattr(exc, "code", "unavailable"), "message": str(exc)},
+        )
     return {"status": "printed", "printer_id": reg.descriptor.id}
 
 
@@ -119,7 +129,12 @@ async def print_text(
     try:
         await device.enqueue(_job)
     except PrinterUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        # Surface the structured code so the frontend can switch on it
+        # ("out_of_paper" → "Закінчився папір", "cover_open" → "Закрийте кришку").
+        raise HTTPException(
+            status_code=503,
+            detail={"code": getattr(exc, "code", "unavailable"), "message": str(exc)},
+        )
     return {"status": "printed", "printer_id": reg.descriptor.id}
 
 
@@ -169,7 +184,12 @@ async def print_lines(
     try:
         await device.enqueue(_job)
     except PrinterUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        # Surface the structured code so the frontend can switch on it
+        # ("out_of_paper" → "Закінчився папір", "cover_open" → "Закрийте кришку").
+        raise HTTPException(
+            status_code=503,
+            detail={"code": getattr(exc, "code", "unavailable"), "message": str(exc)},
+        )
     return {"status": "printed", "printer_id": reg.descriptor.id}
 
 
@@ -258,5 +278,10 @@ async def print_kitchen(
     try:
         await device.enqueue(_job)
     except PrinterUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
+        # Surface the structured code so the frontend can switch on it
+        # ("out_of_paper" → "Закінчився папір", "cover_open" → "Закрийте кришку").
+        raise HTTPException(
+            status_code=503,
+            detail={"code": getattr(exc, "code", "unavailable"), "message": str(exc)},
+        )
     return {"status": "printed", "printer_id": reg.descriptor.id}

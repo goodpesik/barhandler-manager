@@ -24,7 +24,18 @@ logger = logging.getLogger(__name__)
 
 
 class PrinterUnavailable(RuntimeError):
-    """Raised when a print job is attempted but the printer is offline."""
+    """Raised when a print job is attempted but the printer is offline.
+
+    `code` carries a stable identifier the frontend can branch on
+    (e.g. `out_of_paper`) so the operator gets a specific message
+    instead of a generic "printer error" toast. `code` defaults to
+    `unavailable` when the underlying cause isn't a query-able state
+    (USB disconnected mid-print, manager itself died, etc).
+    """
+
+    def __init__(self, message: str, code: str = "unavailable") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class PrinterDevice:
@@ -63,6 +74,34 @@ class PrinterDevice:
 
     def is_connected(self) -> bool:
         return self._printer is not None
+
+    def check_status(self) -> dict:
+        """Best-effort real-time status query (ESC/POS DLE EOT n series).
+
+        Cheap ESC/POS clones often ignore the status command — when they
+        do, python-escpos returns an empty buffer and reports "paper OK
+        / online" by default. That's a lying answer but the only one we
+        can give, so we surface `supported: false` for the caller that
+        wants to differentiate "actively healthy" from "didn't answer".
+
+        Worker calls this before every job; if the printer truthfully
+        reports `out_of_paper` we fail fast with a code the frontend can
+        show ("Закінчився папір") instead of letting the print silently
+        produce a blank ribbon.
+        """
+        if not self.is_connected():
+            return {"online": False, "paper": "unknown", "supported": False}
+        try:
+            paper_raw = self._printer.paper_status()  # 0=empty, 1=low, 2=ok
+            online = self._printer.is_online()
+        except Exception as exc:  # noqa: BLE001 — vendor-specific exceptions vary
+            logger.debug("[%s] status query failed: %s", self.name, exc)
+            return {"online": True, "paper": "unknown", "supported": False}
+        return {
+            "online": bool(online),
+            "paper": {0: "empty", 1: "low", 2: "ok"}.get(paper_raw, "unknown"),
+            "supported": True,
+        }
 
     async def connect(self) -> bool:
         """Try to open the device. Returns True on success, False otherwise.
@@ -266,6 +305,27 @@ class PrinterDevice:
         while True:
             job, done = await self._queue.get()
             try:
+                # Pre-flight status — bail out before sending bytes so a
+                # paper-empty printer doesn't swallow an entire receipt
+                # silently. The check is best-effort: cheap clones just
+                # don't answer the status query and we proceed normally
+                # (the operator hears the printer click and notices).
+                status = self.check_status()
+                if status["supported"]:
+                    if status["paper"] == "empty":
+                        raise PrinterUnavailable(
+                            f"{self.name}: paper is out", code="out_of_paper",
+                        )
+                    if not status["online"]:
+                        # Most printers raise this when the cover is open
+                        # or the head is parked; we can't tell the two
+                        # apart from real-time status alone, but
+                        # "cover_open" is the more actionable hint.
+                        raise PrinterUnavailable(
+                            f"{self.name}: not online (cover or head)",
+                            code="cover_open",
+                        )
+
                 # Render mode selection:
                 #   - "bitmap" (default): every text() call is rasterised
                 #     through PIL and sent via printer.image(). Works on
