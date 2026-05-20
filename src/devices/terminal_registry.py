@@ -22,6 +22,7 @@ from src.models.terminal import (
     TerminalRegistrationRequest,
 )
 from src.services.terminals.base import TerminalAdapter
+from src.services.terminals.privatbank import PrivatBankTerminalAdapter
 from src.services.terminals.ssi import SSITerminalAdapter
 
 logger = logging.getLogger(__name__)
@@ -33,12 +34,20 @@ class UnknownTerminal(Exception):
     """Raised when a route asks for a terminal id we don't know."""
 
 
-# All SSI-protocol banks share the same adapter implementation today.
-# Adding a vendor with a different wire format = new class + an entry
-# here; route layer is unaffected.
+# Adapter selection is per-bank because wire formats diverge:
+#   - SSI ECR JSON (TCP 3000, STX+LEN+LRC framing) — Mono, Raif,
+#     Pivdenny, generic_ssi. PrivatBank also licenses SSI's middleware
+#     on some legacy units, but PB merchants moving to JSON should use
+#     the privat_pos adapter below; "Privat over SSI" stays available
+#     via generic_ssi if anyone needs it.
+#   - PrivatBank ECR JSON (TCP 2000, 0x00-terminated framing) — modern
+#     Ingenico/PAX/NEWLAND with JSON firmware. Different wire format,
+#     own param vocabulary (decimal-comma amount, int step).
+# Adding a new vendor with a different wire format = new class + an
+# entry here; route layer is unaffected.
 _ADAPTER_FOR_KIND: Dict[TerminalKind, Type[TerminalAdapter]] = {
     TerminalKind.mono_pos: SSITerminalAdapter,
-    TerminalKind.privat_pos: SSITerminalAdapter,
+    TerminalKind.privat_pos: PrivatBankTerminalAdapter,
     TerminalKind.raif_pos: SSITerminalAdapter,
     TerminalKind.pivdenny_pos: SSITerminalAdapter,
     TerminalKind.generic_ssi: SSITerminalAdapter,

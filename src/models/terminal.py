@@ -144,6 +144,14 @@ class AcquirerResult(BaseModel):
     error_code: Optional[str] = None  # E00-E22 if non-ok
     error_message: Optional[str] = None
     error_details: Optional[str] = None
+    # PrivatBank embedded-fiscal fields. Populated from Purchase response's
+    # `adv` field (host advert 63.29) when the merchant has activated "Каса"
+    # bank-side; absent for SSI / for PrivatBank merchants without "Каса".
+    # `fiscal_receipt_id` → Національний е-чек ID (ДПС). Surface this in
+    # Reports so the operator can cross-reference in Приват24.
+    fiscal_receipt_id: Optional[str] = None  # adv.natr — ДПС fiscal
+    bank_receipt_id: Optional[int] = None    # adv.rid — bank е-чек
+    fiscal_receipt_text: Optional[str] = None  # GetReceiptInfo.receipt — printable text
     vendor_data: dict = Field(default_factory=dict)  # full GetLastResult.params
 
 

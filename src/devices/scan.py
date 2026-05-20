@@ -258,52 +258,64 @@ def discover_network() -> list[PrinterDescriptor]:
 
 
 SSI_TCP_PORT = 3000  # SSI ECR JSON framed-TCP transport (doc §1.1)
+PB_TCP_PORT = 2000   # PrivatBank ECR JSON direct-terminal port (spec §1)
 
 
 def discover_network_terminals(
     timeout: float = 0.3,
     probe_timeout: float = 2.0,
 ) -> list:
-    """LAN scan for SSI-protocol POS terminals.
+    """LAN scan for SSI- and PrivatBank-protocol POS terminals.
 
-    Two-phase to keep the round-trip count low: fast TCP connect on
-    port 3000 across the host's /24 → only on hosts that accept the
-    connect do we spend the heavier SSI `PingDevice` probe (which
-    speaks the framed protocol and waits for a reply). The probe is
-    what tells a real SSI terminal apart from "something listening on
-    3000" (mDNS responder, a developer box running a service, etc).
+    Two-phase per port: fast TCP connect across the host's /24, then a
+    protocol-specific probe (SSI framed PingDevice on 3000, PB null-
+    terminated PingDevice on 2000) on hosts that accepted the connect.
+    Same probe shape, different adapters — the bank-specific handshake
+    is what tells a real terminal apart from "something listening on
+    that port" (a dev server, mDNS responder, etc).
+
+    A single host can in theory respond on both ports — unlikely in
+    practice but we'd surface two descriptors and let the operator
+    pick the right one.
     """
+    from src.services.terminals.privatbank import PrivatBankTerminalAdapter
     from src.services.terminals.ssi import SSITerminalAdapter
 
     subnet = _local_subnet()
     if subnet is None:
         return []
-    candidates: list[str] = []
     hosts = [str(h) for h in subnet.hosts()]
+    ssi_hosts: list[str] = []
+    pb_hosts: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
-        future_to_host = {
-            pool.submit(_probe_tcp, host, SSI_TCP_PORT, timeout): host
-            for host in hosts
-        }
-        for future in concurrent.futures.as_completed(future_to_host):
-            host = future_to_host[future]
+        future_map: dict = {}
+        for host in hosts:
+            future_map[pool.submit(_probe_tcp, host, SSI_TCP_PORT, timeout)] = (host, "ssi")
+            future_map[pool.submit(_probe_tcp, host, PB_TCP_PORT, timeout)] = (host, "pb")
+        for future in concurrent.futures.as_completed(future_map):
+            host, kind = future_map[future]
             try:
-                if future.result():
-                    candidates.append(host)
+                if not future.result():
+                    continue
             except Exception:  # noqa: BLE001
                 continue
+            (ssi_hosts if kind == "ssi" else pb_hosts).append(host)
 
-    if not candidates:
+    if not ssi_hosts and not pb_hosts:
         return []
 
-    # Probe is async (asyncio.open_connection) so we run the small
-    # batch sequentially on a fresh event loop — keeps the function
-    # callable from both sync (FastAPI startup) and async (route via
-    # asyncio.to_thread) contexts without nested-loop trouble.
+    # Probes are async (asyncio.open_connection). Run them sequentially
+    # on a fresh event loop — keeps the function callable from both
+    # sync (FastAPI startup) and async (route via asyncio.to_thread)
+    # contexts without nested-loop trouble.
     async def _probe_all() -> list:
         out: list = []
-        for host in candidates:
+        for host in ssi_hosts:
             descriptor = await SSITerminalAdapter.probe(host, SSI_TCP_PORT)
+            if descriptor is not None:
+                out.append(descriptor)
+        for host in pb_hosts:
+            descriptor = await PrivatBankTerminalAdapter.probe(host, PB_TCP_PORT)
             if descriptor is not None:
                 out.append(descriptor)
         return out
