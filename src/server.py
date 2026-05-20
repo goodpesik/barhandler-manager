@@ -15,6 +15,7 @@ from fastapi.security.api_key import APIKeyHeader
 
 from src.constants import DEFAULT_API_KEY
 from src.devices.registry import PrinterRegistry
+from src.devices.terminal_registry import TerminalRegistry
 from src.routes import devices, drawer, health, print_routes, terminal
 
 logger = logging.getLogger(__name__)
@@ -29,12 +30,18 @@ def create_app(config: dict) -> FastAPI:
     api_key = config["server"].get("api_key") or DEFAULT_API_KEY
     registry_path = Path(config["server"].get("registry_path", "printers.json"))
     registry = PrinterRegistry(path=registry_path)
+    terminal_registry_path = Path(
+        config["server"].get("terminal_registry_path", "terminals.json"),
+    )
+    terminal_registry = TerminalRegistry(path=terminal_registry_path)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.config = config
         app.state.registry = registry
+        app.state.terminal_registry = terminal_registry
         registry.load()
+        terminal_registry.load()
         yield
         await registry.disconnect_all()
 

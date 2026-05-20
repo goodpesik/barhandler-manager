@@ -34,11 +34,18 @@ def tmp_registry(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def config(tmp_registry: Path) -> dict:
+def tmp_terminal_registry(tmp_path: Path) -> Path:
+    """Isolated `terminals.json` per test."""
+    return tmp_path / "terminals.json"
+
+
+@pytest.fixture
+def config(tmp_registry: Path, tmp_terminal_registry: Path) -> dict:
     return {
         "server": {
             "port": 9999,
             "registry_path": str(tmp_registry),
+            "terminal_registry_path": str(tmp_terminal_registry),
         },
     }
 

@@ -229,28 +229,223 @@ class SSITerminalAdapter(TerminalAdapter):
             network=TerminalNetworkAddress(host=host, port=port),
         )
 
-    # The remaining adapter methods (ping/get_info/list_merchants/charge/
-    # cancel/get_last_result) land in commit 2 to keep this PR review-able.
+    # ----- adapter methods --------------------------------------------
 
-    async def ping(self) -> bool:  # pragma: no cover — implemented in commit 2
-        raise NotImplementedError
+    def _addr(self) -> tuple[str, int]:
+        net = self.descriptor.network
+        if net is None:
+            raise TerminalUnavailable(
+                f"terminal {self.descriptor.id} has no network address",
+                code="not_configured",
+            )
+        return net.host, net.port
 
-    async def get_info(self) -> dict:  # pragma: no cover
-        raise NotImplementedError
+    async def _send(self, message: dict, timeout: float = REQUEST_TIMEOUT_S) -> dict:
+        host, port = self._addr()
+        return await send_tcp(host, port, message, timeout=timeout)
 
-    async def list_merchants(self) -> list[MerchantInfo]:  # pragma: no cover
-        raise NotImplementedError
+    async def ping(self) -> bool:
+        """Quick liveness — never raises."""
+        try:
+            response = await self._send({"method": "PingDevice"}, timeout=3.0)
+        except TerminalUnavailable:
+            return False
+        return isinstance(response, dict) and response.get("error") is False
 
-    async def charge(self, request: ChargeRequest) -> AcquirerResult:  # pragma: no cover
-        raise NotImplementedError
+    async def get_info(self) -> dict:
+        """Full GetTerminalInfo. Caller deals with the Android/Linux
+        shape divergence by checking for `terminalModel` vs `model`."""
+        response = await self._send({"method": "GetTerminalInfo"}, timeout=5.0)
+        _raise_if_error(response)
+        return response.get("params") or {}
 
-    async def cancel(self) -> None:  # pragma: no cover
-        raise NotImplementedError
+    async def list_merchants(self) -> list[MerchantInfo]:
+        """GetMerchantListDetailed — single-merchant terminals return
+        a one-element list which the frontend renders as a disabled
+        select."""
+        response = await self._send({"method": "GetMerchantListDetailed"}, timeout=5.0)
+        _raise_if_error(response)
+        merchants_raw = (response.get("params") or {}).get("merchantList") or []
+        out: list[MerchantInfo] = []
+        for entry in merchants_raw:
+            if not isinstance(entry, dict):
+                continue
+            out.append(
+                MerchantInfo(
+                    merchant_id=str(entry.get("merchantId") or ""),
+                    terminal_id=entry.get("terminalId"),
+                    merchant_name=entry.get("merchantName"),
+                ),
+            )
+        return out
+
+    async def charge(self, request: ChargeRequest) -> AcquirerResult:
+        """End-to-end Purchase flow per doc §3.1:
+
+            1. send Purchase, terminal acks {error: false}
+            2. poll GetStatus until terminal returns to S00 or S08
+            3. fetch final outcome via GetLastResult (or GetResultByUid
+               when we have an external uid)
+
+        Times out after STATUS_POLL_MAX_S (3 minutes) and Interrupts —
+        a runaway transaction never blocks the manager event loop.
+        """
+        merchant_id = (
+            request.merchant_id
+            or self.registration.default_merchant_id
+            or ""
+        )
+        if not merchant_id:
+            raise TerminalUnavailable(
+                "no merchant_id provided and registration has no default",
+                code="missing_merchant",
+            )
+
+        params: dict = {
+            "transAmount": str(request.amount_kopecks),
+            "transCurrency": request.currency,
+            "merchantId": merchant_id,
+        }
+        if request.transaction_uid:
+            params["transactionUid"] = request.transaction_uid
+        if request.discounted_amount_kopecks is not None:
+            params["discountedAmount"] = str(request.discounted_amount_kopecks)
+        if self.registration.default_terminal_id:
+            params["terminalId"] = self.registration.default_terminal_id
+        for k, v in request.extras.items():
+            params.setdefault(k, v)
+
+        ack = await self._send(
+            {"method": "Purchase", "step": "1", "params": params},
+        )
+        _raise_if_error(ack, default_code="charge_rejected")
+
+        # The terminal is now busy. Poll status, interrupting after the
+        # overall window so a stalled cashier interaction can't block
+        # the event loop indefinitely.
+        await self._wait_idle()
+
+        return await self.get_last_result(
+            transaction_uid=request.transaction_uid,
+        )
+
+    async def _wait_idle(self) -> None:
+        """Poll GetStatus until S00 / S08 (idle for next op). Honours
+        the protocol's ≥0.25s inter-request pause and the doc's 15s
+        per-request timeout; gives up after STATUS_POLL_MAX_S and tries
+        an Interrupt so we don't leave the terminal locked."""
+        deadline = asyncio.get_running_loop().time() + STATUS_POLL_MAX_S
+        while True:
+            await asyncio.sleep(INTER_REQUEST_PAUSE_S)
+            status_response = await self._send({"method": "GetStatus"}, timeout=5.0)
+            status = (
+                status_response.get("status")
+                or (status_response.get("params") or {}).get("status")
+            )
+            if status in _IDLE_STATUSES:
+                return
+            if asyncio.get_running_loop().time() > deadline:
+                # Best-effort cancel and surface as timeout — the
+                # caller maps this onto a "cancelled" AcquirerResult.
+                with _suppress(TerminalUnavailable):
+                    await self._send({"method": "Interrupt"}, timeout=3.0)
+                raise TerminalUnavailable(
+                    f"terminal stayed busy >{STATUS_POLL_MAX_S}s "
+                    f"(last status: {status})",
+                    code="timeout",
+                )
+            await asyncio.sleep(STATUS_POLL_INTERVAL_S - INTER_REQUEST_PAUSE_S)
+
+    async def cancel(self) -> None:
+        """Interrupt — only effective in S02/S03/S08 per doc §5.4.2."""
+        try:
+            await self._send({"method": "Interrupt"}, timeout=3.0)
+        except TerminalUnavailable:
+            # If the terminal is unreachable or the operation already
+            # finished there's nothing actionable here; we log and let
+            # the caller decide whether to retry the surrounding flow.
+            logger.debug(
+                "[%s] cancel/Interrupt failed (likely already idle)",
+                self.descriptor.id,
+            )
 
     async def get_last_result(
         self, transaction_uid: Optional[str] = None,
-    ) -> AcquirerResult:  # pragma: no cover
-        raise NotImplementedError
+    ) -> AcquirerResult:
+        """Fetch the final outcome of the most recent operation. Uses
+        GetResultByUid when the caller has a transaction_uid (more
+        precise — survives a second operation between the failure and
+        the recovery call); otherwise GetLastResult."""
+        if transaction_uid:
+            request: dict = {
+                "method": "GetResultByUid",
+                "params": {"transactionUid": transaction_uid},
+            }
+        else:
+            request = {"method": "GetLastResult"}
+        response = await self._send(request, timeout=5.0)
+        _raise_if_error(response, default_code="result_fetch_failed")
+        return _result_from_params(response.get("params") or {})
+
+
+def _raise_if_error(response: dict, *, default_code: str = "error") -> None:
+    """Standard SSI error envelope handling — convert any `error: true`
+    response into TerminalUnavailable with the SSI code as `.code`."""
+    if not isinstance(response, dict):
+        raise TerminalUnavailable(
+            f"unexpected response shape: {type(response).__name__}",
+            code="protocol_error",
+        )
+    if response.get("error"):
+        code = (response.get("errorCode") or default_code).lower()
+        message = (
+            response.get("errorDescription")
+            or response.get("errorCode")
+            or "terminal returned error"
+        )
+        raise TerminalUnavailable(message, code=code)
+
+
+def _result_from_params(params: dict) -> AcquirerResult:
+    """Map SSI GetLastResult / GetResultByUid params onto the unified
+    AcquirerResult shape. Unknown enum values pass through verbatim in
+    `raw_transaction_result` so we don't lose information."""
+    raw = (params.get("transactionResult") or "").upper().replace("-", "_")
+    if raw in _OK_RESULTS:
+        status = "ok"
+    elif raw in _CANCELLED_RESULTS:
+        status = "cancelled"
+    else:
+        status = "declined"
+    return AcquirerResult(
+        status=status,
+        transaction_uid=params.get("transactionUid"),
+        rrn=params.get("rrn"),
+        auth_code=params.get("authCode"),
+        cardmask=params.get("pan"),
+        paysys=params.get("binName"),
+        bank_name=params.get("bankName"),
+        terminal_id=params.get("terminalId"),
+        pos_entry_mode=params.get("posEntryMode"),
+        invoice_num=params.get("invoiceNum"),
+        response_code=params.get("responseCode"),
+        raw_transaction_result=raw or None,
+        error_code=params.get("errorCode") or None,
+        error_message=params.get("errorDescription") or None,
+        error_details=params.get("errorDetails") or None,
+        vendor_data=params,
+    )
+
+
+class _suppress:  # tiny stand-in for contextlib.suppress in async land
+    def __init__(self, *exc_types):
+        self._exc_types = exc_types
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return exc_type is not None and issubclass(exc_type, self._exc_types)
 
 
 def _kind_from_package(package_name: str) -> Optional[TerminalKind]:

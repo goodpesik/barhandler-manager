@@ -1,0 +1,156 @@
+"""Persistent POS terminal registry.
+
+Parallels `PrinterRegistry` — same shape, separate file (`terminals.json`
+next to `printers.json`). Concrete adapter is instantiated lazily on
+each access; SSI is request/response per call so we don't hold sockets
+between charges. The mapping `TerminalKind → TerminalAdapter class` is
+maintained here so the route layer never imports a specific vendor.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+from typing import Dict, Type
+
+from src.models.terminal import (
+    TerminalDescriptor,
+    TerminalKind,
+    TerminalRegistration,
+    TerminalRegistrationRequest,
+)
+from src.services.terminals.base import TerminalAdapter
+from src.services.terminals.ssi import SSITerminalAdapter
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_PATH = Path("terminals.json")
+
+
+class UnknownTerminal(Exception):
+    """Raised when a route asks for a terminal id we don't know."""
+
+
+# All SSI-protocol banks share the same adapter implementation today.
+# Adding a vendor with a different wire format = new class + an entry
+# here; route layer is unaffected.
+_ADAPTER_FOR_KIND: Dict[TerminalKind, Type[TerminalAdapter]] = {
+    TerminalKind.mono_pos: SSITerminalAdapter,
+    TerminalKind.privat_pos: SSITerminalAdapter,
+    TerminalKind.raif_pos: SSITerminalAdapter,
+    TerminalKind.pivdenny_pos: SSITerminalAdapter,
+    TerminalKind.generic_ssi: SSITerminalAdapter,
+}
+
+
+class TerminalRegistry:
+    """In-memory map of registered terminals, backed by a JSON file.
+
+    Discovery results are cached in `_last_discovery` between
+    `/terminal/discover` and `/terminal/register` so the frontend
+    doesn't have to round-trip the full descriptor — same trick as
+    PrinterRegistry.
+    """
+
+    def __init__(self, path: Path = DEFAULT_PATH) -> None:
+        self.path = path
+        self._registrations: Dict[str, TerminalRegistration] = {}
+        self._last_discovery: Dict[str, TerminalDescriptor] = {}
+
+    # ---------- persistence ----------
+
+    def load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            raw = json.loads(self.path.read_text())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("terminals.json unreadable: %s", exc)
+            return
+        for entry in raw.get("terminals", []):
+            try:
+                reg = TerminalRegistration.model_validate(entry)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("skipping bad terminal registration: %s", exc)
+                continue
+            self._registrations[reg.descriptor.id] = reg
+        logger.info("loaded %d registered terminals", len(self._registrations))
+
+    def save(self) -> None:
+        payload = {
+            "terminals": [r.model_dump() for r in self._registrations.values()],
+        }
+        self.path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+
+    # ---------- discovery cache ----------
+
+    def remember_descriptors(self, descriptors: list[TerminalDescriptor]) -> None:
+        self._last_discovery = {d.id: d for d in descriptors}
+
+    # ---------- lookups ----------
+
+    def get_registration(self, terminal_id: str) -> TerminalRegistration:
+        reg = self._registrations.get(terminal_id)
+        if reg is None:
+            raise UnknownTerminal(terminal_id)
+        return reg
+
+    def all_registrations(self) -> list[TerminalRegistration]:
+        return list(self._registrations.values())
+
+    def first(self) -> TerminalRegistration | None:
+        """Convenience for routes that take terminal_id as optional —
+        falls back to the only registered terminal."""
+        for reg in self._registrations.values():
+            return reg
+        return None
+
+    # ---------- mutations ----------
+
+    def register(self, req: TerminalRegistrationRequest) -> TerminalRegistration:
+        descriptor = self._last_discovery.get(req.id)
+        if descriptor is None:
+            # Allow re-register after a manager restart — operator can
+            # then update nickname / default merchant without redoing
+            # a full network scan.
+            existing = self._registrations.get(req.id)
+            if existing is None:
+                raise UnknownTerminal(
+                    f"{req.id}: run /terminal/discover first or provide a known id",
+                )
+            descriptor = existing.descriptor
+        reg = TerminalRegistration(
+            descriptor=descriptor,
+            kind=req.kind,
+            nickname=req.nickname,
+            default_merchant_id=req.default_merchant_id,
+            default_terminal_id=req.default_terminal_id,
+        )
+        self._registrations[descriptor.id] = reg
+        self.save()
+        return reg
+
+    def unregister(self, terminal_id: str) -> None:
+        if terminal_id not in self._registrations:
+            raise UnknownTerminal(terminal_id)
+        self._registrations.pop(terminal_id)
+        self.save()
+
+    # ---------- adapter access ----------
+
+    def adapter_for(self, terminal_id: str) -> TerminalAdapter:
+        """Instantiate the right adapter for a registered terminal.
+
+        Adapters are stateless beyond the registration, so we make a
+        fresh instance per call — keeps the hot path simple and avoids
+        any held-socket invalidation when terminals reboot / DHCP-shift.
+        """
+        registration = self.get_registration(terminal_id)
+        kind_enum = (
+            registration.kind
+            if isinstance(registration.kind, TerminalKind)
+            else TerminalKind(registration.kind)
+        )
+        adapter_cls = _ADAPTER_FOR_KIND.get(kind_enum, SSITerminalAdapter)
+        return adapter_cls(registration)

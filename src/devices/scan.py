@@ -257,6 +257,15 @@ def discover_network() -> list[PrinterDescriptor]:
     return unique
 
 
+def discover_network_terminals() -> list:
+    """Hook used by `/terminal/discover` — LAN scan for SSI-protocol
+    POS terminals on TCP 3000. Real implementation lands in commit 3;
+    until then return an empty list so the endpoint is callable
+    (tests that need terminals monkey-patch this in conftest)."""
+    logger.debug("network terminal discovery not yet implemented (commit 3)")
+    return []
+
+
 def discover_bluetooth() -> list[PrinterDescriptor]:
     """Best-effort Classic Bluetooth scrape.
 
