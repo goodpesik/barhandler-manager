@@ -5,3 +5,9 @@ python-escpos>=3.1
 pydantic>=2.0
 pyyaml>=6.0
 zeroconf>=0.131.0
+
+# Test-time only — kept in the main requirements file so the same
+# `pip install -r requirements.txt` from CI / installers picks them up.
+# httpx is also a transitive dep of FastAPI's TestClient.
+pytest>=8.0
+httpx>=0.27

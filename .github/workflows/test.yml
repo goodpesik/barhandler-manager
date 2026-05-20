@@ -1,0 +1,35 @@
+# Pytest on every push and PR. Fast — no real hardware touched; the
+# fixtures stub USB / LAN / BT discovery and the FastAPI TestClient
+# runs the app in-process.
+
+name: test
+
+on:
+  push:
+    branches: [main, production]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        # libusb is needed for pyusb to load even when discover_usb is
+        # mocked — its module-level import probes the system library.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libusb-1.0-0
+          pip install -r requirements.txt
+          pip install pytest httpx
+
+      - run: pytest tests/ -v
