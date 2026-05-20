@@ -127,7 +127,13 @@ curl -fsS --max-time 1 http://localhost:9999/health 2>/dev/null \
     && echo && echo "✓ running" \
     || echo "✗ not reachable"
 EOF
-chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/stop.sh" "$INSTALL_DIR/status.sh"
+cat > "$INSTALL_DIR/update.sh" <<EOF
+#!/data/data/com.termux/files/usr/bin/env bash
+# Re-run the Termux installer in upgrade mode.
+exec curl -fsSL https://github.com/${REPO}/releases/latest/download/install-android.sh | bash -s -- --force
+EOF
+
+chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/stop.sh" "$INSTALL_DIR/status.sh" "$INSTALL_DIR/update.sh"
 
 # --- USB note --------------------------------------------------------
 cat <<EOF
@@ -146,6 +152,7 @@ cat <<EOF
 │   ${INSTALL_DIR}/start.sh
 │   ${INSTALL_DIR}/stop.sh
 │   ${INSTALL_DIR}/status.sh
+│   ${INSTALL_DIR}/update.sh     ← fetches the latest release
 │
 │  Next steps:
 │   1. Open your POS web app

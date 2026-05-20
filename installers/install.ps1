@@ -196,14 +196,25 @@ try {
     Write-Host '✗ not reachable on http://localhost:9999' -ForegroundColor Red
 }
 "@
+$UpdatePs1 = @"
+# Pull the latest release. Equivalent to:
+#   irm https://github.com/$Repo/releases/latest/download/install.ps1 | iex
+# but with -Force so install.ps1 runs upgrade-mode without prompting.
+`$url = 'https://github.com/$Repo/releases/latest/download/install.ps1'
+`$script = Invoke-WebRequest -Uri `$url -UseBasicParsing
+Invoke-Expression "& { `$(`$script.Content) } -Force"
+"@
+
 Set-Content -Path (Join-Path $InstallDir 'start.ps1')  -Value $StartPs1
 Set-Content -Path (Join-Path $InstallDir 'stop.ps1')   -Value $StopPs1
 Set-Content -Path (Join-Path $InstallDir 'status.ps1') -Value $StatusPs1
+Set-Content -Path (Join-Path $InstallDir 'update.ps1') -Value $UpdatePs1
 
 # .cmd wrappers so double-click works without changing execution policy
 Set-Content -Path (Join-Path $InstallDir 'start.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0start.ps1`""
 Set-Content -Path (Join-Path $InstallDir 'stop.cmd')  -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0stop.ps1`""
 Set-Content -Path (Join-Path $InstallDir 'status.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0status.ps1`""
+Set-Content -Path (Join-Path $InstallDir 'update.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0update.ps1`""
 
 # --- smoke test -------------------------------------------------------
 Start-Sleep -Seconds 3
@@ -221,6 +232,7 @@ Write-Host @"
 │   $InstallDir\start.cmd
 │   $InstallDir\stop.cmd
 │   $InstallDir\status.cmd
+│   $InstallDir\update.cmd    ← fetches the latest release
 │
 │  USB driver:
 │   ESC/POS USB printers need libusb-compatible drivers on

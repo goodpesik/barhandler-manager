@@ -32,6 +32,51 @@ def _registry(request: Request):
     return request.app.state.registry
 
 
+def _discovery_warnings() -> list[dict]:
+    """Platform-specific advisories the frontend should surface as
+    "this is why discovery looked empty" hints instead of a blank list.
+
+    Most cases are about Bluetooth: classic-BT from Python is fiddly on
+    every desktop OS that isn't Linux + BlueZ, so silently returning
+    `[]` from `discover_bluetooth()` would be misleading.
+    """
+    import platform
+
+    warnings: list[dict] = []
+    system = platform.system()
+    if system == "Darwin":
+        warnings.append({
+            "code": "bluetooth_unsupported",
+            "message": (
+                "Bluetooth printer discovery isn't available on macOS — "
+                "pair the printer in System Settings and register it manually "
+                "by IP / MAC once a native wrapper ships."
+            ),
+        })
+    elif system == "Windows":
+        warnings.append({
+            "code": "bluetooth_unsupported",
+            "message": (
+                "Bluetooth printer discovery isn't available on Windows — "
+                "pair the printer in Settings → Bluetooth and use Zadig to "
+                "expose it via WinUSB if you want libusb access."
+            ),
+        })
+    elif system == "Linux":
+        # bluetoothctl might be missing on Pi minimal images; tell the
+        # operator to install it rather than wonder why nothing shows up.
+        import shutil
+        if not shutil.which("bluetoothctl"):
+            warnings.append({
+                "code": "bluetooth_unsupported",
+                "message": (
+                    "Install `bluez` (and pair the printer) to enable "
+                    "Bluetooth discovery on this host."
+                ),
+            })
+    return warnings
+
+
 @router.post("/discover")
 async def discover(request: Request) -> dict:
     """Scan every supported transport and return the candidates.
@@ -40,6 +85,10 @@ async def discover(request: Request) -> dict:
     hold the calling thread for ~2-3 seconds. Hand it off to the
     default executor so the FastAPI event loop stays responsive for
     health probes from the frontend during the sweep.
+
+    Response includes `warnings[]` for platform-specific situations
+    the operator should know about (e.g. Bluetooth discovery skipped
+    on macOS) so a blank `printers` array isn't ambiguous.
     """
     import asyncio
 
@@ -47,7 +96,10 @@ async def discover(request: Request) -> dict:
     descriptors: list[PrinterDescriptor] = await asyncio.to_thread(
         registry.discover,
     )
-    return {"printers": [d.model_dump() for d in descriptors]}
+    return {
+        "printers": [d.model_dump() for d in descriptors],
+        "warnings": _discovery_warnings(),
+    }
 
 
 @router.get("")

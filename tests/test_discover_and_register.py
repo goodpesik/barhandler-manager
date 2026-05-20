@@ -128,3 +128,29 @@ def test_register_unknown_printer_fails(
         json={"id": "deadbeef", "kind": "receipt"},
     )
     assert response.status_code == 404
+
+
+def test_discover_includes_bluetooth_warning_on_darwin(
+    client: TestClient, auth_headers: dict,
+) -> None:
+    # macOS has no userland classic-BT discovery from Python; the
+    # response must say so explicitly instead of returning an empty
+    # printers array with no explanation.
+    with patch("platform.system", return_value="Darwin"):
+        response = client.post("/devices/discover", headers=auth_headers)
+    assert response.status_code == 200
+    body = response.json()
+    codes = [w["code"] for w in body.get("warnings", [])]
+    assert "bluetooth_unsupported" in codes
+
+
+def test_discover_warnings_empty_on_supported_linux(
+    client: TestClient, auth_headers: dict,
+) -> None:
+    # Linux with bluetoothctl available is the happy path — no warnings
+    # because Bluetooth discovery is actually attempted.
+    with patch("platform.system", return_value="Linux"), \
+         patch("shutil.which", return_value="/usr/bin/bluetoothctl"):
+        response = client.post("/devices/discover", headers=auth_headers)
+    body = response.json()
+    assert body.get("warnings", []) == []

@@ -252,7 +252,18 @@ else
 fi
 EOF
 
-chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/stop.sh" "$INSTALL_DIR/status.sh"
+# update.sh: fetches the upstream installer with --force so the
+# operator doesn't have to remember the URL.
+cat > "$INSTALL_DIR/update.sh" <<EOF
+#!/usr/bin/env bash
+# Pull the latest barhandler-manager release. Re-runs install.sh in
+# upgrade mode (config.yaml / printers.json preserved, code + venv
+# refreshed). Equivalent to:
+#   curl -fsSL https://github.com/${REPO}/releases/latest/download/install.sh | bash -s -- --force
+exec curl -fsSL https://github.com/${REPO}/releases/latest/download/install.sh | bash -s -- --force
+EOF
+
+chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/stop.sh" "$INSTALL_DIR/status.sh" "$INSTALL_DIR/update.sh"
 
 # --- smoke test -------------------------------------------------------
 sleep 2
@@ -273,6 +284,7 @@ cat <<EOF
 │   ${INSTALL_DIR}/start.sh
 │   ${INSTALL_DIR}/stop.sh
 │   ${INSTALL_DIR}/status.sh
+│   ${INSTALL_DIR}/update.sh     ← fetches the latest release
 │
 │  Next steps:
 │   1. Open your POS web app
