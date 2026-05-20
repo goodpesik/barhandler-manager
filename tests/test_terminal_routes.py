@@ -167,6 +167,93 @@ def test_merchants_endpoint_returns_list(
     assert response.status_code == 200
     body = response.json()
     assert [m["merchant_id"] for m in body["merchants"]] == ["M1", "M2"]
+    # Bank-side merchantName carries through; nickname starts blank.
+    assert body["merchants"][0]["merchant_name"] == "ФОП Левинець"
+    assert body["merchants"][0]["nickname"] is None
+
+
+def test_merchants_endpoint_preserves_nicknames_across_refresh(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    """Operator names "ФОП Левинець" as "Бар"; next GET /merchants
+    (refreshing from SSI) must keep that nickname. New bank-side
+    merchant appears with no nickname; removed merchant disappears."""
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    # First poll — pure bank-side list.
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.list_merchants",
+        new=AsyncMock(return_value=[
+            MerchantInfo("M1", "T1", "ФОП Левинець"),
+            MerchantInfo("M2", "T1", "ТОВ Smile Bar"),
+        ]),
+    ):
+        client_with_terminal.get(
+            f"/terminal/{fake_terminal.id}/merchants", headers=auth_headers,
+        )
+
+    # Operator sets nicknames.
+    put_response = client_with_terminal.put(
+        f"/terminal/{fake_terminal.id}/merchants",
+        headers=auth_headers,
+        json={"merchants": [
+            {"merchant_id": "M1", "terminal_id": "T1", "nickname": "Бар", "merchant_name": "ФОП Левинець"},
+            {"merchant_id": "M2", "terminal_id": "T1", "nickname": "Тераса", "merchant_name": "ТОВ Smile Bar"},
+        ]},
+    )
+    assert put_response.status_code == 200
+
+    # Re-poll: SSI now reports M1 + a NEW M3 (M2 removed bank-side).
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.list_merchants",
+        new=AsyncMock(return_value=[
+            MerchantInfo("M1", "T1", "ФОП Левинець"),
+            MerchantInfo("M3", "T1", "ФОП Нове"),
+        ]),
+    ):
+        refreshed = client_with_terminal.get(
+            f"/terminal/{fake_terminal.id}/merchants", headers=auth_headers,
+        ).json()
+
+    by_id = {m["merchant_id"]: m for m in refreshed["merchants"]}
+    assert set(by_id) == {"M1", "M3"}
+    assert by_id["M1"]["nickname"] == "Бар"      # survived
+    assert by_id["M3"]["nickname"] is None       # new — no nickname yet
+
+
+def test_merchants_put_unknown_terminal_returns_404(
+    client_with_terminal: TestClient, auth_headers: dict,
+) -> None:
+    response = client_with_terminal.put(
+        "/terminal/never-registered/merchants",
+        headers=auth_headers,
+        json={"merchants": []},
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"]["code"] == "unknown_terminal"
+
+
+def test_register_with_initial_merchants_persists_nicknames(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    """Frontend can push the merchant list with nicknames in the
+    initial /register call — same shape as the bulk PUT. Useful for
+    single-merchant terminals where the UI never shows an editor and
+    just defaults the nickname to the bank name."""
+    client_with_terminal.post("/terminal/discover", headers=auth_headers)
+    response = client_with_terminal.post(
+        "/terminal/register",
+        headers=auth_headers,
+        json={
+            "id": fake_terminal.id,
+            "kind": "mono_pos",
+            "default_merchant_id": "M1",
+            "merchants": [
+                {"merchant_id": "M1", "terminal_id": "T1", "nickname": "Бар"},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["terminal"]["merchants"][0]["nickname"] == "Бар"
 
 
 def test_charge_endpoint_returns_acquirer_result(

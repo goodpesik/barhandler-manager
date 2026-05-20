@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Dict, Type
 
 from src.models.terminal import (
+    MerchantBinding,
     TerminalDescriptor,
     TerminalKind,
     TerminalRegistration,
@@ -110,26 +111,79 @@ class TerminalRegistry:
 
     def register(self, req: TerminalRegistrationRequest) -> TerminalRegistration:
         descriptor = self._last_discovery.get(req.id)
+        existing = self._registrations.get(req.id)
         if descriptor is None:
             # Allow re-register after a manager restart — operator can
             # then update nickname / default merchant without redoing
             # a full network scan.
-            existing = self._registrations.get(req.id)
             if existing is None:
                 raise UnknownTerminal(
                     f"{req.id}: run /terminal/discover first or provide a known id",
                 )
             descriptor = existing.descriptor
+        # Preserve operator-set nicknames across re-registration: if
+        # the caller didn't supply a fresh merchants list, keep the
+        # one we already had so nicknames don't get wiped.
+        merchants = (
+            req.merchants
+            if req.merchants is not None
+            else (existing.merchants if existing else [])
+        )
         reg = TerminalRegistration(
             descriptor=descriptor,
             kind=req.kind,
             nickname=req.nickname,
             default_merchant_id=req.default_merchant_id,
             default_terminal_id=req.default_terminal_id,
+            merchants=merchants,
         )
         self._registrations[descriptor.id] = reg
         self.save()
         return reg
+
+    def update_merchants(
+        self, terminal_id: str, merchants: list[MerchantBinding],
+    ) -> TerminalRegistration:
+        """Replace the merchant binding list — used by the Settings UI
+        after the operator fills in nicknames."""
+        reg = self.get_registration(terminal_id)
+        reg.merchants = merchants
+        self.save()
+        return reg
+
+    def merge_merchant_list(
+        self,
+        terminal_id: str,
+        fresh: list[MerchantBinding],
+    ) -> list[MerchantBinding]:
+        """Refresh the bank-side merchant list while keeping nicknames.
+
+        Called from `GET /terminal/{id}/merchants` so the SSI roster
+        stays current (a new merchant added bank-side appears here)
+        but the operator's nicknames survive. Match is by
+        merchant_id+terminal_id pair; unmatched stored entries are
+        dropped (merchant removed bank-side).
+        """
+        reg = self._registrations.get(terminal_id)
+        nickname_index: dict[tuple[str, str], str] = {}
+        if reg is not None:
+            for m in reg.merchants:
+                key = (m.merchant_id, m.terminal_id or "")
+                if m.nickname:
+                    nickname_index[key] = m.nickname
+        merged: list[MerchantBinding] = []
+        for m in fresh:
+            key = (m.merchant_id, m.terminal_id or "")
+            merged.append(MerchantBinding(
+                merchant_id=m.merchant_id,
+                terminal_id=m.terminal_id,
+                merchant_name=m.merchant_name,
+                nickname=nickname_index.get(key) or m.nickname,
+            ))
+        if reg is not None:
+            reg.merchants = merged
+            self.save()
+        return merged
 
     def unregister(self, terminal_id: str) -> None:
         if terminal_id not in self._registrations:

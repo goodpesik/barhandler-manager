@@ -20,6 +20,8 @@ from fastapi import APIRouter, HTTPException, Request
 from src.devices.terminal_registry import TerminalRegistry, UnknownTerminal
 from src.models.terminal import (
     ChargeRequest,
+    MerchantBinding,
+    MerchantNicknameUpdate,
     TerminalRegistrationRequest,
 )
 from src.services.terminals.base import TerminalUnavailable
@@ -151,14 +153,55 @@ async def info(terminal_id: str, request: Request) -> dict:
 
 @router.get("/{terminal_id}/merchants")
 async def list_merchants(terminal_id: str, request: Request) -> dict:
+    """Live merchant roster from the terminal, merged with operator-
+    set nicknames the registry has remembered. New bank-side merchants
+    show up here on the next reload; removed ones disappear; nicknames
+    survive both."""
     adapter, _ = _resolve(request, terminal_id)
     try:
         merchants = await adapter.list_merchants()
     except TerminalUnavailable as exc:
         raise _surface_terminal_error(exc)
+    fresh = [
+        MerchantBinding(
+            merchant_id=m.merchant_id,
+            terminal_id=m.terminal_id,
+            merchant_name=m.merchant_name,
+        )
+        for m in merchants
+    ]
+    registry = _registry(request)
+    try:
+        merged = registry.merge_merchant_list(terminal_id, fresh)
+    except UnknownTerminal:
+        # Caller asked for merchants on an un-registered terminal —
+        # still return the live list (useful during the discover/
+        # register flow, when the UI peeks before persisting).
+        merged = fresh
     return {
         "terminal_id": terminal_id,
-        "merchants": [m.to_dict() for m in merchants],
+        "merchants": [m.model_dump() for m in merged],
+    }
+
+
+@router.put("/{terminal_id}/merchants")
+async def update_merchants(
+    terminal_id: str, payload: MerchantNicknameUpdate, request: Request,
+) -> dict:
+    """Bulk-update merchant nicknames. The Settings UI sends the full
+    list (operator may rename multiple at once); we replace what's
+    stored. Nicknames are what the cashier sees in the merchant
+    select at payment time."""
+    try:
+        reg = _registry(request).update_merchants(terminal_id, payload.merchants)
+    except UnknownTerminal as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "unknown_terminal", "message": str(exc)},
+        )
+    return {
+        "terminal_id": terminal_id,
+        "merchants": [m.model_dump() for m in reg.merchants],
     }
 
 

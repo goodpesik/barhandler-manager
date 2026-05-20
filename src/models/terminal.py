@@ -62,6 +62,24 @@ class TerminalDescriptor(BaseModel):
     network: Optional[TerminalNetworkAddress] = None
 
 
+class MerchantBinding(BaseModel):
+    """Operator-named binding to one SSI merchantId/terminalId pair.
+
+    A single physical POS terminal can host several merchants (a
+    restaurant ФОП + a takeaway-window ФОП on the same device — both
+    legal in Ukraine). The terminal returns them via
+    `GetMerchantListDetailed` with bank-side names that are usually
+    legal-entity boilerplate; the operator overrides those with a
+    short nickname ("Бар", "Тераса") that's actually pickable at the
+    cash drawer.
+    """
+
+    merchant_id: str
+    terminal_id: Optional[str] = None  # SSI multi-merchant-multi-terminal case
+    nickname: Optional[str] = None     # operator override; falls back to
+    merchant_name: Optional[str] = None  # the bank-side name (from SSI)
+
+
 class TerminalRegistration(BaseModel):
     """Operator-saved binding: descriptor + per-merchant defaults."""
 
@@ -70,6 +88,11 @@ class TerminalRegistration(BaseModel):
     nickname: Optional[str] = None  # "Каса 1" / "Бар"
     default_merchant_id: Optional[str] = None  # picked from GetMerchantListDetailed
     default_terminal_id: Optional[str] = None  # multi-merchant-multi-terminal case
+    merchants: list[MerchantBinding] = Field(default_factory=list)
+    # ^ Snapshot of what's on the terminal at registration time, with
+    # operator-set nicknames preserved across reboots. The route layer
+    # refreshes this on every /merchants call so the bank-side names
+    # stay current, but nicknames are sticky.
 
 
 class TerminalRegistrationRequest(BaseModel):
@@ -80,6 +103,14 @@ class TerminalRegistrationRequest(BaseModel):
     nickname: Optional[str] = None
     default_merchant_id: Optional[str] = None
     default_terminal_id: Optional[str] = None
+    merchants: Optional[list[MerchantBinding]] = None
+
+
+class MerchantNicknameUpdate(BaseModel):
+    """Body for PUT /terminal/{id}/merchants. Operator submits the full
+    list — server merges nicknames in by merchant_id+terminal_id."""
+
+    merchants: list[MerchantBinding]
 
 
 class ChargeRequest(BaseModel):

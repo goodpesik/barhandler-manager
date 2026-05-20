@@ -14,6 +14,7 @@ import pytest
 
 from src.devices.terminal_registry import TerminalRegistry, UnknownTerminal
 from src.models.terminal import (
+    MerchantBinding,
     TerminalDescriptor,
     TerminalKind,
     TerminalNetworkAddress,
@@ -126,6 +127,86 @@ def test_adapter_for_unknown_id_raises(tmp_path: Path) -> None:
     registry = TerminalRegistry(path=tmp_path / "terminals.json")
     with pytest.raises(UnknownTerminal):
         registry.adapter_for("nope")
+
+
+def test_update_merchants_replaces_list(tmp_path: Path) -> None:
+    """Settings UI sends the full list — registry replaces, doesn't merge."""
+    registry = TerminalRegistry(path=tmp_path / "terminals.json")
+    registry.remember_descriptors([_descriptor()])
+    registry.register(TerminalRegistrationRequest(id="abc123"))
+
+    reg = registry.update_merchants("abc123", [
+        MerchantBinding(merchant_id="M1", terminal_id="T1", nickname="Бар"),
+    ])
+    assert len(reg.merchants) == 1
+    assert reg.merchants[0].nickname == "Бар"
+
+    # Reload from disk — nicknames persist.
+    reload = TerminalRegistry(path=tmp_path / "terminals.json")
+    reload.load()
+    assert reload.get_registration("abc123").merchants[0].nickname == "Бар"
+
+
+def test_merge_merchant_list_preserves_nicknames(tmp_path: Path) -> None:
+    """Bank-side roster changes; operator-set nicknames stick to their
+    merchant_id+terminal_id pair across refreshes."""
+    registry = TerminalRegistry(path=tmp_path / "terminals.json")
+    registry.remember_descriptors([_descriptor()])
+    registry.register(TerminalRegistrationRequest(id="abc123"))
+    registry.update_merchants("abc123", [
+        MerchantBinding(merchant_id="M1", terminal_id="T1", nickname="Бар"),
+        MerchantBinding(merchant_id="M2", terminal_id="T1", nickname="Тераса"),
+    ])
+
+    # SSI now reports M1 (unchanged) + new M3; M2 is gone.
+    merged = registry.merge_merchant_list("abc123", [
+        MerchantBinding(merchant_id="M1", terminal_id="T1", merchant_name="ФОП Л"),
+        MerchantBinding(merchant_id="M3", terminal_id="T1", merchant_name="ФОП Нове"),
+    ])
+
+    by_id = {m.merchant_id: m for m in merged}
+    assert by_id["M1"].nickname == "Бар"           # kept
+    assert by_id["M1"].merchant_name == "ФОП Л"    # refreshed bank-side name
+    assert by_id["M3"].nickname is None             # new — no nickname
+    assert "M2" not in by_id                        # removed bank-side
+
+
+def test_merge_merchant_list_for_unregistered_returns_fresh(tmp_path: Path) -> None:
+    """Calling on an unregistered terminal must not raise — returns
+    whatever the live SSI list gave us (used during discover/register
+    preview flow)."""
+    registry = TerminalRegistry(path=tmp_path / "terminals.json")
+    fresh = [MerchantBinding(merchant_id="M1", merchant_name="X")]
+    out = registry.merge_merchant_list("ghost", fresh)
+    assert out == fresh
+
+
+def test_register_with_initial_merchants(tmp_path: Path) -> None:
+    """Single-merchant terminals — UI never shows the editor and just
+    pushes the nickname through the initial /register call."""
+    registry = TerminalRegistry(path=tmp_path / "terminals.json")
+    registry.remember_descriptors([_descriptor()])
+    reg = registry.register(TerminalRegistrationRequest(
+        id="abc123",
+        merchants=[MerchantBinding(merchant_id="M1", nickname="Каса")],
+    ))
+    assert reg.merchants[0].nickname == "Каса"
+
+
+def test_re_register_preserves_merchants_when_omitted(tmp_path: Path) -> None:
+    """Re-registering to change nickname/default must not blow away
+    the merchant list silently."""
+    registry = TerminalRegistry(path=tmp_path / "terminals.json")
+    registry.remember_descriptors([_descriptor()])
+    registry.register(TerminalRegistrationRequest(
+        id="abc123",
+        merchants=[MerchantBinding(merchant_id="M1", nickname="Бар")],
+    ))
+    reg = registry.register(TerminalRegistrationRequest(
+        id="abc123", nickname="Каса 1",  # only changing terminal nickname
+    ))
+    assert reg.nickname == "Каса 1"
+    assert reg.merchants[0].nickname == "Бар"  # untouched
 
 
 def test_first_returns_only_registered_terminal(tmp_path: Path) -> None:
