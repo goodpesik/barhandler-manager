@@ -30,6 +30,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libusb-1.0-0
           pip install -r requirements.txt
-          pip install pytest httpx
+          # Belt-and-braces: requirements.txt already pins these, but keep
+          # the explicit install so a future cleanup of requirements doesn't
+          # silently disarm CI.
+          pip install pytest pytest-asyncio httpx
 
       - run: pytest tests/ -v
