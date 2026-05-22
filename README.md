@@ -1,5 +1,198 @@
 # barhandler-manager
 
+> 🇺🇦 **Українською нижче** / **[English below](#english)**
+
+---
+
+## Українська
+
+Локальний HTTP-шлюз, який дозволяє веб-касі (BarHandler, FitStudio або
+будь-якій іншій, що вміє JSON over HTTP) керувати термопринтером,
+грошовою скринькою або POS-терміналом, фізично підключеними до тієї ж
+машини. Працює на `localhost:9999`.
+
+Браузер сам по собі не має доступу до USB / serial — менеджер стоїть
+посередині: веб-додаток шле запит на друк/оплату → менеджер говорить з
+обладнанням → повертає результат. Один невеликий Python-сервіс на
+касовій машині обслуговує все підключене залізо.
+
+### Що вміє зараз
+
+- **Друк чеків** — фіскальний (стиль Вчасно), нефіскальний, рахунок
+  для гостя перед оплатою, кухонна квитанція. Форматування по рядках
+  (жирний, по центру, подвійна висота) — щоб око касира одразу
+  чіплялося за номер замовлення / СУМА.
+- **Кирилиця, яка реально друкується** — кожен рядок растеризується
+  через Noto Sans Mono і відсилається як `GS v 0` raster image. Працює
+  на будь-якому ESC/POS принтері незалежно від того, які code pages
+  підтримує його прошивка.
+- **Грошова скринька** — імпульс на drawer-kick роз’єм принтера після
+  продажу (опційно).
+- **Виявлення пристроїв** — `POST /devices/discover` знаходить USB
+  принтерного класу, mDNS-броузить IPP / `_pdl-datastream`, port-scan
+  по власному /24 для raw-9100. Bluetooth — best-effort на Linux
+  (`bluetoothctl`); спершу спаруйте принтер в ОС, тоді він з’явиться.
+- **POS-термінали** — повна підтримка Monobank (SSI ECR JSON) і
+  ПриватБанк (PB ECR JSON). Discover у LAN на портах 3000 (SSI) та
+  2000 (PrivatBank), реєстрація, мультимерчантні термінали з
+  псевдонімами, проведення оплат, парсинг фіскальних ID для
+  ПриватБанку з активованою "Касою". Деталі: `docs/INTEGRATION-SPEC.md`.
+
+### Підтримуване обладнання
+
+Будь-що з ESC/POS — протестовано на STMicroelectronics-класі 58 мм
+USB-принтерах та Epson TM-i по мережі. 58 мм та 80 мм папір.
+Етикеточні принтери (TSPL / ZPL) — Phase 2.
+
+### Встановлення
+
+#### macOS / Linux / Raspberry Pi
+
+```bash
+curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash
+```
+
+#### Windows
+
+```powershell
+irm https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.ps1 | iex
+```
+
+#### Android (Termux)
+
+```bash
+curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install-android.sh | bash
+```
+
+Усі три інсталери роблять одне й те саме: ставлять Python 3.11+ якщо
+його ще нема, розпаковують менеджер у `~/.barhandler-manager/`,
+створюють virtualenv, ставлять залежності та **реєструють службу яка
+автоматично стартує при кожному завантаженні машини** (launchd на
+macOS, systemd на Linux, termux-services на Android, Scheduled Task на
+Windows).
+
+Після встановлення менеджер доступний за адресою `http://localhost:9999`.
+
+### Що буде після перезавантаження компʼютера?
+
+**Нічого робити не треба** — менеджер запуститься сам:
+
+- **macOS** — `RunAtLoad=true` + `KeepAlive=true`: стартує при логіні
+  користувача і автоматично перезапускається, якщо процес впав
+- **Linux** — `systemctl enable` + `Restart=on-failure`: стартує при
+  завантаженні системи, перезапускається при збоях
+- **Android (Termux)** — `sv-enable`: стартує при відкритті Termux
+  (для постійної роботи у фоні потрібен Termux:Boot з F-Droid)
+- **Windows** — Scheduled Task `-AtLogOn`: стартує при вході
+  користувача в систему
+
+Перевірити що менеджер працює:
+
+```bash
+curl http://localhost:9999/health
+# {"status": "ok", ...}
+```
+
+### Ручне керування
+
+Після встановлення в `~/.barhandler-manager/` зявляються 4 скрипти:
+
+| Скрипт | Що робить |
+|---|---|
+| `start.sh` / `start.ps1` | Запустити менеджер вручну |
+| `stop.sh` / `stop.ps1` | Зупинити менеджер |
+| `status.sh` / `status.ps1` | Показати стан (запущено / зупинено + порт) |
+| `update.sh` / `update.ps1` | Оновитись до останньої версії з GitHub Releases |
+
+Приклад:
+
+```bash
+~/.barhandler-manager/status.sh
+~/.barhandler-manager/stop.sh
+~/.barhandler-manager/start.sh
+~/.barhandler-manager/update.sh
+```
+
+### Налаштування
+
+Файл `config.yaml` поруч з `main.py`. Дві речі які варто торкатися:
+
+```yaml
+server:
+  port: 9999                 # змінити якщо 9999 зайнятий
+  api_key: "change-me"       # усі роути крім /health вимагають це в X-Api-Key
+  cors_origins:              # опційно — override вбудованого dev/prod allowlist-у
+    - "https://your-pos.example.com"
+```
+
+Усе інше (ширина паперу принтера, drawer pin, code page) налаштовується
+зі **сторінки Settings веб-додатку**, не з цього файлу — менеджер сам
+виявляє USB / LAN принтери, оператор реєструє їх через UI, і призначення
+зберігаються в `printers.json` поруч з менеджером.
+
+### API коротко
+
+| Endpoint | Метод | Що робить |
+|---|---|---|
+| `/health` | GET | Liveness + статус кожного принтера. Без auth. |
+| `/devices/discover` | POST | Скан USB + LAN (+ Bluetooth на Linux). |
+| `/devices` | GET | Список зареєстрованих принтерів. |
+| `/devices/register` | POST | Зареєструвати принтер з role / nickname / шириною паперу. |
+| `/devices/{id}` | DELETE | Видалити принтер з реєстру. |
+| `/devices/{id}/test-print` | POST | Демо-чек. |
+| `/print/fiscal` | POST | Фіскальний чек у стилі Вчасно з QR-кодом. |
+| `/print/receipt` | POST | Нефіскальний чек. |
+| `/print/lines` | POST | Структуровані рядки з форматуванням по рядку. |
+| `/print/text` | POST | Сирий заздалегідь сформатований текст (вихід Checkbox `/text`). |
+| `/print/kitchen` | POST | Кухонна квитанція — один самодостатній блок на позицію. |
+| `/drawer/open` | POST | Імпульс на грошову скриньку. |
+| `/terminal/discover` | POST | Скан LAN для POS-терміналів (порти 3000 SSI + 2000 PB). |
+| `/terminal/register` | POST | Зареєструвати термінал. |
+| `/terminal` | GET | Список зареєстрованих терміналів. |
+| `/terminal/{id}/merchants` | GET / PUT | Список мерчантів + апдейт псевдонімів. |
+| `/terminal/charge` | POST | Провести оплату (банк визначається з реєстрації). |
+| `/terminal/{id}/cancel` | POST | Скасувати поточну операцію. |
+| `/terminal/{id}/last-result` | GET | Отримати результат по UID або останній. |
+
+Повні схеми payload-ів — у `docs/INTEGRATION-SPEC.md` (документ, з
+якого читає веб-додаток коли підключає виклики).
+
+### Встановлення вручну (для розробки)
+
+```bash
+git clone https://github.com/goodpesik/barhandler-manager.git
+cd barhandler-manager
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python main.py
+```
+
+### Релізи
+
+Гілка `main` — щоденна; релізи відвантажуються з `production` через
+GitHub Releases. До кожного релізу прикріплюється:
+
+- Tarball з вихідниками
+- `install.sh`, `install.ps1`, `install-android.sh`
+
+Авто-оновлення нема — перезапустіть інсталер (або `update.sh`) коли
+зявиться новий реліз. Налаштування (`printers.json`, `terminals.json`,
+`config.yaml`) переживають оновлення.
+
+### Ліцензія
+
+MIT.
+
+### Контриб'ютинг
+
+Issues і PR вітаються. Для повідомлень про hardware-баги наведіть
+vendor:product принтера (з `lsusb` / `system_profiler SPUSBDataType`) і
+відповідні рядки з `bhm.log`.
+
+---
+
+## English
+
 Local HTTP bridge that lets a browser-based POS (BarHandler, FitStudio,
 or anything else that can talk JSON over HTTP) drive a thermal printer,
 cash drawer, or POS terminal that's physically connected to the same
@@ -10,7 +203,7 @@ sits in the middle: web app sends a print/charge request → manager
 talks to the device → returns the result. One small Python service on
 the bar/till machine, drives every piece of hardware on it.
 
-## What it does today
+### What it does today
 
 - **Receipt printing** — fiscal layout (Vchasno-style), non-fiscal,
   pre-payment bill, kitchen ticket. Per-line formatting (bold,
@@ -26,42 +219,87 @@ the bar/till machine, drives every piece of hardware on it.
   printers, and port-scans the host's own /24 for raw-9100 listeners.
   Bluetooth is best-effort on Linux (scrapes `bluetoothctl`) — pair
   the printer in your OS first, then it shows up.
-- **POS terminal (Mono, Privatbank)** — adapter scaffold is in
-  `src/routes/terminal.py`. Real adapters land once the bank-side
-  protocol docs come through; see `docs/INTEGRATION-SPEC.md`.
+- **POS terminal** — full Monobank (SSI ECR JSON) and PrivatBank
+  (PB ECR JSON) support. LAN discovery on ports 3000 (SSI) + 2000 (PB),
+  registration, multi-merchant terminals with nicknames, card
+  charging, and fiscal-ID parsing for PrivatBank merchants with
+  "Каса" activated. Details in `docs/INTEGRATION-SPEC.md`.
 
-## Supported hardware
+### Supported hardware
 
 Anything that speaks ESC/POS — tested on STMicroelectronics-class
 58 mm USB printers and Epson TM-i over network. 58 mm and 80 mm paper
 both supported. Label printers (TSPL / ZPL) — Phase 2.
 
-## Install
+### Install
 
-### macOS / Linux / Raspberry Pi
+#### macOS / Linux / Raspberry Pi
+
 ```bash
 curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash
 ```
 
-### Windows
+#### Windows
+
 ```powershell
 irm https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.ps1 | iex
 ```
 
-### Android (Termux)
+#### Android (Termux)
+
 ```bash
 curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install-android.sh | bash
 ```
 
 All three installers do the same thing: install Python 3.11+ if it's
 missing, drop the manager under `~/.barhandler-manager/`, create a
-virtualenv, install dependencies, and register a service that starts
-on boot (launchd / systemd / Termux services / Windows Scheduled
-Task).
+virtualenv, install dependencies, and **register a service that starts
+automatically on every boot** (launchd on macOS, systemd on Linux,
+termux-services on Android, Scheduled Task on Windows).
 
 After install the manager is up at `http://localhost:9999`.
 
+### What happens after a reboot?
+
+**Nothing for you to do** — the manager comes back up on its own:
+
+- **macOS** — `RunAtLoad=true` + `KeepAlive=true`: starts at user
+  login and auto-restarts if the process dies
+- **Linux** — `systemctl enable` + `Restart=on-failure`: starts at
+  system boot, restarts on failures
+- **Android (Termux)** — `sv-enable`: starts when Termux opens (for
+  persistent background, install Termux:Boot from F-Droid)
+- **Windows** — Scheduled Task `-AtLogOn`: starts at user logon
+
+Verify it's running:
+
+```bash
+curl http://localhost:9999/health
+# {"status": "ok", ...}
+```
+
+### Manual control
+
+The installer drops 4 helper scripts under `~/.barhandler-manager/`:
+
+| Script | What it does |
+|---|---|
+| `start.sh` / `start.ps1` | Start the manager manually |
+| `stop.sh` / `stop.ps1` | Stop the manager |
+| `status.sh` / `status.ps1` | Show state (running / stopped + port) |
+| `update.sh` / `update.ps1` | Update to the latest GitHub Releases version |
+
+Example:
+
+```bash
+~/.barhandler-manager/status.sh
+~/.barhandler-manager/stop.sh
+~/.barhandler-manager/start.sh
+~/.barhandler-manager/update.sh
+```
+
 ### Manual install (for development)
+
 ```bash
 git clone https://github.com/goodpesik/barhandler-manager.git
 cd barhandler-manager
@@ -70,7 +308,7 @@ python3 -m venv .venv
 .venv/bin/python main.py
 ```
 
-## Configuration
+### Configuration
 
 `config.yaml` next to `main.py`. Two things you'll touch:
 
@@ -88,7 +326,7 @@ manager auto-detects USB / LAN printers, the operator registers them
 through the UI, and the assignments are stored in `printers.json`
 beside the manager.
 
-## API at a glance
+### API at a glance
 
 | Endpoint | Method | What it does |
 |---|---|---|
@@ -104,12 +342,18 @@ beside the manager.
 | `/print/text` | POST | Raw pre-formatted text (Checkbox `/text` endpoint output). |
 | `/print/kitchen` | POST | Kitchen ticket — one self-contained block per item. |
 | `/drawer/open` | POST | Pulse the cash drawer. |
-| `/terminal/*` | (Phase 2) | POS terminal charge / cancel / status. |
+| `/terminal/discover` | POST | LAN scan for POS terminals (ports 3000 SSI + 2000 PB). |
+| `/terminal/register` | POST | Register a terminal. |
+| `/terminal` | GET | List registered terminals. |
+| `/terminal/{id}/merchants` | GET / PUT | Merchant list + nickname update. |
+| `/terminal/charge` | POST | Run a charge (bank inferred from registration). |
+| `/terminal/{id}/cancel` | POST | Interrupt the in-flight operation. |
+| `/terminal/{id}/last-result` | GET | Fetch result by UID or last completed. |
 
 Full payload schemas live in `docs/INTEGRATION-SPEC.md` (the doc the
 web-app side reads when wiring its calls).
 
-## Releases
+### Releases
 
 `main` is the day-to-day branch; releases ship from `production` via
 GitHub Releases. Every release attaches:
@@ -117,15 +361,15 @@ GitHub Releases. Every release attaches:
 - Source tarball
 - `install.sh`, `install.ps1`, `install-android.sh`
 
-Auto-update isn't implemented — re-run the installer when a new
-release lands. Settings (`printers.json`, `config.yaml`) survive
-upgrades.
+Auto-update isn't implemented — re-run the installer (or `update.sh`)
+when a new release lands. Settings (`printers.json`, `terminals.json`,
+`config.yaml`) survive upgrades.
 
-## License
+### License
 
 MIT.
 
-## Contributing
+### Contributing
 
 Issues and PRs welcome. For hardware-specific bug reports include the
 printer's vendor:product (from `lsusb` / `system_profiler
