@@ -20,5 +20,9 @@ Thumbs.db
 # Logs
 *.log
 
-# Runtime registry — per-machine printer assignments
+# Runtime registry — per-machine printer/terminal assignments
 printers.json
+terminals.json
+
+# CLI runtime — PID of the detached server (written by `python cli.py start`)
+bhm.pid
