@@ -5,6 +5,9 @@ python-escpos>=3.1
 pydantic>=2.0
 pyyaml>=6.0
 zeroconf>=0.131.0
+# Used by cli.py for the live operator dashboard. Pure-Python, ~1 MB,
+# also a convenient dep to have around for any future TUI work.
+rich>=13.0
 
 # Test-time only — kept in the main requirements file so the same
 # `pip install -r requirements.txt` from CI / installers picks them up.

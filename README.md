@@ -113,6 +113,31 @@ curl http://localhost:9999/health
 ~/.barhandler-manager/update.sh
 ```
 
+### Консоль оператора (CLI)
+
+Окремо є компактна CLI для операторського використання — підключається до
+запущеного менеджера по HTTP і показує живий dashboard зі станом
+принтерів і POS-терміналів:
+
+```bash
+.venv/bin/python cli.py             # живий dashboard (default)
+.venv/bin/python cli.py start       # запуск у detached-режимі (виживає
+                                    #   при закритті терміналу/SSH)
+.venv/bin/python cli.py stop        # зупинка
+.venv/bin/python cli.py restart     # stop + start
+.venv/bin/python cli.py status      # те саме що без аргументів
+.venv/bin/python cli.py logs        # tail -F bhm.log
+.venv/bin/python cli.py health      # one-shot health-перевірка (exit code)
+```
+
+`cli.py start` ставить процес у власну сесію (POSIX `start_new_session`),
+тож менеджер переживе закриття консолі. PID зберігається у `bhm.pid`,
+логи в `bhm.log` поруч з `main.py`.
+
+⚠️ **Авто-рестарт при крашi** CLI **НЕ робить** — для production-рівневої
+надійності (старт при ребуті + рестарт при крашi + survives logout)
+користуйтесь інсталером вище (launchd на macOS / systemd на Linux).
+
 ### Налаштування
 
 Файл `config.yaml` поруч з `main.py`. Дві речі які варто торкатися:
@@ -297,6 +322,30 @@ Example:
 ~/.barhandler-manager/start.sh
 ~/.barhandler-manager/update.sh
 ```
+
+### Operator CLI
+
+A compact operator console talks to a running manager over HTTP and
+shows a live dashboard of printers and POS terminals:
+
+```bash
+.venv/bin/python cli.py             # live dashboard (default)
+.venv/bin/python cli.py start       # detached launch (survives
+                                    #   shell / SSH close)
+.venv/bin/python cli.py stop        # stop
+.venv/bin/python cli.py restart     # stop + start
+.venv/bin/python cli.py status      # same as no-arg
+.venv/bin/python cli.py logs        # tail -F bhm.log
+.venv/bin/python cli.py health      # one-shot health check (exit code)
+```
+
+`cli.py start` puts the process in its own POSIX session
+(`start_new_session`), so the manager survives the controlling shell
+closing. PID lands in `bhm.pid`, logs in `bhm.log` next to `main.py`.
+
+⚠️ **Auto-restart on crash is NOT handled by this CLI** — for
+production-grade resilience (boot start + crash restart + survives
+logout) use the installer above (launchd on macOS / systemd on Linux).
 
 ### Manual install (for development)
 
