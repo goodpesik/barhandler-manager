@@ -48,30 +48,28 @@ def _discovery_warnings() -> list[dict]:
         warnings.append({
             "code": "bluetooth_unsupported",
             "message": (
-                "Bluetooth printer discovery isn't available on macOS — "
-                "pair the printer in System Settings and register it manually "
-                "by IP / MAC once a native wrapper ships."
+                "Пошук Bluetooth-принтерів на macOS недоступний — "
+                "з'єднайте принтер у Системних налаштуваннях та "
+                "зареєструйте вручну за IP / MAC."
             ),
         })
     elif system == "Windows":
         warnings.append({
             "code": "bluetooth_unsupported",
             "message": (
-                "Bluetooth printer discovery isn't available on Windows — "
-                "pair the printer in Settings → Bluetooth and use Zadig to "
-                "expose it via WinUSB if you want libusb access."
+                "Пошук Bluetooth-принтерів на Windows недоступний — "
+                "з'єднайте принтер у Налаштування → Bluetooth та "
+                "використайте Zadig для доступу через WinUSB."
             ),
         })
     elif system == "Linux":
-        # bluetoothctl might be missing on Pi minimal images; tell the
-        # operator to install it rather than wonder why nothing shows up.
         import shutil
         if not shutil.which("bluetoothctl"):
             warnings.append({
                 "code": "bluetooth_unsupported",
                 "message": (
-                    "Install `bluez` (and pair the printer) to enable "
-                    "Bluetooth discovery on this host."
+                    "Встановіть `bluez` (та з'єднайте принтер) щоб "
+                    "увімкнути Bluetooth-пошук на цьому хості."
                 ),
             })
     return warnings
