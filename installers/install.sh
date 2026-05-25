@@ -266,11 +266,11 @@ EOF
 chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/stop.sh" "$INSTALL_DIR/status.sh" "$INSTALL_DIR/update.sh"
 
 # --- smoke test -------------------------------------------------------
-sleep 2
+sleep 3
 if is_running; then
     say "✓ manager is up at http://localhost:9999"
 else
-    warn "manager didn't answer /health within 2s — check ${INSTALL_DIR}/bhm.log"
+    warn "manager didn't answer /health within 3s — check ${INSTALL_DIR}/bhm.log"
 fi
 
 cat <<EOF
@@ -286,9 +286,12 @@ cat <<EOF
 │   ${INSTALL_DIR}/status.sh
 │   ${INSTALL_DIR}/update.sh     ← fetches the latest release
 │
+│  Dashboard:       http://localhost:9999/
+│
 │  Next steps:
-│   1. Open your POS web app
-│   2. Settings → Integrations → "Use device manager" → toggle ON
-│   3. Click "Discover printers"
+│   1. Open http://localhost:9999/ to see the dashboard
+│   2. Open your POS web app
+│   3. Settings → Integrations → "Use device manager" → toggle ON
+│   4. Click "Discover printers"
 ╰──────────────────────────────────────────────────────────────╯
 EOF

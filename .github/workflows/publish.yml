@@ -27,26 +27,53 @@ jobs:
         with:
           fetch-depth: 0  # full history so we can read prior tags + commit messages
 
-      - name: Read version
+      - name: Resolve version
         id: version
         run: |
-          if [ ! -f VERSION ]; then
-            echo "::error::VERSION file missing — bump it in the PR before merging"
+          FILE_VERSION=$(tr -d '[:space:]' < VERSION 2>/dev/null || echo "")
+          LATEST_TAG=$(git tag --sort=-v:refname | head -n1 | sed 's/^v//')
+
+          # Auto-bump patch from latest tag
+          if [ -n "$LATEST_TAG" ]; then
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$LATEST_TAG"
+            AUTO_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
+          else
+            AUTO_VERSION="0.1.0"
+          fi
+
+          # Use VERSION file if it's higher (manual minor/major bump),
+          # otherwise use auto-bumped patch.
+          if [ -n "$FILE_VERSION" ] && [ "$(printf '%s\n' "$FILE_VERSION" "$AUTO_VERSION" | sort -V | tail -n1)" = "$FILE_VERSION" ] \
+             && [ "$FILE_VERSION" != "$AUTO_VERSION" ]; then
+            VERSION="$FILE_VERSION"
+          else
+            VERSION="$AUTO_VERSION"
+          fi
+
+          # Fail if tag already exists (shouldn't happen with auto-bump)
+          if git rev-parse "v${VERSION}" >/dev/null 2>&1; then
+            echo "::error::tag v${VERSION} already exists"
             exit 1
           fi
-          VERSION=$(tr -d '[:space:]' < VERSION)
-          if [ -z "$VERSION" ]; then
-            echo "::error::VERSION file is empty"
-            exit 1
-          fi
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION"    >> "$GITHUB_OUTPUT"
+          echo "Releasing v$VERSION (file=$FILE_VERSION, auto=$AUTO_VERSION, latest_tag=$LATEST_TAG)"
 
-      - name: Check tag is fresh
+      - name: Sync VERSION file and version strings
         run: |
-          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
-            echo "::error::tag v${{ steps.version.outputs.version }} already exists — bump VERSION"
-            exit 1
+          VERSION="${{ steps.version.outputs.version }}"
+          echo "$VERSION" > VERSION
+          sed -i "s/version=\"[0-9]*\.[0-9]*\.[0-9]*\"/version=\"$VERSION\"/g" src/server.py || true
+          sed -i "s/\"version\": \"[0-9]*\.[0-9]*\.[0-9]*\"/\"version\": \"$VERSION\"/g" src/routes/health.py || true
+          if git diff --quiet; then
+            echo "No version files to update"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add VERSION src/server.py src/routes/health.py
+            git commit -m "chore: bump version to $VERSION [skip ci]"
+            git push origin HEAD:production
           fi
 
       - name: Build source archives
