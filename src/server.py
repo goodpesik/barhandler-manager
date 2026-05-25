@@ -58,9 +58,11 @@ def create_app(config: dict) -> FastAPI:
         "https://bar-handler.web.app",
         "https://barhandler.com",
     ]
+    cors_origin_regex = config["server"].get("cors_origin_regex")
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
+        allow_origin_regex=cors_origin_regex,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
