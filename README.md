@@ -18,6 +18,9 @@
 
 ### Що вміє зараз
 
+- **Веб-дашборд** — на `http://localhost:9999/` відкривається live
+  dashboard зі статусом підключених принтерів, POS-терміналів та
+  останніх операцій. Не потребує авторизації.
 - **Друк чеків** — фіскальний (стиль Вчасно), нефіскальний, рахунок
   для гостя перед оплатою, кухонна квитанція. Форматування по рядках
   (жирний, по центру, подвійна висота) — щоб око касира одразу
@@ -72,6 +75,8 @@ macOS, systemd на Linux, termux-services на Android, Scheduled Task на
 Windows).
 
 Після встановлення менеджер доступний за адресою `http://localhost:9999`.
+Відкрийте `http://localhost:9999/` у браузері — побачите дашборд зі
+статусом пристроїв.
 
 ### Що буде після перезавантаження компʼютера?
 
@@ -140,15 +145,29 @@ curl http://localhost:9999/health
 
 ### Налаштування
 
-Файл `config.yaml` поруч з `main.py`. Дві речі які варто торкатися:
+Файл `config.yaml` поруч з `main.py`:
 
 ```yaml
 server:
   port: 9999                 # змінити якщо 9999 зайнятий
-  api_key: "change-me"       # усі роути крім /health вимагають це в X-Api-Key
-  cors_origins:              # опційно — override вбудованого dev/prod allowlist-у
-    - "https://your-pos.example.com"
+  api_key: "bf11b47b-..."    # усі роути крім /health та / вимагають це в X-Api-Key
+  cors_origins:              # точні origins для localhost dev-серверів
+    - "http://localhost:4115"
+    - "http://localhost:5273"
+  cors_origin_regex: "https://([a-z0-9-]+\\.)?(barhandler\\.com|petshandler\\.com|fitstudiocrm\\.com)"
 ```
+
+- **`api_key`** — статичний токен, який фронтенд передає в хедері
+  `X-Api-Key`. Не секрет у класичному сенсі — просто handshake щоб
+  сторонній софт на хості не міг випадково відкрити скриньку чи
+  надрукувати чек. Однаковий для всіх POS-додатків.
+- **`cors_origins`** — точний список дозволених origins (localhost
+  dev-сервери).
+- **`cors_origin_regex`** — regex для мультитенантних продакшн-доменів.
+  Матчить будь-який субдомен: `[client].barhandler.com`,
+  `[client].petshandler.com`, `[client].fitstudiocrm.com` та їхні
+  `.web.app` деплої. Працює разом з `cors_origins` — достатньо збігу
+  в будь-якому з них.
 
 Усе інше (ширина паперу принтера, drawer pin, code page) налаштовується
 зі **сторінки Settings веб-додатку**, не з цього файлу — менеджер сам
@@ -159,7 +178,8 @@ server:
 
 | Endpoint | Метод | Що робить |
 |---|---|---|
-| `/health` | GET | Liveness + статус кожного принтера. Без auth. |
+| `/` | GET | Веб-дашборд — live статус принтерів і терміналів. Без auth. |
+| `/health` | GET | Liveness + статус кожного принтера (JSON). Без auth. |
 | `/devices/discover` | POST | Скан USB + LAN (+ Bluetooth на Linux). |
 | `/devices` | GET | Список зареєстрованих принтерів. |
 | `/devices/register` | POST | Зареєструвати принтер з role / nickname / шириною паперу. |
@@ -230,6 +250,9 @@ the bar/till machine, drives every piece of hardware on it.
 
 ### What it does today
 
+- **Web dashboard** — open `http://localhost:9999/` in a browser to see
+  a live dashboard with printer and POS terminal status. No auth
+  required.
 - **Receipt printing** — fiscal layout (Vchasno-style), non-fiscal,
   pre-payment bill, kitchen ticket. Per-line formatting (bold,
   centred, double-height) so the operator's eye lands on the things
@@ -283,6 +306,7 @@ automatically on every boot** (launchd on macOS, systemd on Linux,
 termux-services on Android, Scheduled Task on Windows).
 
 After install the manager is up at `http://localhost:9999`.
+Open `http://localhost:9999/` in a browser to see the device dashboard.
 
 ### What happens after a reboot?
 
@@ -359,15 +383,29 @@ python3 -m venv .venv
 
 ### Configuration
 
-`config.yaml` next to `main.py`. Two things you'll touch:
+`config.yaml` next to `main.py`:
 
 ```yaml
 server:
   port: 9999                 # change if 9999 is taken
-  api_key: "change-me"       # all routes except /health require this in X-Api-Key
-  cors_origins:              # optional — override the built-in dev/prod allowlist
-    - "https://your-pos.example.com"
+  api_key: "bf11b47b-..."    # all routes except /health and / require this in X-Api-Key
+  cors_origins:              # exact origins for localhost dev servers
+    - "http://localhost:4115"
+    - "http://localhost:5273"
+  cors_origin_regex: "https://([a-z0-9-]+\\.)?(barhandler\\.com|petshandler\\.com|fitstudiocrm\\.com)"
 ```
+
+- **`api_key`** — static token the frontend sends in `X-Api-Key`.
+  Not a secret per se — just a handshake so random software on the
+  host can't accidentally open the cash drawer or print a receipt.
+  Same key across all POS apps.
+- **`cors_origins`** — exact list of allowed origins (localhost dev
+  servers).
+- **`cors_origin_regex`** — regex for multi-tenant production domains.
+  Matches any subdomain: `[client].barhandler.com`,
+  `[client].petshandler.com`, `[client].fitstudiocrm.com` and their
+  `.web.app` deploys. Works together with `cors_origins` — a match in
+  either is enough.
 
 Everything else (printer paper width, drawer pin, code page) is
 configured from the **web app's Settings page**, not this file — the
@@ -379,7 +417,8 @@ beside the manager.
 
 | Endpoint | Method | What it does |
 |---|---|---|
-| `/health` | GET | Liveness + per-printer status. No auth. |
+| `/` | GET | Web dashboard — live printer and terminal status. No auth. |
+| `/health` | GET | Liveness + per-printer status (JSON). No auth. |
 | `/devices/discover` | POST | Scan USB + LAN (+ Bluetooth on Linux). |
 | `/devices` | GET | List registered printers. |
 | `/devices/register` | POST | Persist a printer with role / nickname / paper width. |
