@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from datetime import datetime
 from typing import Optional
 
 from src.models.terminal import (
@@ -406,6 +407,23 @@ def _raise_if_error(response: dict, *, default_code: str = "error") -> None:
         raise TerminalUnavailable(message, code=code)
 
 
+def _parse_terminal_datetime(params: dict) -> Optional[datetime]:
+    """Parse transactionDate (DDMMYYYY or YYYYMMDD) + transactionTime (HHMMSS)
+    from SSI GetLastResult params. Returns None if either field is absent or
+    unparseable — callers treat None as "terminal didn't report a time"."""
+    date_str = params.get("transactionDate") or ""
+    time_str = params.get("transactionTime") or ""
+    if not date_str or not time_str:
+        return None
+    combined = f"{date_str}{time_str}"
+    for fmt in ("%d%m%Y%H%M%S", "%Y%m%d%H%M%S"):
+        try:
+            return datetime.strptime(combined, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _result_from_params(params: dict) -> AcquirerResult:
     """Map SSI GetLastResult / GetResultByUid params onto the unified
     AcquirerResult shape. Unknown enum values pass through verbatim in
@@ -433,6 +451,7 @@ def _result_from_params(params: dict) -> AcquirerResult:
         error_code=params.get("errorCode") or None,
         error_message=params.get("errorDescription") or None,
         error_details=params.get("errorDetails") or None,
+        payment_date=_parse_terminal_datetime(params),
         vendor_data=params,
     )
 

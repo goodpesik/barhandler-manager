@@ -147,6 +147,8 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
             printer.text(_two_col("RRN", a.rrn, width) + "\n")
         if a.auth_code:
             printer.text(_two_col("Код авторизації", a.auth_code, width) + "\n")
+        if a.payment_date:
+            printer.text(_two_col("Дата оплати", a.payment_date.strftime("%d.%m.%Y %H:%M:%S"), width) + "\n")
         if a.paysys:
             printer.text(_two_col("Платіжна система", a.paysys, width) + "\n")
 

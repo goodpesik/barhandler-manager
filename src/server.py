@@ -5,6 +5,7 @@ all open device handles on shutdown. Printers are NOT connected eagerly —
 connections happen on the first print to that ID.
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 import logging
@@ -16,7 +17,7 @@ from fastapi.security.api_key import APIKeyHeader
 from src.constants import DEFAULT_API_KEY
 from src.devices.registry import PrinterRegistry
 from src.devices.terminal_registry import TerminalRegistry
-from src.routes import dashboard, devices, drawer, health, print_routes, terminal
+from src.routes import dashboard, devices, drawer, health, print_routes, system, terminal
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,21 @@ def create_app(config: dict) -> FastAPI:
     )
     terminal_registry = TerminalRegistry(path=terminal_registry_path)
 
+    async def _printer_heartbeat() -> None:
+        """Every 30 s probe each connected printer. On failure, disconnect
+        the stale handle so /health reports 'unavailable' immediately."""
+        while True:
+            await asyncio.sleep(30)
+            for printer_id, device in list(registry._devices.items()):  # noqa: SLF001
+                if device.is_connected():
+                    try:
+                        reachable = await device.async_probe()
+                    except Exception:
+                        reachable = False
+                    if not reachable:
+                        logger.info("[heartbeat] %s unreachable — disconnecting", printer_id)
+                        await device.disconnect()
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.config = config
@@ -42,7 +58,9 @@ def create_app(config: dict) -> FastAPI:
         app.state.terminal_registry = terminal_registry
         registry.load()
         terminal_registry.load()
+        heartbeat = asyncio.create_task(_printer_heartbeat(), name="printer-heartbeat")
         yield
+        heartbeat.cancel()
         await registry.disconnect_all()
 
     app = FastAPI(title="Barhandler Manager", version="0.3.2", lifespan=lifespan)
@@ -78,5 +96,6 @@ def create_app(config: dict) -> FastAPI:
     app.include_router(print_routes.router, prefix="/print", dependencies=[Depends(verify_key)])
     app.include_router(drawer.router, prefix="/drawer", dependencies=[Depends(verify_key)])
     app.include_router(terminal.router, prefix="/terminal", dependencies=[Depends(verify_key)])
+    app.include_router(system.router, prefix="/system", dependencies=[Depends(verify_key)])
 
     return app

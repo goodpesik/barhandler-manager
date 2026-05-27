@@ -12,6 +12,7 @@ result so the route layer doesn't have to chase every new doc revision.
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 from enum import Enum
 from typing import Optional
 
@@ -149,6 +150,7 @@ class AcquirerResult(BaseModel):
     # bank-side; absent for SSI / for PrivatBank merchants without "Каса".
     # `fiscal_receipt_id` → Національний е-чек ID (ДПС). Surface this in
     # Reports so the operator can cross-reference in Приват24.
+    payment_date: Optional[datetime] = None  # transactionDate+transactionTime from terminal
     fiscal_receipt_id: Optional[str] = None  # adv.natr — ДПС fiscal
     bank_receipt_id: Optional[int] = None    # adv.rid — bank е-чек
     fiscal_receipt_text: Optional[str] = None  # GetReceiptInfo.receipt — printable text

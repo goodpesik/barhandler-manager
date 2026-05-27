@@ -75,6 +75,35 @@ class PrinterDevice:
     def is_connected(self) -> bool:
         return self._printer is not None
 
+    async def async_probe(self) -> bool:
+        """Non-destructive liveness check. Returns False if the physical
+        device is unreachable so the heartbeat can clear the stale handle.
+
+        Network: opens a fresh TCP connection (2s timeout) and closes it.
+        USB: calls is_online() on the existing handle.
+        """
+        if self._printer is None:
+            return False
+        connection = (self._config.get("connection") or "usb").lower()
+        if connection == "network":
+            host = self._config.get("host")
+            port = int(self._config.get("port") or 9100)
+            try:
+                _, writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), timeout=2.0,
+                )
+                writer.close()
+                with suppress(Exception):
+                    await writer.wait_closed()
+                return True
+            except Exception:
+                return False
+        else:
+            try:
+                return bool(self._printer.is_online())
+            except Exception:
+                return False
+
     def check_status(self) -> dict:
         """Best-effort real-time status query (ESC/POS DLE EOT n series).
 
@@ -349,6 +378,18 @@ class PrinterDevice:
                 await job(self._printer)
                 if not done.done():
                     done.set_result(None)
+            except OSError as exc:
+                # Socket-level failure → the physical connection is gone.
+                # Clear the handle so health() reports "unavailable" and
+                # the next print attempt triggers a fresh connect().
+                logger.warning("[%s] socket error — marking disconnected: %s", self.name, exc)
+                with suppress(Exception):
+                    if self._printer is not None:
+                        self._printer.close()
+                self._printer = None
+                if not done.done():
+                    done.set_exception(PrinterUnavailable(str(exc), code="unreachable"))
+                return  # worker exits; registry.get_device() rebuilds on next print
             except Exception as exc:  # noqa: BLE001
                 logger.exception("[%s] print job failed", self.name)
                 if not done.done():
