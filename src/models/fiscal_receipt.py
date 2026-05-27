@@ -48,6 +48,7 @@ class AcquirerInfo(BaseModel):
     commission: Optional[float] = None
     operation: Optional[str] = None      # "Оплата" / "Повернення"
     method_name: Optional[str] = None    # "Чіп" / "PayPass"
+    payment_date: Optional[datetime] = None  # timestamp from the physical terminal
 
 
 class FiscalReceipt(BaseModel):
