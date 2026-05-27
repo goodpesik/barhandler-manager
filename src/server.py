@@ -17,7 +17,7 @@ from fastapi.security.api_key import APIKeyHeader
 from src.constants import DEFAULT_API_KEY
 from src.devices.registry import PrinterRegistry
 from src.devices.terminal_registry import TerminalRegistry
-from src.routes import dashboard, devices, drawer, health, print_routes, terminal
+from src.routes import dashboard, devices, drawer, health, print_routes, system, terminal
 
 logger = logging.getLogger(__name__)
 
@@ -96,5 +96,6 @@ def create_app(config: dict) -> FastAPI:
     app.include_router(print_routes.router, prefix="/print", dependencies=[Depends(verify_key)])
     app.include_router(drawer.router, prefix="/drawer", dependencies=[Depends(verify_key)])
     app.include_router(terminal.router, prefix="/terminal", dependencies=[Depends(verify_key)])
+    app.include_router(system.router, prefix="/system", dependencies=[Depends(verify_key)])
 
     return app
