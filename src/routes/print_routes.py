@@ -4,13 +4,17 @@ If `printer_id` is omitted the manager falls back to the first registered
 printer of the appropriate role:
   - /print/receipt, /print/fiscal, /print/text  → role 'receipt'
   - /print/kitchen                              → role 'kitchen'
+  - /print/label                                → role 'label'
 
 Connections are opened lazily by PrinterRegistry and reused across prints.
 """
 
+import base64
+import io
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from PIL import Image
 from pydantic import BaseModel, Field
 
 from src.devices.printer import PrinterUnavailable
@@ -18,6 +22,7 @@ from src.devices.registry import UnknownPrinter
 from src.models.fiscal_receipt import FiscalReceipt
 from src.models.printer import PrinterKind
 from src.models.receipt import ReceiptPayload
+from src.services.bitmap_render import dots_for, image_to_gs_v_0
 from src.services.fiscal_receipt import render_fiscal_receipt
 from src.services.receipt import render_receipt
 
@@ -186,6 +191,53 @@ async def print_lines(
     except PrinterUnavailable as exc:
         # Surface the structured code so the frontend can switch on it
         # ("out_of_paper" → "Закінчився папір", "cover_open" → "Закрийте кришку").
+        raise HTTPException(
+            status_code=503,
+            detail={"code": getattr(exc, "code", "unavailable"), "message": str(exc)},
+        )
+    return {"status": "printed", "printer_id": reg.descriptor.id}
+
+
+class LabelPayload(BaseModel):
+    image_base64: str
+
+
+@router.post("/label")
+async def print_label(
+    payload: LabelPayload,
+    request: Request,
+    printer_id: Optional[str] = Query(default=None),
+):
+    """Print a pre-rendered label image (base64 PNG) on the label printer.
+
+    The image is resized to exactly the printer's dot width, converted to
+    1-bit, and sent via GS v 0. No paper cut — label printers use tear-off
+    or continuous stock; cutting would jam the mechanism.
+    """
+    reg, device = await _resolve_printer(request, printer_id, PrinterKind.label)
+    dot_width = dots_for(reg.paper_width)
+
+    try:
+        raw = base64.b64decode(payload.image_base64)
+        img = Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"invalid image_base64: {exc}")
+
+    # Scale to exactly dot_width pixels wide, preserving aspect ratio.
+    orig_w, orig_h = img.size
+    if orig_w != dot_width:
+        new_h = max(1, int(orig_h * dot_width / orig_w))
+        img = img.resize((dot_width, new_h), Image.LANCZOS)
+
+    img = img.convert("1")
+    raster = image_to_gs_v_0(img)
+
+    async def _job(esc):
+        esc._raw(raster)
+
+    try:
+        await device.enqueue(_job)
+    except PrinterUnavailable as exc:
         raise HTTPException(
             status_code=503,
             detail={"code": getattr(exc, "code", "unavailable"), "message": str(exc)},

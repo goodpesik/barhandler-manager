@@ -23,7 +23,8 @@ FONT_REGULAR = ASSETS_DIR / "NotoSansMono-Regular.ttf"
 FONT_BOLD = ASSETS_DIR / "NotoSansMono-Bold.ttf"
 
 # Dot widths of common thermal printer paper sizes.
-PAPER_DOTS = {58: 384, 80: 576}
+# 48mm label (XP-246B): 8 dots/mm × 48mm = 384 printable dots (same pitch as 58mm).
+PAPER_DOTS = {48: 384, 58: 384, 80: 576}
 
 # Base font size in pixels for "normal" text. Tuned so Noto Sans Mono
 # fits exactly 32 chars across 58mm (384 dots) and 48 chars across 80mm
