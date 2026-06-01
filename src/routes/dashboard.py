@@ -327,11 +327,45 @@ _HTML_TEMPLATE = r"""<!doctype html>
       const res = await api("POST", "/system/update", true);
       showToast(res.message || "Оновлення запущено!", "ok", 10000);
       btn.textContent = "Перезапуск…";
+      // Poll update.log so the operator sees real progress (curl
+      // downloads, pip output, launchctl reload). If we go silent for
+      // 60s with the manager still alive, surface the log so they
+      // know why the update isn't taking.
+      pollUpdateLog();
     } catch (e) {
       showToast("Помилка оновлення: " + e.message, "err");
       btn.disabled = false;
       btn.textContent = "⬆ Оновити";
     }
+  }
+
+  async function pollUpdateLog() {
+    const started = Date.now();
+    const POLL_MS = 3000;
+    const REPORT_AFTER_MS = 60000;
+    let reported = false;
+    const tick = async () => {
+      try {
+        const log = await api("GET", "/system/update-log?tail=30", true);
+        const elapsed = Date.now() - started;
+        if (elapsed > REPORT_AFTER_MS && !reported && log.exists) {
+          reported = true;
+          const last = (log.lines || []).slice(-6).join("\n");
+          showToast(
+            "Оновлення ще йде, останні рядки логу:\n" + last,
+            "ok", 15000,
+          );
+        }
+      } catch (_) {
+        // /health throws too when the manager restarts — that's the
+        // happy path. Stop polling.
+        return;
+      }
+      // Stop once the manager itself reboots (next /health call will
+      // fail and trigger error banner via the main refresh loop).
+      setTimeout(tick, POLL_MS);
+    };
+    setTimeout(tick, POLL_MS);
   }
 
   // ---- main poll loop ------------------------------------------------------
