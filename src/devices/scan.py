@@ -54,7 +54,22 @@ def _bulk_endpoints(iface) -> tuple[Optional[int], Optional[int]]:
     return in_ep, out_ep
 
 
+def _is_termux() -> bool:
+    """True iff we're running under Termux on Android. Marker env var
+    is set by Termux itself in every shell."""
+    import os
+    return os.environ.get("PREFIX", "").startswith("/data/data/com.termux/")
+
+
 def discover_usb() -> list[PrinterDescriptor]:
+    # On Termux/Android pyusb's libusb backend can't reach the system
+    # USB stack without per-device termux-usb permissions, and even
+    # then the workflow is one-at-a-time + user-prompted. We've
+    # decided to support only network printers on Android — skip
+    # cleanly so the operator doesn't see noisy NoBackendError logs.
+    if _is_termux():
+        logger.debug("USB discovery skipped on Termux/Android (use network printers)")
+        return []
     found: list[PrinterDescriptor] = []
     for dev in usb.core.find(find_all=True):
         for cfg in dev:
@@ -334,6 +349,13 @@ def discover_bluetooth() -> list[PrinterDescriptor]:
     asking the OS for *already paired* devices and offering them to the
     operator — they pair once in System Settings, then they're here.
     """
+    # Termux/Android: BluetoothAdapter is a Java framework API
+    # accessible only from an Activity/Service with the BLUETOOTH
+    # permission — Python in Termux can't reach it without a companion
+    # APK. Skip until we ship one.
+    if _is_termux():
+        logger.debug("Bluetooth discovery skipped on Termux/Android (needs companion APK)")
+        return []
     found: list[PrinterDescriptor] = []
     import platform
     import shutil
