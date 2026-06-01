@@ -40,8 +40,36 @@ if is_installed && [ $FORCE -eq 0 ]; then
         exit 0
     else
         say "installed but not running — starting it"
-        sv up "$SERVICE_NAME" || true
-        exit 0
+        # sv refuses with "unable to change to service directory" on a
+        # fresh Termux session where runsv hasn't scanned yet; fall
+        # straight to direct nohup spawn so the operator gets a
+        # working manager, not a noise message.
+        if ! sv up "$SERVICE_NAME" 2>/dev/null; then
+            warn "runit not ready — spawning manager directly"
+            (
+                cd "$INSTALL_DIR" && \
+                nohup "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/main.py" \
+                    > "$INSTALL_DIR/bhm.boot.log" 2>&1 &
+                disown 2>/dev/null || true
+            )
+        fi
+        # Wait up to 2 minutes for /health — Pillow import + zeroconf
+        # spinup can take 30-60s on older Android hardware.
+        WAIT=0
+        printf '%s' "▸ waiting for server (0s)"
+        while [ $WAIT -lt 120 ]; do
+            if curl -fsS --max-time 2 http://localhost:9999/health >/dev/null 2>&1; then
+                printf '\n'
+                say "✓ running at http://localhost:9999 (took ${WAIT}s)"
+                exit 0
+            fi
+            sleep 5
+            WAIT=$((WAIT + 5))
+            printf '\r▸ waiting for server (%ds)' "$WAIT"
+        done
+        printf '\n'
+        warn "didn't answer within 120s — check $INSTALL_DIR/bhm.boot.log"
+        exit 1
     fi
 fi
 
@@ -167,7 +195,25 @@ if ! curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
             > "$INSTALL_DIR/bhm.boot.log" 2>&1 &
         disown 2>/dev/null || true
     )
-    sleep 2
+    # Wait up to 2 minutes for /health — Pillow import + zeroconf
+    # spinup + first device scan can take 30-60s on lower-end Android.
+    WAIT=0
+    printf '%s' "▸ waiting for server (0s)"
+    while [ $WAIT -lt 120 ]; do
+        if curl -fsS --max-time 2 http://localhost:9999/health >/dev/null 2>&1; then
+            printf '\n'
+            say "✓ running at http://localhost:9999 (took ${WAIT}s)"
+            break
+        fi
+        sleep 5
+        WAIT=$((WAIT + 5))
+        printf '\r▸ waiting for server (%ds)' "$WAIT"
+    done
+    if [ $WAIT -ge 120 ] && ! is_running; then
+        printf '\n'
+        warn "didn't answer within 120s — check $INSTALL_DIR/bhm.boot.log"
+        warn "    tail -50 $INSTALL_DIR/bhm.boot.log"
+    fi
 fi
 
 # --- helper scripts --------------------------------------------------
@@ -178,11 +224,31 @@ if curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
     exit 0
 fi
 echo "▸ starting barhandler-manager"
-sv up $SERVICE_NAME
-sleep 2
-curl -fsS --max-time 2 http://localhost:9999/health >/dev/null 2>&1 \
-    && echo "✓ running" \
-    || { echo "⚠ check $INSTALL_DIR/log/current"; exit 1; }
+if ! sv up $SERVICE_NAME 2>/dev/null; then
+    echo "⚠ runit not ready — spawning manager directly"
+    (
+        cd $INSTALL_DIR && \\
+        nohup $INSTALL_DIR/.venv/bin/python $INSTALL_DIR/main.py \\
+            > $INSTALL_DIR/bhm.boot.log 2>&1 &
+        disown 2>/dev/null || true
+    )
+fi
+WAIT=0
+printf '%s' "▸ waiting for server (0s)"
+while [ \$WAIT -lt 120 ]; do
+    if curl -fsS --max-time 2 http://localhost:9999/health >/dev/null 2>&1; then
+        printf '\n'
+        echo "✓ running at http://localhost:9999 (took \${WAIT}s)"
+        exit 0
+    fi
+    sleep 5
+    WAIT=\$((WAIT + 5))
+    printf '\r▸ waiting for server (%ds)' "\$WAIT"
+done
+printf '\n'
+echo "✗ didn't answer within 120s — check $INSTALL_DIR/bhm.boot.log"
+echo "  tail -50 $INSTALL_DIR/bhm.boot.log"
+exit 1
 EOF
 cat > "$INSTALL_DIR/stop.sh" <<EOF
 #!/data/data/com.termux/files/usr/bin/env bash
