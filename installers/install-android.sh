@@ -141,9 +141,28 @@ EOF
 chmod +x "$SV_DIR/log/run"
 mkdir -p "$INSTALL_DIR/log"
 
-# Enable + start
-sv-enable "$SERVICE_NAME" 2>/dev/null || true
-sv up "$SERVICE_NAME" 2>/dev/null || true
+# Enable + start. `sv` talks to `runsv` over named pipes inside
+# $SV_DIR/supervise — but those pipes only exist once `runsvdir` (the
+# scanner) has noticed the new service directory. On a fresh install
+# that hasn't happened yet, and `sv up` prints the noisy:
+#   fail: barhandler-manager: unable to change to service directory: ...
+# Redirect ALL output (some sv versions write to fd 1 not fd 2) and
+# tolerate the failure — we have a direct-spawn fallback below.
+sv-enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+sv up "$SERVICE_NAME" >/dev/null 2>&1 || true
+
+# Fallback: if runsv hasn't picked up the service yet (common on a
+# fresh install — runsvdir starts at next shell login), spawn the
+# Python directly via nohup so the manager is running RIGHT NOW. The
+# user gets working software immediately; runit takes over on reboot.
+sleep 1
+if ! curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
+    say "service supervisor not ready — spawning manager directly"
+    nohup "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/main.py" \
+        > "$INSTALL_DIR/bhm.boot.log" 2>&1 &
+    disown 2>/dev/null || true
+    sleep 2
+fi
 
 # --- helper scripts --------------------------------------------------
 cat > "$INSTALL_DIR/start.sh" <<EOF
@@ -183,6 +202,14 @@ cat <<EOF
 ╭──────────────────────────────────────────────────────────────╮
 │  Installed under: ${INSTALL_DIR}
 │  Logs:            ${INSTALL_DIR}/log/current
+│                   ${INSTALL_DIR}/bhm.log (rotated app log)
+│
+│  Dashboard:       http://localhost:9999
+│                   (open in any browser on the same device —
+│                   shows printer / terminal status, live logs,
+│                   "Check for updates" button)
+│
+│  Health check:    curl http://localhost:9999/health
 │
 │  USB hardware: Termux can talk to USB devices via the
 │                'termux-usb' command (Termux:API app required).
@@ -197,8 +224,9 @@ cat <<EOF
 │   ${INSTALL_DIR}/update.sh     ← fetches the latest release
 │
 │  Next steps:
-│   1. Open your POS web app
-│   2. Settings → Integrations → "Use device manager" → toggle ON
-│   3. Click "Discover printers"
+│   1. Open Dashboard at http://localhost:9999 to verify it's up
+│   2. In your POS web app: Settings → Integrations →
+│      "Use device manager" → toggle ON
+│   3. Click "Discover printers" / "Discover POS terminals"
 ╰──────────────────────────────────────────────────────────────╯
 EOF
