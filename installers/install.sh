@@ -187,11 +187,30 @@ EOF
         # bootout is a no-op if the service isn't loaded — swallow the
         # error so re-runs of install.sh work.
         launchctl bootout "$LAUNCH_TARGET" 2>/dev/null || true
-        if ! launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST"; then
+        LAUNCHD_OK=1
+        if ! launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST" 2>&1; then
             warn "launchctl bootstrap failed — falling back to legacy load"
-            launchctl load "$PLIST"
+            if ! launchctl load "$PLIST" 2>&1; then
+                warn "launchctl load also refused — falling back to direct nohup spawn"
+                LAUNCHD_OK=0
+            fi
         fi
-        say "launchd service installed and started"
+        if [ $LAUNCHD_OK -eq 1 ]; then
+            say "launchd service installed and started"
+        else
+            # On boxes where neither bootstrap nor load work we still
+            # want the manager running RIGHT NOW so the operator isn't
+            # stuck after a fresh install. The plist stays on disk so
+            # the next reboot may pick it up; in the meantime nohup
+            # keeps the python process alive across this shell.
+            (
+                cd "$INSTALL_DIR" && \
+                nohup "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/main.py" \
+                    > "$INSTALL_DIR/bhm.boot.log" 2>&1 &
+                disown 2>/dev/null || true
+            )
+            say "manager spawned directly (launchd refused — restart laptop to re-arm launchd)"
+        fi
         ;;
     raspberry|linux)
         UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
@@ -255,13 +274,23 @@ if ! $SERVICE_CMD_START; then
         disown 2>/dev/null || true
     )
 fi
-sleep 2
-if curl -fsS --max-time 2 http://localhost:9999/health >/dev/null 2>&1; then
-    echo "✓ running at http://localhost:9999"
-else
-    echo "⚠ didn't answer within 2s — check $INSTALL_DIR/bhm.boot.log"
-    exit 1
-fi
+WAIT=0
+WAIT_MAX=120
+printf '%s' "▸ waiting for server (0s)"
+while [ \$WAIT -lt \$WAIT_MAX ]; do
+    if curl -fsS --max-time 2 http://localhost:9999/health >/dev/null 2>&1; then
+        printf '\n'
+        echo "✓ running at http://localhost:9999 (took \${WAIT}s)"
+        exit 0
+    fi
+    sleep 5
+    WAIT=\$((WAIT + 5))
+    printf '\r▸ waiting for server (%ds)' "\$WAIT"
+done
+printf '\n'
+echo "✗ didn't answer within \${WAIT_MAX}s — check $INSTALL_DIR/bhm.boot.log"
+echo "  tail -50 $INSTALL_DIR/bhm.boot.log"
+exit 1
 EOF
 
 cat > "$INSTALL_DIR/stop.sh" <<EOF
@@ -299,11 +328,27 @@ EOF
 chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/stop.sh" "$INSTALL_DIR/status.sh" "$INSTALL_DIR/update.sh"
 
 # --- smoke test -------------------------------------------------------
-sleep 3
-if is_running; then
-    say "✓ manager is up at http://localhost:9999"
-else
-    warn "manager didn't answer /health within 3s — check ${INSTALL_DIR}/bhm.log"
+# Poll for up to 2 minutes: a fresh manager has to import Pillow +
+# spin up zeroconf + run device discovery before /health responds.
+# On older boxes that's 30-60s. Show progress every 5s so the operator
+# knows we're still working instead of staring at a frozen prompt.
+WAIT_MAX=120
+WAIT_ELAPSED=0
+printf '%s' "▸ waiting for server (0s)"
+while [ $WAIT_ELAPSED -lt $WAIT_MAX ]; do
+    if is_running; then
+        printf '\n'
+        say "✓ manager is up at http://localhost:9999 (took ${WAIT_ELAPSED}s)"
+        break
+    fi
+    sleep 5
+    WAIT_ELAPSED=$((WAIT_ELAPSED + 5))
+    printf '\r▸ waiting for server (%ds)' "$WAIT_ELAPSED"
+done
+if [ $WAIT_ELAPSED -ge $WAIT_MAX ] && ! is_running; then
+    printf '\n'
+    warn "manager didn't answer /health within ${WAIT_MAX}s — check ${INSTALL_DIR}/bhm.boot.log"
+    warn "    tail -50 ${INSTALL_DIR}/bhm.boot.log"
 fi
 
 cat <<EOF
