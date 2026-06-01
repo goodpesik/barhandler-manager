@@ -128,15 +128,24 @@ curl -fsSL "$TARBALL_URL" -o "$TMP/src.tar.gz" || die "couldn't fetch release ta
 tar -xzf "$TMP/src.tar.gz" -C "$TMP"
 SRC_ROOT="$(find "$TMP" -maxdepth 1 -mindepth 1 -type d | head -n1)"
 
-# Preserve user config across re-installs.
+# Preserve user config across re-installs — but only EXCLUDE files
+# from rsync when they actually exist in $INSTALL_DIR. The previous
+# logic excluded config.yaml unconditionally, so fresh installs never
+# got the seed config from the release tarball and main.py crashed
+# with FileNotFoundError on first start.
+RSYNC_EXCLUDES=(--exclude='.venv')
 for keep in config.yaml printers.json terminals.json; do
-    [ -f "$INSTALL_DIR/$keep" ] && cp -a "$INSTALL_DIR/$keep" "$TMP/$keep.bak"
+    if [ -f "$INSTALL_DIR/$keep" ]; then
+        cp -a "$INSTALL_DIR/$keep" "$TMP/$keep.bak"
+        RSYNC_EXCLUDES+=(--exclude="$keep")
+    fi
 done
 
-# Copy fresh code over the install dir (everything except .venv / user data).
-rsync -a --exclude='.venv' --exclude='config.yaml' --exclude='printers.json' --exclude='terminals.json' "$SRC_ROOT/" "$INSTALL_DIR/"
+# Copy fresh code over the install dir.
+rsync -a "${RSYNC_EXCLUDES[@]}" "$SRC_ROOT/" "$INSTALL_DIR/"
 
-# Restore user config (only if upgrade; fresh install uses shipped config.yaml).
+# Restore preserved user config (no-op on fresh install — the tarball's
+# default config.yaml has already been rsynced in).
 for keep in config.yaml printers.json terminals.json; do
     [ -f "$TMP/$keep.bak" ] && cp -a "$TMP/$keep.bak" "$INSTALL_DIR/$keep"
 done
