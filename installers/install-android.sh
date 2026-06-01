@@ -271,6 +271,13 @@ EOF
 cat > "$INSTALL_DIR/update.sh" <<EOF
 #!/data/data/com.termux/files/usr/bin/env bash
 # Re-run the Termux installer in upgrade mode.
+#
+# Termux's \$PREFIX/bin holds every binary we need (curl, bash, pkg,
+# python). Most of the time it's already in PATH, but if update.sh is
+# triggered from a service-context subprocess with a stripped PATH
+# (the dashboard's Update button is one such case) we have to put it
+# back ourselves before exec'ing the installer.
+export PATH="/data/data/com.termux/files/usr/bin:/data/data/com.termux/files/usr/bin/applets:\$PATH"
 exec curl -fsSL https://github.com/${REPO}/releases/latest/download/install-android.sh | bash -s -- --force
 EOF
 
