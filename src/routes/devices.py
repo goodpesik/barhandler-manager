@@ -32,6 +32,18 @@ def _registry(request: Request):
     return request.app.state.registry
 
 
+def _is_termux() -> bool:
+    """True iff we're running under Termux on Android.
+
+    `PREFIX=/data/data/com.termux/files/usr` is the canonical marker —
+    Termux itself sets it in every shell, and no non-Termux process
+    would write that value. More reliable than `platform.system()`,
+    which returns "Linux" on Android same as on Ubuntu.
+    """
+    import os
+    return os.environ.get("PREFIX", "").startswith("/data/data/com.termux/")
+
+
 def _discovery_warnings() -> list[dict]:
     """Platform-specific advisories the frontend should surface as
     "this is why discovery looked empty" hints instead of a blank list.
@@ -43,6 +55,24 @@ def _discovery_warnings() -> list[dict]:
     import platform
 
     warnings: list[dict] = []
+    # Termux on Android: no USB without termux-usb permissions, no BT
+    # without a companion APK. Network printers (ESC/POS over TCP /
+    # bonjour) is the only viable transport. Show this prominently so
+    # the operator doesn't waste time hunting for a "Discover" feature
+    # that physically can't work on the platform.
+    if _is_termux():
+        warnings.append({
+            "code": "android_network_only",
+            "message": (
+                "На Android підтримуються лише мережеві принтери. "
+                "USB-доступ потребує дозволу через termux-usb для "
+                "кожного пристрою окремо, а Bluetooth-discover на "
+                "Android вимагає окремого Companion APK (ще не реалізовано). "
+                "Підключіть принтер до Wi-Fi і скористайтесь пошуком."
+            ),
+        })
+        return warnings
+
     system = platform.system()
     if system == "Darwin":
         warnings.append({
