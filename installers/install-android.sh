@@ -59,7 +59,17 @@ pkg update -y
 say "upgrading existing Termux packages (keeps libcurl/libngtcp2 in sync)"
 pkg upgrade -y
 say "installing required Termux packages"
-pkg install -y python rust binutils libusb termux-api termux-services curl wget tar rsync
+# Termux has no prebuilt Pillow wheel for android_arm64, so pip has to
+# compile it from source. Pillow links against jpeg + png + zlib +
+# freetype at build time — missing any of those gives:
+#   RequiredDependencyException: jpeg
+# (or png, zlib, freetype). We don't import Pillow ourselves, but
+# python-escpos does (for image-based receipts / labels), so the install
+# fails at pip step without these headers. Add them up front.
+pkg install -y \
+    python rust binutils libusb termux-api termux-services \
+    curl wget tar rsync \
+    libjpeg-turbo libpng zlib freetype
 
 # Termux occasionally still ships a curl that can't link even after an
 # upgrade if the user interrupted a previous install. Reinstall the
