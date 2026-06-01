@@ -214,7 +214,14 @@ EOF
         # what the launchctl EIO message itself recommends.
         LAUNCH_DOMAIN="gui/$(id -u)"
         LAUNCH_TARGET="$LAUNCH_DOMAIN/com.goodpesik.barhandler-manager"
+        # Kill BOTH the launchd-managed instance AND any nohup-spawned
+        # process left over from a previous install where launchd
+        # refused. Without this `--force` updates the code on disk
+        # but the old python keeps running with the old VERSION — the
+        # operator sees the same number on the dashboard forever.
         launchctl bootout "$LAUNCH_TARGET" 2>/dev/null || true
+        pkill -f "$INSTALL_DIR/main.py" 2>/dev/null || true
+        sleep 1
         launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST" 2>&1 || \
             { warn "launchctl bootstrap failed — trying legacy load"; \
               launchctl load "$PLIST" 2>&1 || true; }
