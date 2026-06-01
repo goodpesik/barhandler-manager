@@ -128,12 +128,20 @@ fetch_tarball || die "couldn't fetch release tarball (tried curl + wget)"
 tar -xzf "$TMP/src.tar.gz" -C "$TMP"
 SRC_ROOT="$(find "$TMP" -maxdepth 1 -mindepth 1 -type d | head -n1)"
 
-# Preserve user config.
+# Preserve user config — but ONLY exclude from rsync when the file
+# actually exists. On a fresh install $INSTALL_DIR has nothing, the
+# blanket --exclude=config.yaml would drop the seed config from the
+# release tarball, and main.py would crash with FileNotFoundError on
+# config.yaml. Build the exclude list dynamically.
+RSYNC_EXCLUDES=(--exclude='.venv')
 for keep in config.yaml printers.json terminals.json; do
-    [ -f "$INSTALL_DIR/$keep" ] && cp -a "$INSTALL_DIR/$keep" "$TMP/$keep.bak"
+    if [ -f "$INSTALL_DIR/$keep" ]; then
+        cp -a "$INSTALL_DIR/$keep" "$TMP/$keep.bak"
+        RSYNC_EXCLUDES+=(--exclude="$keep")
+    fi
 done
 
-rsync -a --exclude='.venv' --exclude='config.yaml' --exclude='printers.json' --exclude='terminals.json' "$SRC_ROOT/" "$INSTALL_DIR/"
+rsync -a "${RSYNC_EXCLUDES[@]}" "$SRC_ROOT/" "$INSTALL_DIR/"
 
 for keep in config.yaml printers.json terminals.json; do
     [ -f "$TMP/$keep.bak" ] && cp -a "$TMP/$keep.bak" "$INSTALL_DIR/$keep"
