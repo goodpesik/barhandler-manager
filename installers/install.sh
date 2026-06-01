@@ -189,36 +189,41 @@ EOF
         # and on Sonoma they fail with `Load failed: 5: Input/output error`
         # on Intel boxes (observed in the field). Use the modern
         # bootstrap/bootout API targeting the user's gui domain — that's
-        # what the launchctl EIO message itself recommends ("Try running
-        # launchctl bootstrap as root for richer errors").
+        # what the launchctl EIO message itself recommends.
         LAUNCH_DOMAIN="gui/$(id -u)"
         LAUNCH_TARGET="$LAUNCH_DOMAIN/com.goodpesik.barhandler-manager"
-        # bootout is a no-op if the service isn't loaded — swallow the
-        # error so re-runs of install.sh work.
         launchctl bootout "$LAUNCH_TARGET" 2>/dev/null || true
-        LAUNCHD_OK=1
-        if ! launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST" 2>&1; then
-            warn "launchctl bootstrap failed — falling back to legacy load"
-            if ! launchctl load "$PLIST" 2>&1; then
-                warn "launchctl load also refused — falling back to direct nohup spawn"
-                LAUNCHD_OK=0
+        launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST" 2>&1 || \
+            { warn "launchctl bootstrap failed — trying legacy load"; \
+              launchctl load "$PLIST" 2>&1 || true; }
+        # Don't trust launchctl's exit code: on macOS Sonoma `load`
+        # prints "Load failed: 5: Input/output error" to stderr while
+        # returning 0, so a naive `if launchctl load ...` thinks the
+        # service started when it didn't. Truth is whether /health
+        # answers within a few seconds. If launchd loaded the plist
+        # successfully RunAtLoad=true + KeepAlive=true should have the
+        # python up by then; if not, we fall straight through to a
+        # direct nohup spawn so the operator gets a working manager
+        # immediately. The plist stays on disk for the next reboot.
+        LAUNCHD_OK=0
+        for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
+                LAUNCHD_OK=1
+                break
             fi
-        fi
+            sleep 1
+        done
         if [ $LAUNCHD_OK -eq 1 ]; then
             say "launchd service installed and started"
         else
-            # On boxes where neither bootstrap nor load work we still
-            # want the manager running RIGHT NOW so the operator isn't
-            # stuck after a fresh install. The plist stays on disk so
-            # the next reboot may pick it up; in the meantime nohup
-            # keeps the python process alive across this shell.
+            warn "launchd accepted the plist but the manager didn't come up — falling back to direct spawn"
             (
                 cd "$INSTALL_DIR" && \
                 nohup "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/main.py" \
                     > "$INSTALL_DIR/bhm.boot.log" 2>&1 &
                 disown 2>/dev/null || true
             )
-            say "manager spawned directly (launchd refused — restart laptop to re-arm launchd)"
+            say "manager spawned directly (restart laptop later to re-arm launchd)"
         fi
         ;;
     raspberry|linux)
