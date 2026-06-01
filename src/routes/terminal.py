@@ -215,11 +215,31 @@ async def charge(
     finish chip/PIN, return the unified AcquirerResult. The frontend's
     NgRx effect awaits this and feeds the result into the fiscal
     receipt flow."""
+    import logging
+    log = logging.getLogger("src.routes.terminal")
     adapter, used_id = _resolve(request, terminal_id)
+    log.info(
+        "[charge] terminal=%s payload=%s",
+        used_id,
+        payload.model_dump_json(),
+    )
     try:
         result = await adapter.charge(payload)
     except TerminalUnavailable as exc:
+        log.warning("[charge] terminal=%s TerminalUnavailable code=%s msg=%s", used_id, getattr(exc, "code", None), exc)
         raise _surface_terminal_error(exc)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — surface root cause instead of bare 500
+        log.exception("[charge] terminal=%s unhandled error: %s", used_id, exc)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "internal_error",
+                "message": f"{type(exc).__name__}: {exc}",
+            },
+        )
+    log.info("[charge] terminal=%s result=%s", used_id, result.model_dump_json())
     return {"terminal_id": used_id, "result": result.model_dump()}
 
 

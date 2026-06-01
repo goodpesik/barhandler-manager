@@ -119,12 +119,15 @@ async def send_tcp(host: str, port: int, message: dict, timeout: float = REQUEST
     """Open a TCP connection, send one framed message, read the framed
     response, close. Caller is responsible for the ≥0.25s pause between
     consecutive calls."""
+    method = message.get("method", "?")
+    logger.info("[ssi %s:%s] → %s: %s", host, port, method, json.dumps(message, ensure_ascii=False))
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port),
             timeout=timeout,
         )
     except (OSError, asyncio.TimeoutError) as exc:
+        logger.warning("[ssi %s:%s] connect failed for %s: %s", host, port, method, exc)
         raise TerminalUnavailable(
             f"cannot connect to {host}:{port}: {exc}",
             code="unreachable",
@@ -142,18 +145,27 @@ async def send_tcp(host: str, port: int, message: dict, timeout: float = REQUEST
             reader.readexactly(data_len + 1),  # +1 for LRC
             timeout=timeout,
         )
-        return decode_frame(header + rest)
+        response = decode_frame(header + rest)
+        logger.info(
+            "[ssi %s:%s] ← %s: %s",
+            host, port, method,
+            json.dumps(response, ensure_ascii=False),
+        )
+        return response
     except asyncio.TimeoutError as exc:
+        logger.warning("[ssi %s:%s] timeout on %s after %.1fs", host, port, method, timeout)
         raise TerminalUnavailable(
             f"timeout talking to {host}:{port}",
             code="timeout",
         ) from exc
     except (OSError, asyncio.IncompleteReadError) as exc:
+        logger.warning("[ssi %s:%s] transport error on %s: %s", host, port, method, exc)
         raise TerminalUnavailable(
             f"transport error talking to {host}:{port}: {exc}",
             code="unreachable",
         ) from exc
     except FrameError as exc:
+        logger.warning("[ssi %s:%s] malformed frame on %s: %s", host, port, method, exc)
         raise TerminalUnavailable(
             f"malformed SSI response from {host}:{port}: {exc}",
             code="protocol_error",
@@ -316,19 +328,38 @@ class SSITerminalAdapter(TerminalAdapter):
         for k, v in request.extras.items():
             params.setdefault(k, v)
 
+        logger.info(
+            "[%s] charge starting: amount=%s currency=%s merchant=%s uid=%s",
+            self.descriptor.id,
+            request.amount_kopecks,
+            request.currency,
+            merchant_id,
+            request.transaction_uid,
+        )
         ack = await self._send(
             {"method": "Purchase", "step": "1", "params": params},
         )
         _raise_if_error(ack, default_code="charge_rejected")
+        logger.info("[%s] charge ack OK, polling for completion", self.descriptor.id)
 
         # The terminal is now busy. Poll status, interrupting after the
         # overall window so a stalled cashier interaction can't block
         # the event loop indefinitely.
         await self._wait_idle()
+        logger.info("[%s] charge idle reached, fetching final result", self.descriptor.id)
 
-        return await self.get_last_result(
+        result = await self.get_last_result(
             transaction_uid=request.transaction_uid,
         )
+        logger.info(
+            "[%s] charge final: status=%s raw=%s rrn=%s auth=%s",
+            self.descriptor.id,
+            result.status,
+            result.raw_transaction_result,
+            result.rrn,
+            result.auth_code,
+        )
+        return result
 
     async def _wait_idle(self) -> None:
         """Poll GetStatus until S00 / S08 (idle for next op). Honours

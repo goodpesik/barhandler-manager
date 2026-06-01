@@ -46,15 +46,47 @@ if is_installed && [ $FORCE -eq 0 ]; then
 fi
 
 # --- packages --------------------------------------------------------
-say "updating Termux packages"
+# `pkg update` only refreshes the index; `pkg upgrade` actually pulls
+# newer versions. Without the upgrade step, a freshly-flashed Termux
+# install often ends up with libcurl built against an older libngtcp2
+# than the one `pkg install` just pulled in, and the next curl call
+# dies with:
+#   CANNOT LINK EXECUTABLE ".../curl": cannot locate symbol
+#   "ngtcp2_crypto_get_path_challenge_data2_cb" referenced by libcurl.so
+# Upgrading first keeps the shared-library graph in sync.
+say "updating Termux package index"
 pkg update -y
-pkg install -y python rust binutils libusb termux-api termux-services curl tar rsync
+say "upgrading existing Termux packages (keeps libcurl/libngtcp2 in sync)"
+pkg upgrade -y
+say "installing required Termux packages"
+pkg install -y python rust binutils libusb termux-api termux-services curl wget tar rsync
+
+# Termux occasionally still ships a curl that can't link even after an
+# upgrade if the user interrupted a previous install. Reinstall the
+# pair atomically so they're guaranteed to share an ABI.
+if ! curl -fsS --max-time 1 https://github.com >/dev/null 2>&1; then
+    warn "curl can't link to libcurl — reinstalling libcurl + libngtcp2"
+    pkg install -y --reinstall libcurl libngtcp2 curl || true
+fi
 
 # --- download release ------------------------------------------------
 mkdir -p "$INSTALL_DIR"
 TARBALL_URL="https://github.com/${REPO}/archive/refs/heads/production.tar.gz"
 TMP="$(mktemp -d)"
-curl -fsSL "$TARBALL_URL" -o "$TMP/src.tar.gz" || die "couldn't fetch release tarball"
+
+# Try curl, then wget as fallback. Either covers Termux's libcurl-ABI
+# breakage so the operator isn't stuck re-running pkg by hand.
+fetch_tarball() {
+    if curl -fsSL "$TARBALL_URL" -o "$TMP/src.tar.gz" 2>/dev/null; then
+        return 0
+    fi
+    warn "curl failed — falling back to wget"
+    if command -v wget >/dev/null && wget -q "$TARBALL_URL" -O "$TMP/src.tar.gz"; then
+        return 0
+    fi
+    return 1
+}
+fetch_tarball || die "couldn't fetch release tarball (tried curl + wget)"
 tar -xzf "$TMP/src.tar.gz" -C "$TMP"
 SRC_ROOT="$(find "$TMP" -maxdepth 1 -mindepth 1 -type d | head -n1)"
 
