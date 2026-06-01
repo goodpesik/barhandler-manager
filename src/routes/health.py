@@ -39,6 +39,6 @@ async def health(request: Request):
             })
     return {
         "status": "ok",
-        "version": "0.3.3",
+        "version": "0.3.4",
         "printers": printers,
     }
