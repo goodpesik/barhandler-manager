@@ -176,8 +176,21 @@ case "$PLATFORM" in
 </dict>
 </plist>
 EOF
-        launchctl unload "$PLIST" 2>/dev/null || true
-        launchctl load "$PLIST"
+        # launchctl `load`/`unload` are deprecated since macOS Catalina
+        # and on Sonoma they fail with `Load failed: 5: Input/output error`
+        # on Intel boxes (observed in the field). Use the modern
+        # bootstrap/bootout API targeting the user's gui domain — that's
+        # what the launchctl EIO message itself recommends ("Try running
+        # launchctl bootstrap as root for richer errors").
+        LAUNCH_DOMAIN="gui/$(id -u)"
+        LAUNCH_TARGET="$LAUNCH_DOMAIN/com.goodpesik.barhandler-manager"
+        # bootout is a no-op if the service isn't loaded — swallow the
+        # error so re-runs of install.sh work.
+        launchctl bootout "$LAUNCH_TARGET" 2>/dev/null || true
+        if ! launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST"; then
+            warn "launchctl bootstrap failed — falling back to legacy load"
+            launchctl load "$PLIST"
+        fi
         say "launchd service installed and started"
         ;;
     raspberry|linux)
@@ -208,8 +221,11 @@ esac
 # --- drop helper scripts so users don't need to remember launchctl ---
 case "$PLATFORM" in
     macos)
-        SERVICE_CMD_START="launchctl load $HOME/Library/LaunchAgents/com.goodpesik.barhandler-manager.plist"
-        SERVICE_CMD_STOP="launchctl unload $HOME/Library/LaunchAgents/com.goodpesik.barhandler-manager.plist"
+        # Modern launchctl: bootstrap/bootout (not deprecated load/unload).
+        # The $(id -u) is captured at script-generation time so start.sh
+        # works for the operator regardless of which shell they run it from.
+        SERVICE_CMD_START="launchctl bootstrap gui/$(id -u) $HOME/Library/LaunchAgents/com.goodpesik.barhandler-manager.plist"
+        SERVICE_CMD_STOP="launchctl bootout gui/$(id -u)/com.goodpesik.barhandler-manager"
         ;;
     raspberry|linux)
         SERVICE_CMD_START="sudo systemctl start $SERVICE_NAME"
@@ -225,12 +241,19 @@ if curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
     exit 0
 fi
 echo "▸ starting barhandler-manager"
-$SERVICE_CMD_START
+if ! $SERVICE_CMD_START; then
+    echo "⚠ service manager (launchctl/systemd) refused — falling back to direct spawn"
+    # nohup keeps it alive after this shell closes; \`disown\` removes it
+    # from the shell's job table so Ctrl+C here doesn't kill it.
+    nohup "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/main.py" \\
+        > "$INSTALL_DIR/bhm.boot.log" 2>&1 &
+    disown 2>/dev/null || true
+fi
 sleep 2
 if curl -fsS --max-time 2 http://localhost:9999/health >/dev/null 2>&1; then
     echo "✓ running at http://localhost:9999"
 else
-    echo "⚠ didn't answer within 2s — check $INSTALL_DIR/bhm.log"
+    echo "⚠ didn't answer within 2s — check $INSTALL_DIR/bhm.boot.log"
     exit 1
 fi
 EOF
@@ -238,7 +261,11 @@ EOF
 cat > "$INSTALL_DIR/stop.sh" <<EOF
 #!/usr/bin/env bash
 echo "▸ stopping barhandler-manager"
-$SERVICE_CMD_STOP
+# Whichever route start.sh took (service manager vs direct spawn) we
+# want stop.sh to kill both — bootout is a no-op if not loaded, pkill
+# is a no-op if no process matches.
+$SERVICE_CMD_STOP 2>/dev/null || true
+pkill -f "$INSTALL_DIR/main.py" 2>/dev/null || true
 EOF
 
 cat > "$INSTALL_DIR/status.sh" <<EOF
