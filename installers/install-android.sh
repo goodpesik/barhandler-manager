@@ -177,6 +177,17 @@ EOF
 chmod +x "$SV_DIR/log/run"
 mkdir -p "$INSTALL_DIR/log"
 
+# Stop any currently-running manager BEFORE starting a new one. On
+# --force re-installs we've already swapped the code on disk, but the
+# old Python process is still in memory holding the previous VERSION.
+# Without this kill, `sv up` is a no-op (process already running) and
+# the operator sees the old version forever — the original "install
+# said success but version didn't bump" bug.
+sv down "$SERVICE_NAME" >/dev/null 2>&1 || true
+pkill -f "$INSTALL_DIR/main.py" 2>/dev/null || true
+# Give the OS a tick to release the port so the new process can bind.
+sleep 1
+
 # Enable + start. `sv` talks to `runsv` over named pipes inside
 # $SV_DIR/supervise — but those pipes only exist once `runsvdir` (the
 # scanner) has noticed the new service directory. On a fresh install
