@@ -72,19 +72,41 @@ esac
 say "platform: $PLATFORM"
 
 # --- ensure Python 3.11+ ---------------------------------------------
+# When install.sh is invoked from a launchd / systemd / nohup-spawned
+# parent (e.g. through the dashboard's Update button) the PATH it
+# inherits is the bare service-context one (`/usr/bin:/bin:/usr/sbin:
+# /sbin`), which doesn't include Homebrew or any operator additions.
+# Prepend the standard Homebrew prefixes so `command -v brew` / `python3`
+# work even when there's no interactive shell underneath us. No-op on
+# Linux (those dirs don't exist).
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:$PATH"
+
 have_python() {
     command -v python3 >/dev/null && \
         python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"
+}
+
+# brew may be present without being in PATH (rare but possible if the
+# operator installed it under a custom prefix). Probe absolute paths
+# before giving up.
+find_brew() {
+    if command -v brew >/dev/null; then
+        command -v brew
+        return 0
+    fi
+    for candidate in /opt/homebrew/bin/brew /usr/local/bin/brew "$HOME/homebrew/bin/brew"; do
+        [ -x "$candidate" ] && { echo "$candidate"; return 0; }
+    done
+    return 1
 }
 
 if ! have_python; then
     say "Python ${PY_MIN}+ not found — installing"
     case "$PLATFORM" in
         macos)
-            if ! command -v brew >/dev/null; then
+            BREW="$(find_brew)" || \
                 die "Homebrew not installed. Get it from https://brew.sh and re-run."
-            fi
-            brew install python@3.11
+            "$BREW" install python@3.11
             ;;
         raspberry|linux)
             if command -v apt >/dev/null; then
@@ -336,6 +358,13 @@ cat > "$INSTALL_DIR/update.sh" <<EOF
 # upgrade mode (config.yaml / printers.json preserved, code + venv
 # refreshed). Equivalent to:
 #   curl -fsSL https://github.com/${REPO}/releases/latest/download/install.sh | bash -s -- --force
+#
+# When triggered from the dashboard's Update button this script runs
+# inside a launchd-spawned subprocess whose PATH does NOT include
+# Homebrew. Prepend it explicitly so the downstream install.sh can
+# find brew/python3 — otherwise it dies with "Homebrew not installed"
+# even when brew is sitting right there in /opt/homebrew.
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:\$PATH"
 exec curl -fsSL https://github.com/${REPO}/releases/latest/download/install.sh | bash -s -- --force
 EOF
 

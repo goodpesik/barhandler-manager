@@ -64,6 +64,20 @@ async def trigger_update() -> dict:
             )
             fh.write(f"cmd: {cmd}\n")
             fh.flush()
+        # When the manager runs under launchd / systemd the inherited
+        # PATH is the bare service-context one and doesn't include
+        # Homebrew. install.sh itself prepends those prefixes now, but
+        # set a sane PATH here too so we're not relying solely on the
+        # downstream script — anything that runs before install.sh
+        # sources its own PATH still resolves brew/python3.
+        env = {
+            **os.environ,
+            "PATH": (
+                "/opt/homebrew/bin:/opt/homebrew/sbin:"
+                "/usr/local/bin:/usr/local/sbin:"
+                + os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            ),
+        }
         log_fh = _UPDATE_LOG.open("a")
         subprocess.Popen(
             ["bash", "-c", cmd],
@@ -71,6 +85,7 @@ async def trigger_update() -> dict:
             stdout=log_fh,
             stderr=subprocess.STDOUT,
             close_fds=True,
+            env=env,
         )
         # Popen dup'd the fd; close our handle so it doesn't leak.
         log_fh.close()
