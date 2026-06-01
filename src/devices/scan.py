@@ -383,9 +383,27 @@ def discover_bluetooth() -> list[PrinterDescriptor]:
 
 
 def discover_all() -> list[PrinterDescriptor]:
-    """Aggregate every transport into one list."""
+    """Aggregate every transport into one list.
+
+    Each transport is wrapped — a failure in one shouldn't sink the
+    whole scan. On Termux/Android pyusb can't reach the system USB
+    stack (NoBackendError); on a machine without a network stack
+    zeroconf throws; bluetoothctl may be missing. None of those are
+    operator-actionable from the dashboard, and 500 on Discover is a
+    worse UX than "nothing found yet — plug your printer in."
+    """
     out: list[PrinterDescriptor] = []
-    out.extend(discover_usb())
-    out.extend(discover_network())
-    out.extend(discover_bluetooth())
+    for transport_name, fn in (
+        ("USB", discover_usb),
+        ("network", discover_network),
+        ("Bluetooth", discover_bluetooth),
+    ):
+        try:
+            out.extend(fn())
+        except Exception as exc:  # noqa: BLE001 — keep going on any failure
+            logger.warning(
+                "%s discovery failed: %s (continuing with other transports)",
+                transport_name,
+                exc,
+            )
     return out
