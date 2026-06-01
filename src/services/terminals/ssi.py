@@ -339,6 +339,18 @@ class SSITerminalAdapter(TerminalAdapter):
         ack = await self._send(
             {"method": "Purchase", "step": "1", "params": params},
         )
+        # Business-class error on the ack (operator cancelled, card
+        # declined at swipe, EMV failure) is a legitimate transaction
+        # outcome — surface as AcquirerResult, not as a 503. The route
+        # layer wraps this in HTTP 200 and the frontend renders
+        # "Скасовано" / "Відхилено" instead of a service-error toast.
+        business = _business_error_to_result(ack)
+        if business is not None:
+            logger.info(
+                "[%s] charge business-rejected at ack: status=%s code=%s",
+                self.descriptor.id, business.status, business.error_code,
+            )
+            return business
         _raise_if_error(ack, default_code="charge_rejected")
         logger.info("[%s] charge ack OK, polling for completion", self.descriptor.id)
 
@@ -416,8 +428,56 @@ class SSITerminalAdapter(TerminalAdapter):
         else:
             request = {"method": "GetLastResult"}
         response = await self._send(request, timeout=5.0)
+        # Same business-error short-circuit as charge(): E10-E12/E16/E17
+        # are legitimate transaction outcomes and should surface as
+        # AcquirerResult, not raise.
+        business = _business_error_to_result(response)
+        if business is not None:
+            logger.info(
+                "[get_last_result] business outcome via error envelope: "
+                "status=%s code=%s",
+                business.status, business.error_code,
+            )
+            return business
         _raise_if_error(response, default_code="result_fetch_failed")
         return _result_from_params(response.get("params") or {})
+
+
+# SSI error codes from the "Operation" category (doc §4.3.3) that
+# represent legitimate transaction outcomes, not service failures.
+# Mapped to the unified AcquirerResult.status values consumed by the
+# frontend (CreditCardPaymentStatus enum: Approved / Declined /
+# Canceled / Error). Anything not in this table (E00-E09 = bad
+# request, E13-E15/E18-E22 = state errors) keeps the existing
+# TerminalUnavailable → HTTP 503 behaviour.
+_BUSINESS_ERROR_CODES = {
+    "e10": "declined",   # Connection error (issuer/bank link down)
+    "e11": "declined",   # Verification error (PIN/signature)
+    "e12": "cancelled",  # Transaction canceled (operator/cardholder)
+    "e16": "declined",   # Card read error
+    "e17": "declined",   # EMV error
+}
+
+
+def _business_error_to_result(response: dict) -> Optional[AcquirerResult]:
+    """If `response` is an SSI error envelope (`error: true`) with an
+    operation-category errorCode, synthesise an AcquirerResult so the
+    route layer emits HTTP 200 + a structured outcome instead of 503.
+    Returns None for non-errors and for request/state-category codes
+    where TerminalUnavailable is still the right surface."""
+    if not isinstance(response, dict) or not response.get("error"):
+        return None
+    code = (response.get("errorCode") or "").lower()
+    status = _BUSINESS_ERROR_CODES.get(code)
+    if not status:
+        return None
+    params = response.get("params") if isinstance(response.get("params"), dict) else {}
+    return AcquirerResult(
+        status=status,
+        error_code=response.get("errorCode"),
+        error_message=response.get("errorDescription") or None,
+        error_details=params.get("details") or None,
+    )
 
 
 def _raise_if_error(response: dict, *, default_code: str = "error") -> None:
