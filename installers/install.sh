@@ -244,10 +244,16 @@ echo "▸ starting barhandler-manager"
 if ! $SERVICE_CMD_START; then
     echo "⚠ service manager (launchctl/systemd) refused — falling back to direct spawn"
     # nohup keeps it alive after this shell closes; \`disown\` removes it
-    # from the shell's job table so Ctrl+C here doesn't kill it.
-    nohup "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/main.py" \\
-        > "$INSTALL_DIR/bhm.boot.log" 2>&1 &
-    disown 2>/dev/null || true
+    # from the shell's job table so Ctrl+C here doesn't kill it. The
+    # subshell + \`cd\` is for code that reads config.yaml via a
+    # cwd-relative path (the launchd plist and runit script both set
+    # WorkingDirectory; we have to do it ourselves here).
+    (
+        cd "$INSTALL_DIR" && \\
+        nohup "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/main.py" \\
+            > "$INSTALL_DIR/bhm.boot.log" 2>&1 &
+        disown 2>/dev/null || true
+    )
 fi
 sleep 2
 if curl -fsS --max-time 2 http://localhost:9999/health >/dev/null 2>&1; then

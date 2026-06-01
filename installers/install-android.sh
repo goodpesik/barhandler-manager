@@ -158,9 +158,15 @@ sv up "$SERVICE_NAME" >/dev/null 2>&1 || true
 sleep 1
 if ! curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
     say "service supervisor not ready — spawning manager directly"
-    nohup "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/main.py" \
-        > "$INSTALL_DIR/bhm.boot.log" 2>&1 &
-    disown 2>/dev/null || true
+    # Run from $INSTALL_DIR so any code that reads config.yaml / VERSION
+    # via cwd-relative paths still works (runit's `run` script also
+    # does `cd ${INSTALL_DIR}` for the same reason).
+    (
+        cd "$INSTALL_DIR" && \
+        nohup "$INSTALL_DIR/.venv/bin/python" "$INSTALL_DIR/main.py" \
+            > "$INSTALL_DIR/bhm.boot.log" 2>&1 &
+        disown 2>/dev/null || true
+    )
     sleep 2
 fi
 
