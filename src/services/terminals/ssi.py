@@ -418,6 +418,36 @@ class SSITerminalAdapter(TerminalAdapter):
             result.rrn,
             result.auth_code,
         )
+        # Mono SSI doesn't auto-print the cardholder slip when an ECR
+        # is driving the transaction — that responsibility shifts to
+        # the cash register. Pull GetLastReceipt and stash the text in
+        # result.terminal_receipt so the frontend can route it onto
+        # the receipt printer. Best-effort: an error here doesn't
+        # invalidate a successful charge, just leaves the slip empty.
+        if result.status == "ok":
+            try:
+                receipt_response = await self._send(
+                    {"method": "GetLastReceipt"}, timeout=5.0,
+                )
+                receipt_text = (
+                    (receipt_response.get("params") or {}).get("receipt")
+                )
+                if receipt_text:
+                    result.terminal_receipt = receipt_text
+                    logger.info(
+                        "[%s] terminal slip fetched (%d chars)",
+                        self.descriptor.id, len(receipt_text),
+                    )
+                else:
+                    logger.warning(
+                        "[%s] GetLastReceipt returned no receipt field",
+                        self.descriptor.id,
+                    )
+            except Exception as exc:  # noqa: BLE001 — slip is best-effort
+                logger.warning(
+                    "[%s] GetLastReceipt failed: %s (charge still ok)",
+                    self.descriptor.id, exc,
+                )
         return result
 
     async def _wait_idle(self) -> Optional[str]:
