@@ -150,12 +150,39 @@ done
 rm -rf "$TMP"
 
 # --- venv + deps ------------------------------------------------------
+# Termux bumps its default `python` (3.11 → 3.13 in mid-2026) every
+# few months. A venv created against the old python keeps pointing at
+# a binary that's been replaced; even when it still imports OK,
+# subsequent `pip install` of pure-Python deps misses precompiled
+# wheels and falls back to rust compilation. Easiest fix: recreate
+# the venv when the system python's version no longer matches the
+# venv's.
+SYS_PY_VER="$(python -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "?")"
+VENV_PY_VER="?"
+if [ -x "$INSTALL_DIR/.venv/bin/python" ]; then
+    VENV_PY_VER="$("$INSTALL_DIR/.venv/bin/python" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "?")"
+fi
+if [ -d "$INSTALL_DIR/.venv" ] && [ "$SYS_PY_VER" != "$VENV_PY_VER" ]; then
+    warn "venv was built on Python $VENV_PY_VER but system has $SYS_PY_VER — recreating"
+    rm -rf "$INSTALL_DIR/.venv"
+fi
 if [ ! -d "$INSTALL_DIR/.venv" ]; then
-    say "creating virtualenv"
+    say "creating virtualenv (Python $SYS_PY_VER)"
     python -m venv "$INSTALL_DIR/.venv"
 fi
 
-say "installing Python dependencies (this is the slow part on Android — Rust crates for cryptography compile)"
+# pydantic-core / pyo3 / cryptography / uvloop all build native
+# extensions when there's no wheel for the current android_arm64+CPython
+# combo. maturin (the build backend for pydantic-core) refuses to
+# proceed without ANDROID_API_LEVEL, killing the whole pip install
+# midway and leaving uvicorn (and friends) unimported next boot.
+# Termux's NDK target is 24 (Android 7); set it so cargo+maturin build.
+# https://github.com/PyO3/maturin/issues/2225
+export ANDROID_API_LEVEL=24
+# uvloop's setup.py also reads this name in some versions:
+export ANDROID_PLATFORM_VERSION=24
+
+say "installing Python dependencies (this is the slow part on Android — Rust crates compile from source when wheels aren't published)"
 "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip >/dev/null
 "$INSTALL_DIR/.venv/bin/pip" install -r "$INSTALL_DIR/requirements.txt"
 
