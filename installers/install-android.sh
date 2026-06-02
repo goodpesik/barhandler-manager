@@ -181,11 +181,17 @@ mkdir -p "$INSTALL_DIR/log"
 # --force re-installs we've already swapped the code on disk, but the
 # old Python process is still in memory holding the previous VERSION.
 # Without this kill, `sv up` is a no-op (process already running) and
-# the operator sees the old version forever — the original "install
-# said success but version didn't bump" bug.
+# the operator sees the old version forever.
 sv down "$SERVICE_NAME" >/dev/null 2>&1 || true
 pkill -f "$INSTALL_DIR/main.py" 2>/dev/null || true
-# Give the OS a tick to release the port so the new process can bind.
+# SIGTERM triggers uvicorn's graceful shutdown which can take 5+ seconds.
+# Wait up to 10s for actual exit; SIGKILL fallback so the new process
+# can bind port 9999.
+for i in 1 2 3 4 5 6 7 8 9 10; do
+    pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1 || break
+    sleep 1
+done
+pkill -9 -f "$INSTALL_DIR/main.py" 2>/dev/null || true
 sleep 1
 
 # Enable + start. `sv` talks to `runsv` over named pipes inside
@@ -214,14 +220,19 @@ if ! curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
             > "$INSTALL_DIR/bhm.boot.log" 2>&1 &
         disown 2>/dev/null || true
     )
-    # Wait up to 2 minutes for /health — Pillow import + zeroconf
-    # spinup + first device scan can take 30-60s on lower-end Android.
+    # Wait up to 2 minutes for the NEW version specifically — Pillow
+    # import + zeroconf spinup + first device scan can take 30-60s on
+    # lower-end Android. Match against VERSION file so a stale process
+    # answering before its SIGTERM completes doesn't fool us.
+    EXPECTED_VERSION="$(cat "$INSTALL_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')"
     WAIT=0
     printf '%s' "▸ waiting for server (0s)"
     while [ $WAIT -lt 120 ]; do
-        if curl -fsS --max-time 2 http://localhost:9999/health >/dev/null 2>&1; then
+        RESP="$(curl -fsS --max-time 2 http://localhost:9999/health 2>/dev/null || true)"
+        if [ -n "$EXPECTED_VERSION" ] && \
+           echo "$RESP" | grep -q "\"version\":\"$EXPECTED_VERSION\""; then
             printf '\n'
-            say "✓ running at http://localhost:9999 (took ${WAIT}s)"
+            say "✓ v${EXPECTED_VERSION} running at http://localhost:9999 (took ${WAIT}s)"
             break
         fi
         sleep 5

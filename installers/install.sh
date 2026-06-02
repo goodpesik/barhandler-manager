@@ -215,28 +215,40 @@ EOF
         LAUNCH_DOMAIN="gui/$(id -u)"
         LAUNCH_TARGET="$LAUNCH_DOMAIN/com.goodpesik.barhandler-manager"
         # Kill BOTH the launchd-managed instance AND any nohup-spawned
-        # process left over from a previous install where launchd
-        # refused. Without this `--force` updates the code on disk
-        # but the old python keeps running with the old VERSION — the
-        # operator sees the same number on the dashboard forever.
+        # process left over from a previous install. Without this
+        # `--force` updates the code on disk but the old python keeps
+        # running with the old VERSION because launchctl bootstrap
+        # is a no-op when port 9999 is still held by the old process.
         launchctl bootout "$LAUNCH_TARGET" 2>/dev/null || true
         pkill -f "$INSTALL_DIR/main.py" 2>/dev/null || true
+        # SIGTERM triggers uvicorn's graceful shutdown which can take
+        # 5+ seconds. Wait up to 10s for the process to actually exit;
+        # if it's still alive after that, escalate to SIGKILL so the
+        # new launchd instance can bind to port 9999.
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1 || break
+            sleep 1
+        done
+        pkill -9 -f "$INSTALL_DIR/main.py" 2>/dev/null || true
         sleep 1
         launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST" 2>&1 || \
             { warn "launchctl bootstrap failed — trying legacy load"; \
               launchctl load "$PLIST" 2>&1 || true; }
         # Don't trust launchctl's exit code: on macOS Sonoma `load`
         # prints "Load failed: 5: Input/output error" to stderr while
-        # returning 0, so a naive `if launchctl load ...` thinks the
-        # service started when it didn't. Truth is whether /health
-        # answers within a few seconds. If launchd loaded the plist
-        # successfully RunAtLoad=true + KeepAlive=true should have the
-        # python up by then; if not, we fall straight through to a
-        # direct nohup spawn so the operator gets a working manager
-        # immediately. The plist stays on disk for the next reboot.
+        # returning 0. Truth is whether /health answers WITH THE NEW
+        # VERSION. Reading just "did /health respond" isn't enough —
+        # the old process can outlive its SIGTERM long enough to answer
+        # a few requests, which used to trick install.sh into declaring
+        # success while the new launchd-spawned process was still
+        # blocked waiting for the port. So poll for an exact-match
+        # version string from the tarball's VERSION file.
+        EXPECTED_VERSION="$(cat "$INSTALL_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')"
         LAUNCHD_OK=0
-        for i in 1 2 3 4 5; do
-            if curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
+        for i in 1 2 3 4 5 6 7 8 9 10; do
+            RESP="$(curl -fsS --max-time 1 http://localhost:9999/health 2>/dev/null || true)"
+            if [ -n "$EXPECTED_VERSION" ] && \
+               echo "$RESP" | grep -q "\"version\":\"$EXPECTED_VERSION\""; then
                 LAUNCHD_OK=1
                 break
             fi
@@ -378,17 +390,21 @@ EOF
 chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/stop.sh" "$INSTALL_DIR/status.sh" "$INSTALL_DIR/update.sh"
 
 # --- smoke test -------------------------------------------------------
-# Poll for up to 2 minutes: a fresh manager has to import Pillow +
-# spin up zeroconf + run device discovery before /health responds.
-# On older boxes that's 30-60s. Show progress every 5s so the operator
-# knows we're still working instead of staring at a frozen prompt.
+# Poll for up to 2 minutes for the NEW version specifically — a stale
+# process can outlive its SIGTERM long enough to answer /health with
+# the old version, which used to trick this loop into declaring
+# success. Match the response against the VERSION file we just rsynced
+# in to know we're talking to the freshly-installed code.
+EXPECTED_VERSION="$(cat "$INSTALL_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')"
 WAIT_MAX=120
 WAIT_ELAPSED=0
 printf '%s' "▸ waiting for server (0s)"
 while [ $WAIT_ELAPSED -lt $WAIT_MAX ]; do
-    if is_running; then
+    RESP="$(curl -fsS --max-time 1 http://localhost:9999/health 2>/dev/null || true)"
+    if [ -n "$EXPECTED_VERSION" ] && \
+       echo "$RESP" | grep -q "\"version\":\"$EXPECTED_VERSION\""; then
         printf '\n'
-        say "✓ manager is up at http://localhost:9999 (took ${WAIT_ELAPSED}s)"
+        say "✓ manager v${EXPECTED_VERSION} is up at http://localhost:9999 (took ${WAIT_ELAPSED}s)"
         break
     fi
     sleep 5
