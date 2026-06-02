@@ -155,7 +155,23 @@ def create_app(config: dict) -> FastAPI:
                     "(not in allow_origins and doesn't match regex)",
                     origin, request.url.path,
                 )
-        return await call_next(request)
+        response = await call_next(request)
+        # Private Network Access (PNA) — Chrome 117+ blocks fetches
+        # from a "public" origin (https://...barhandler.com) to a
+        # "private" network (localhost) unless the preflight explicitly
+        # echoes the PNA header. Starlette's CORSMiddleware doesn't
+        # know about this. Surface symptom is identical to a generic
+        # CORS failure ("HTTP status of preflight didn't indicate
+        # success") with no other clue. Echo it back whenever the
+        # client requests it — by spec, the standard CORS check has
+        # already gated this preflight; PNA is additive on top.
+        if request.headers.get("access-control-request-private-network") == "true":
+            response.headers["access-control-allow-private-network"] = "true"
+            _cors_logger.info(
+                "PNA preflight from origin=%s path=%s — allowing",
+                origin, request.url.path,
+            )
+        return response
 
     async def verify_key(key: str = Security(API_KEY_HEADER)):
         if key != api_key:
