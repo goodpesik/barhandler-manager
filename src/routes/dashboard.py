@@ -144,7 +144,24 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <span class="controls-label">Дії</span>
     <button class="btn btn-default" onclick="scanPrinters(this)">🔍 Сканувати принтери</button>
     <button class="btn btn-default" onclick="scanTerminals(this)">🔍 Сканувати термінали</button>
+    <button class="btn btn-default" onclick="openLogs()">📋 Логи</button>
+    <button class="btn btn-default" onclick="runUsbProbe()">🔌 USB діагностика</button>
   </div>
+
+  <section id="logs-panel" style="display:none;">
+    <h2>
+      Логи
+      <span style="font-weight:normal; font-size:0.9rem; margin-left:1rem;">
+        <button class="btn btn-default" data-log="bhm" onclick="loadLog('bhm', this)">bhm.log</button>
+        <button class="btn btn-default" data-log="boot" onclick="loadLog('boot', this)">bhm.boot.log</button>
+        <button class="btn btn-default" data-log="update" onclick="loadLog('update', this)">update.log</button>
+        <button class="btn btn-default" onclick="refreshLog()">↻</button>
+        <button class="btn btn-default" onclick="closeLogs()">✕</button>
+      </span>
+    </h2>
+    <pre id="log-content"
+         style="background:#111;color:#ddd;padding:1rem;border-radius:6px;overflow:auto;max-height:60vh;font-size:0.8rem;line-height:1.3;white-space:pre-wrap;word-break:break-all;">—</pre>
+  </section>
 
   <section>
     <h2>
@@ -298,6 +315,57 @@ _HTML_TEMPLATE = r"""<!doctype html>
     } finally {
       btn.disabled = false;
       btn.textContent = "🔍 Сканувати принтери";
+    }
+  }
+
+  // ---- logs panel ----------------------------------------------------------
+
+  let currentLog = "bhm";
+
+  function openLogs() {
+    $("logs-panel").style.display = "block";
+    loadLog(currentLog);
+  }
+
+  function closeLogs() {
+    $("logs-panel").style.display = "none";
+  }
+
+  async function loadLog(source, btn) {
+    currentLog = source;
+    $("log-content").textContent = "Завантаження…";
+    try {
+      const res = await api("GET", "/system/logs?source=" + source + "&tail=500", true);
+      if (!res.exists) {
+        $("log-content").textContent = `(${res.path} ще не існує)`;
+        return;
+      }
+      const lines = res.lines || [];
+      $("log-content").textContent = lines.length
+        ? lines.join("\n")
+        : "(порожньо)";
+      const el = $("log-content");
+      el.scrollTop = el.scrollHeight;
+    } catch (e) {
+      $("log-content").textContent = "Помилка: " + (e.message || e);
+    }
+  }
+
+  function refreshLog() {
+    loadLog(currentLog);
+  }
+
+  async function runUsbProbe() {
+    $("logs-panel").style.display = "block";
+    $("log-content").textContent = "Запуск USB діагностики…";
+    try {
+      const res = await api("POST", "/system/usb-probe", true);
+      const out = res.stdout || "";
+      const err = res.stderr || "";
+      $("log-content").textContent =
+        out + (err ? "\n--- stderr ---\n" + err : "");
+    } catch (e) {
+      $("log-content").textContent = "Помилка: " + (e.message || e);
     }
   }
 

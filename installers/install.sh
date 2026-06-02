@@ -164,6 +164,23 @@ fi
 [ -n "$PYTHON" ] || die "Python ${PY_MIN}+ still not available after install attempt"
 say "python: $PYTHON ($("$PYTHON" --version))"
 
+# libusb is pyusb's backend. Without it `usb.core.find()` returns
+# NoBackendError at runtime and discover_usb() silently sees no
+# printers. Linux gets it from apt/dnf/pacman above; on macOS it's
+# a separate brew package. Idempotent — brew install is a no-op when
+# already present.
+if [ "$PLATFORM" = "macos" ]; then
+    BREW="${BREW:-$(find_brew || true)}"
+    if [ -n "$BREW" ]; then
+        if ! "$BREW" list libusb >/dev/null 2>&1; then
+            say "installing libusb (pyusb backend)"
+            "$BREW" install libusb
+        fi
+    else
+        warn "Homebrew not found — install it from https://brew.sh and re-run, otherwise USB printer discovery won't work"
+    fi
+fi
+
 # --- udev rules (Linux only — give the user access to USB printers) --
 if [ "$PLATFORM" != "macos" ]; then
     UDEV_RULE="/etc/udev/rules.d/99-barhandler-manager.rules"
