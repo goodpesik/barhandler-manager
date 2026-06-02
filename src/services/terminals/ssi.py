@@ -357,9 +357,56 @@ class SSITerminalAdapter(TerminalAdapter):
         # The terminal is now busy. Poll status, interrupting after the
         # overall window so a stalled cashier interaction can't block
         # the event loop indefinitely.
-        await self._wait_idle()
-        logger.info("[%s] charge idle reached, fetching final result", self.descriptor.id)
+        idle_status = await self._wait_idle()
+        logger.info(
+            "[%s] charge idle reached (status=%s), fetching first-step result",
+            self.descriptor.id, idle_status,
+        )
 
+        # Mono/Privat SSI is a TWO-STEP purchase per doc §3.1 — step:1
+        # reads the card and shows the amount, terminal parks in S08
+        # ("Очікується другий крок"), GetLastResult returns
+        # transactionResult="FIRST_STEP_COMPLETED" with the PAN/track but
+        # no authCode/rrn. The ECR MUST then send Purchase step:2 to
+        # actually authorise the transaction. Without step:2 the operator
+        # sees the card read, then "decline" — the bank never sees the
+        # auth request because we never sent it.
+        first = await self.get_last_result(
+            transaction_uid=request.transaction_uid,
+        )
+        needs_step_two = (
+            idle_status == "S08"
+            or (first.raw_transaction_result == "FIRST_STEP_COMPLETED")
+        )
+        if not needs_step_two:
+            logger.info(
+                "[%s] single-step charge complete: status=%s raw=%s",
+                self.descriptor.id, first.status, first.raw_transaction_result,
+            )
+            return first
+
+        logger.info(
+            "[%s] first step done (raw=%s), sending step:2 for authorisation",
+            self.descriptor.id, first.raw_transaction_result,
+        )
+        ack2 = await self._send(
+            {"method": "Purchase", "step": "2", "params": params},
+        )
+        business2 = _business_error_to_result(ack2)
+        if business2 is not None:
+            logger.info(
+                "[%s] step:2 ack business-rejected: status=%s code=%s",
+                self.descriptor.id, business2.status, business2.error_code,
+            )
+            return business2
+        _raise_if_error(ack2, default_code="charge_step2_rejected")
+
+        # Wait for the second step to complete (authorisation + receipt).
+        idle2 = await self._wait_idle()
+        logger.info(
+            "[%s] step:2 idle reached (status=%s), fetching final result",
+            self.descriptor.id, idle2,
+        )
         result = await self.get_last_result(
             transaction_uid=request.transaction_uid,
         )
@@ -373,11 +420,15 @@ class SSITerminalAdapter(TerminalAdapter):
         )
         return result
 
-    async def _wait_idle(self) -> None:
-        """Poll GetStatus until S00 / S08 (idle for next op). Honours
-        the protocol's ≥0.25s inter-request pause and the doc's 15s
-        per-request timeout; gives up after STATUS_POLL_MAX_S and tries
-        an Interrupt so we don't leave the terminal locked."""
+    async def _wait_idle(self) -> Optional[str]:
+        """Poll GetStatus until S00 / S08 (idle for next op or waiting
+        for the second step of a multi-pass operation). Returns the
+        terminal status that broke the loop so callers can branch on
+        S08 ("send step:2") vs S00 ("operation complete").
+
+        Honours the protocol's ≥0.25s inter-request pause and the
+        doc's 15s per-request timeout; gives up after STATUS_POLL_MAX_S
+        and tries an Interrupt so we don't leave the terminal locked."""
         deadline = asyncio.get_running_loop().time() + STATUS_POLL_MAX_S
         while True:
             await asyncio.sleep(INTER_REQUEST_PAUSE_S)
@@ -387,7 +438,7 @@ class SSITerminalAdapter(TerminalAdapter):
                 or (status_response.get("params") or {}).get("status")
             )
             if status in _IDLE_STATUSES:
-                return
+                return status
             if asyncio.get_running_loop().time() > deadline:
                 # Best-effort cancel and surface as timeout — the
                 # caller maps this onto a "cancelled" AcquirerResult.
