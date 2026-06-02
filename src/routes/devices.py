@@ -20,10 +20,14 @@ from fastapi import APIRouter, HTTPException, Request
 
 from src.devices.registry import UnknownPrinter
 from src.models.printer import (
+    PrintProtocol,
     PrinterDescriptor,
+    PrinterKind,
     PrinterRegistration,
     RegistrationRequest,
 )
+from src.services.bitmap_render import dots_for, render_paragraph
+from src.services.tspl_render import image_to_tspl_bitmap
 
 router = APIRouter()
 
@@ -239,6 +243,49 @@ async def test_print(printer_id: str, request: Request) -> dict:
         raise HTTPException(status_code=503, detail=f"printer connect failed: {exc}")
     if not device.is_connected():
         raise HTTPException(status_code=503, detail="printer_unavailable")
+
+    # Label printers in TSPL mode silently drop ESC/POS bytes, so the
+    # legacy demo below would return 200 with nothing physically on the
+    # roll. Send a real TSPL bitmap instead — same handshake the
+    # production /print/label uses, but with a self-describing payload.
+    protocol = getattr(reg, "protocol", PrintProtocol.escpos)
+    if reg.kind == PrinterKind.label and protocol == PrintProtocol.tspl:
+        label_width = reg.paper_width
+        label_height = getattr(reg, "label_height", 25)
+        gap = getattr(reg, "label_gap", 2.25)
+        dot_width = dots_for(label_width)
+        lines = [
+            "ТЕСТ ДРУКУ",
+            reg.nickname or reg.descriptor.label or "label",
+            f"{label_width}x{label_height} mm",
+            f"gap {gap:g} mm  tspl",
+        ]
+        img = render_paragraph(
+            "\n".join(lines),
+            width_px=dot_width,
+            bold=True,
+            align="center",
+        )
+        blob = image_to_tspl_bitmap(
+            img,
+            label_width_mm=label_width,
+            label_height_mm=label_height,
+            gap_mm=gap,
+            copies=1,
+        )
+
+        async def _tspl_job(esc):
+            esc._raw(blob)
+
+        try:
+            await device.enqueue(_tspl_job)
+        except Exception as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        return {
+            "status": "printed",
+            "printer_id": printer_id,
+            "protocol": protocol.value if hasattr(protocol, "value") else protocol,
+        }
 
     chars = reg.chars_per_line
 
