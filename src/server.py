@@ -103,11 +103,24 @@ def create_app(config: dict) -> FastAPI:
         r"|https://([a-zA-Z0-9-]+\.)*fitstudiocrm\.com"
         r")$"
     )
+    # NB: `allow_credentials=True` + `allow_headers=["*"]` is invalid
+    # per the CORS spec — wildcard `Access-Control-Allow-Headers` is
+    # only permitted when credentials are NOT in play. Starlette
+    # silently rejects preflights from some clients (observed on
+    # Android Chrome inside an emulator) when this combo is set,
+    # surfacing as "HTTP status of preflight request didn't indicate
+    # success" with no explicit error.
+    #
+    # We use X-Api-Key (a custom header, not a cookie) for auth, so
+    # credentials=True buys nothing — the browser doesn't carry our
+    # auth bit via cookies anyway. Setting it to False lets the
+    # wildcard headers + wildcard methods stay legal under the spec
+    # and Starlette stops being picky.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
         allow_origin_regex=cors_origin_regex,
-        allow_credentials=True,
+        allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],
     )
