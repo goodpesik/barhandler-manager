@@ -99,6 +99,82 @@ async def trigger_update() -> dict:
     }
 
 
+_LOG_SOURCES = {
+    "bhm": _INSTALL_DIR / "bhm.log",
+    "boot": _INSTALL_DIR / "bhm.boot.log",
+    "update": _UPDATE_LOG,
+}
+
+
+@router.get("/logs")
+async def read_log(source: str = "bhm", tail: int = 300) -> dict:
+    """Return the last N lines of one of the manager's three log files.
+    Dashboard surfaces these in a tabbed panel so the operator doesn't
+    have to SSH in for routine diagnosis.
+
+    - `bhm`    rotating app log (Python logger output: SSI flow, charges,
+               errors)
+    - `boot`   bhm.boot.log — stdout/stderr from the nohup-spawned
+               process (uvicorn output, startup tracebacks, port-bind
+               errors)
+    - `update` ~/.barhandler-manager/update.log — what happened during
+               the last dashboard-triggered update
+    """
+    path = _LOG_SOURCES.get(source)
+    if path is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown log source '{source}' — pick one of {list(_LOG_SOURCES)}",
+        )
+    if not path.exists():
+        return {"source": source, "path": str(path), "lines": [], "exists": False}
+    tail = max(1, min(tail, 2000))
+    try:
+        text = path.read_text(errors="replace")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"can't read {path}: {exc}") from exc
+    lines = text.splitlines()[-tail:]
+    return {"source": source, "path": str(path), "lines": lines, "exists": True}
+
+
+@router.post("/usb-probe")
+async def usb_probe() -> dict:
+    """Run the standalone USB diagnostic and return its output.
+
+    Tells the operator whether libusb sees the printer at all and
+    whether it reports the standard USB Printer Class (0x07) we
+    filter on. Replaces the curl-and-paste workflow for "manager
+    can't find my printer" tickets.
+    """
+    import subprocess as _sp
+    script = _INSTALL_DIR / "scripts" / "usb_probe.py"
+    python = _INSTALL_DIR / ".venv" / "bin" / "python"
+    if not script.exists():
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"{script} not found — run install --force to pull "
+                "the latest scripts."
+            ),
+        )
+    if not python.exists():
+        raise HTTPException(
+            status_code=500, detail=f"venv python not found at {python}",
+        )
+    try:
+        proc = _sp.run(
+            [str(python), str(script)],
+            capture_output=True, text=True, timeout=15,
+        )
+    except _sp.TimeoutExpired:
+        raise HTTPException(status_code=504, detail="usb probe timed out (>15s)")
+    return {
+        "exit_code": proc.returncode,
+        "stdout": proc.stdout,
+        "stderr": proc.stderr,
+    }
+
+
 @router.get("/update-log")
 async def read_update_log(tail: int = 200) -> dict:
     """Return the last N lines of update.log so the dashboard can show
