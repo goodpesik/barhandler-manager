@@ -82,8 +82,26 @@ def create_app(config: dict) -> FastAPI:
     # `bar-handler--preview-abc.web.app`, which the regex below covers.
     # Operators can still override with their own cors_origin_regex
     # in config.yaml if they need something narrower.
+    # Default regex covers:
+    #  - any Firebase Hosting subdomain (production + preview channels)
+    #  - any *.firebaseapp.com fallback URL
+    #  - tenant deployments on barhandler.com / petshandler.com /
+    #    fitstudiocrm.com — apex domains AND any subdomain depth
+    #    (biergarten-lviv.barhandler.com, app.fitstudiocrm.com, etc.)
+    #  - localhost on any port via http or https (covers dev servers
+    #    and Capacitor Android wrappers, which use `https://localhost`)
+    #  - capacitor://localhost (Capacitor 4+ native bridge)
+    # X-Api-Key middleware still gates every request, so liberal CORS
+    # here is safe — the key is what actually authorises calls.
     cors_origin_regex = config["server"].get("cors_origin_regex") or (
-        r"^https://[a-zA-Z0-9-]+\.(web\.app|firebaseapp\.com)$"
+        r"^("
+        r"https?://localhost(:\d+)?"
+        r"|capacitor://localhost"
+        r"|https://[a-zA-Z0-9-]+\.(web\.app|firebaseapp\.com)"
+        r"|https://([a-zA-Z0-9-]+\.)*barhandler\.com"
+        r"|https://([a-zA-Z0-9-]+\.)*petshandler\.com"
+        r"|https://([a-zA-Z0-9-]+\.)*fitstudiocrm\.com"
+        r")$"
     )
     app.add_middleware(
         CORSMiddleware,
