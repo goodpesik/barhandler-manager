@@ -86,6 +86,42 @@ have_python() {
         python3 -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"
 }
 
+# Resolve an absolute path to a Python >=3.11 interpreter. Prefer
+# explicitly-versioned binaries (python3.13/3.12/3.11) over plain
+# `python3` because on macOS the latter often resolves to /usr/bin/
+# python3 -> the Apple Command Line Tools 3.8, which is too old for
+# pydantic v2's PEP-585 type hints (`list[X]`). Returns empty if
+# nothing qualifies.
+find_python() {
+    for py in python3.13 python3.12 python3.11; do
+        if command -v "$py" >/dev/null 2>&1; then
+            command -v "$py"
+            return 0
+        fi
+    done
+    # Brew puts versioned interpreters under <prefix>/opt/python@X.Y/
+    # bin/ but doesn't always symlink them onto PATH — probe directly.
+    for prefix in /opt/homebrew /usr/local; do
+        for py in python3.13 python3.12 python3.11; do
+            if [ -x "$prefix/bin/$py" ]; then
+                echo "$prefix/bin/$py"
+                return 0
+            fi
+            ver="${py#python}"
+            if [ -x "$prefix/opt/python@$ver/bin/$py" ]; then
+                echo "$prefix/opt/python@$ver/bin/$py"
+                return 0
+            fi
+        done
+    done
+    # Last resort: plain python3 if it happens to be new enough.
+    if have_python; then
+        command -v python3
+        return 0
+    fi
+    return 1
+}
+
 # brew may be present without being in PATH (rare but possible if the
 # operator installed it under a custom prefix). Probe absolute paths
 # before giving up.
@@ -100,13 +136,15 @@ find_brew() {
     return 1
 }
 
-if ! have_python; then
+PYTHON="$(find_python || true)"
+if [ -z "$PYTHON" ]; then
     say "Python ${PY_MIN}+ not found — installing"
     case "$PLATFORM" in
         macos)
             BREW="$(find_brew)" || \
                 die "Homebrew not installed. Get it from https://brew.sh and re-run."
             "$BREW" install python@3.11
+            PYTHON="$(find_python || true)"
             ;;
         raspberry|linux)
             if command -v apt >/dev/null; then
@@ -119,10 +157,12 @@ if ! have_python; then
             else
                 die "no supported package manager (apt/dnf/pacman) found"
             fi
+            PYTHON="$(find_python || true)"
             ;;
     esac
 fi
-say "python: $(python3 --version)"
+[ -n "$PYTHON" ] || die "Python ${PY_MIN}+ still not available after install attempt"
+say "python: $PYTHON ($("$PYTHON" --version))"
 
 # --- udev rules (Linux only — give the user access to USB printers) --
 if [ "$PLATFORM" != "macos" ]; then
@@ -175,9 +215,26 @@ done
 rm -rf "$TMP"
 
 # --- venv + deps ------------------------------------------------------
-if [ ! -d "$INSTALL_DIR/.venv" ]; then
-    say "creating virtualenv"
-    python3 -m venv "$INSTALL_DIR/.venv"
+# Recreate venv if it's missing OR if it was built against an outdated
+# Python. Field case (macOS Intel, Yana's box): a previous install
+# created the venv with Apple's /usr/bin/python3 (3.8), then brew
+# install python@3.11 succeeded but the venv was never rebuilt — so
+# pydantic 2 crashed on `list[MerchantBinding]` PEP-585 syntax that
+# 3.8 can't parse. Check the venv's actual python version each run.
+NEED_VENV=1
+if [ -d "$INSTALL_DIR/.venv" ]; then
+    if "$INSTALL_DIR/.venv/bin/python" \
+           -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)" \
+           >/dev/null 2>&1; then
+        NEED_VENV=0
+    else
+        warn "existing venv is on an outdated Python — recreating from $PYTHON"
+        rm -rf "$INSTALL_DIR/.venv"
+    fi
+fi
+if [ $NEED_VENV -eq 1 ]; then
+    say "creating virtualenv from $PYTHON"
+    "$PYTHON" -m venv "$INSTALL_DIR/.venv"
 fi
 say "installing Python dependencies"
 "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip >/dev/null
