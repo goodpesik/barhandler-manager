@@ -20,11 +20,12 @@ from pydantic import BaseModel, Field
 from src.devices.printer import PrinterUnavailable
 from src.devices.registry import UnknownPrinter
 from src.models.fiscal_receipt import FiscalReceipt
-from src.models.printer import PrinterKind
+from src.models.printer import PrintProtocol, PrinterKind
 from src.models.receipt import ReceiptPayload
 from src.services.bitmap_render import dots_for, image_to_gs_v_0
 from src.services.fiscal_receipt import render_fiscal_receipt
 from src.services.receipt import render_receipt
+from src.services.tspl_render import image_to_tspl_bitmap
 
 router = APIRouter()
 
@@ -200,6 +201,14 @@ async def print_lines(
 
 class LabelPayload(BaseModel):
     image_base64: str
+    # PET-182 / label-designer — the FE template knows its own paper
+    # size; pass it through so the BE doesn't have to assume. All
+    # optional: when omitted the manager falls back to the registered
+    # printer's paper_width / label_height / label_gap so a `curl` test
+    # still works without re-registering.
+    width_mm: Optional[int] = None
+    height_mm: Optional[int] = None
+    gap_mm: Optional[float] = None
 
 
 @router.post("/label")
@@ -210,12 +219,27 @@ async def print_label(
 ):
     """Print a pre-rendered label image (base64 PNG) on the label printer.
 
-    The image is resized to exactly the printer's dot width, converted to
-    1-bit, and sent via GS v 0. No paper cut — label printers use tear-off
-    or continuous stock; cutting would jam the mechanism.
+    Branches on the registration's `protocol`:
+      - `escpos`: legacy path, GS v 0 raster bitmap. Works for receipt
+        printers configured to print labels (continuous tape, no gap).
+      - `tspl` (default for label kind): TSPL `BITMAP` + `PRINT` with
+        SIZE/GAP framing so the printer aligns to the next label and
+        feeds to tear-off position. This is what XP-246B / 235B etc.
+        expect in their factory "LABEL" mode.
+
+    No paper cut either way — label printers use tear-off or continuous
+    stock; cutting would jam the mechanism.
     """
     reg, device = await _resolve_printer(request, printer_id, PrinterKind.label)
-    dot_width = dots_for(reg.paper_width)
+
+    # Per-job paper size wins over the registration default. Lets the
+    # FE label designer be the source of truth for "this template is
+    # 40x25mm" without forcing operators to re-register every printer
+    # when they swap label stock.
+    label_width = payload.width_mm or reg.paper_width
+    label_height = payload.height_mm or getattr(reg, "label_height", 25)
+    gap = payload.gap_mm if payload.gap_mm is not None else getattr(reg, "label_gap", 2.25)
+    dot_width = dots_for(label_width)
 
     try:
         raw = base64.b64decode(payload.image_base64)
@@ -229,11 +253,26 @@ async def print_label(
         new_h = max(1, int(orig_h * dot_width / orig_w))
         img = img.resize((dot_width, new_h), Image.LANCZOS)
 
-    img = img.convert("1")
-    raster = image_to_gs_v_0(img)
+    # Threshold-binarize without Floyd-Steinberg dithering. PIL's default
+    # convert("1") dithers, which scatters antialiased glyph edges as
+    # speckled mid-grey dots — letters look thin and washed-out on
+    # thermal stock. Pure threshold at 180 instead keeps antialiased
+    # edge pixels as solid black, fattening glyphs by ~1 dot.
+    img = img.convert("L").point(lambda v: 0 if v < 180 else 255, mode="1")
+    protocol = getattr(reg, "protocol", PrintProtocol.escpos)
+    if protocol == PrintProtocol.tspl:
+        blob = image_to_tspl_bitmap(
+            img,
+            label_width_mm=label_width,
+            label_height_mm=label_height,
+            gap_mm=gap,
+            copies=1,
+        )
+    else:
+        blob = image_to_gs_v_0(img)
 
     async def _job(esc):
-        esc._raw(raster)
+        esc._raw(blob)
 
     try:
         await device.enqueue(_job)
@@ -242,7 +281,11 @@ async def print_label(
             status_code=503,
             detail={"code": getattr(exc, "code", "unavailable"), "message": str(exc)},
         )
-    return {"status": "printed", "printer_id": reg.descriptor.id}
+    return {
+        "status": "printed",
+        "printer_id": reg.descriptor.id,
+        "protocol": protocol.value if hasattr(protocol, "value") else protocol,
+    }
 
 
 class KitchenItem(BaseModel):

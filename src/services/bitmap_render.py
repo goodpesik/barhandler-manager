@@ -24,7 +24,8 @@ FONT_BOLD = ASSETS_DIR / "NotoSansMono-Bold.ttf"
 
 # Dot widths of common thermal printer paper sizes.
 # 48mm label (XP-246B): 8 dots/mm × 48mm = 384 printable dots (same pitch as 58mm).
-PAPER_DOTS = {48: 384, 58: 384, 80: 576}
+# 40mm label: 8 dots/mm × 40mm = 320 dots — common Xprinter label stock.
+PAPER_DOTS = {40: 320, 48: 384, 58: 384, 80: 576}
 
 # Base font size in pixels for "normal" text. Tuned so Noto Sans Mono
 # fits exactly 32 chars across 58mm (384 dots) and 48 chars across 80mm
@@ -35,7 +36,11 @@ Align = Literal["left", "center", "right"]
 
 
 def dots_for(paper_width_mm: int) -> int:
-    return PAPER_DOTS.get(paper_width_mm, PAPER_DOTS[58])
+    # Known sizes win; otherwise compute from the 8 dots/mm pitch every
+    # thermal head we've seen uses, rounded to the byte boundary.
+    if paper_width_mm in PAPER_DOTS:
+        return PAPER_DOTS[paper_width_mm]
+    return max(8, (paper_width_mm * 8 // 8) * 8)
 
 
 def _font(*, bold: bool, scale: float) -> ImageFont.FreeTypeFont:
