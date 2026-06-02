@@ -94,6 +94,38 @@ def create_app(config: dict) -> FastAPI:
         allow_headers=["*"],
     )
 
+    # CORS rejections are otherwise silent — uvicorn logs a `400 Bad
+    # Request` for the preflight but doesn't say WHY, leaving the
+    # operator to guess "is this CORS, auth, or a real bug?" Log each
+    # cross-origin OPTIONS with its outcome so the dashboard's bhm.log
+    # tab shows exactly which Origin got rejected and what's allowed.
+    import logging as _logging
+    import re as _re
+    _cors_logger = _logging.getLogger("src.cors")
+    _cors_origins_set = set(cors_origins)
+    _cors_regex_compiled = _re.compile(cors_origin_regex) if cors_origin_regex else None
+    _cors_logger.info(
+        "CORS allowed_origins=%s allowed_regex=%r",
+        cors_origins, cors_origin_regex,
+    )
+
+    @app.middleware("http")
+    async def log_cors_rejections(request, call_next):
+        origin = request.headers.get("origin")
+        if origin and request.method == "OPTIONS":
+            allowed = (
+                origin in _cors_origins_set
+                or (_cors_regex_compiled is not None
+                    and _cors_regex_compiled.match(origin) is not None)
+            )
+            if not allowed:
+                _cors_logger.warning(
+                    "preflight REJECTED origin=%s path=%s "
+                    "(not in allow_origins and doesn't match regex)",
+                    origin, request.url.path,
+                )
+        return await call_next(request)
+
     async def verify_key(key: str = Security(API_KEY_HEADER)):
         if key != api_key:
             raise HTTPException(status_code=401, detail="Invalid API key")
