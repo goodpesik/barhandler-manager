@@ -154,6 +154,14 @@ class AcquirerResult(BaseModel):
     fiscal_receipt_id: Optional[str] = None  # adv.natr — ДПС fiscal
     bank_receipt_id: Optional[int] = None    # adv.rid — bank е-чек
     fiscal_receipt_text: Optional[str] = None  # GetReceiptInfo.receipt — printable text
+    # Bank-side acquirer slip ("чек термінала"): the strip of text the
+    # cardholder normally gets — RRN, masked PAN, auth code, amount,
+    # bank/merchant name. In stand-alone use the terminal prints this
+    # itself; in SSI-driven mode the terminal hands it back via
+    # GetLastReceipt (doc §5.5.2) and the ECR is responsible for
+    # printing it on its receipt roll. Plain text on Linux terminals,
+    # XML (with optional hex-encoded logos) on Android.
+    terminal_receipt: Optional[str] = None
     vendor_data: dict = Field(default_factory=dict)  # full GetLastResult.params
 
 
