@@ -73,10 +73,18 @@ def create_app(config: dict) -> FastAPI:
         "http://localhost:4115",      # bar-handler-app dev server
         "http://localhost:4200",      # generic Angular default
         "http://localhost:8080",
-        "https://bar-handler.web.app",
         "https://barhandler.com",
     ]
-    cors_origin_regex = config["server"].get("cors_origin_regex")
+    # Match every Firebase Hosting subdomain (production sites, preview
+    # channels, and *.firebaseapp.com fallback URLs) so newly-deployed
+    # projects don't need a manager-side config bump to talk to the
+    # local bridge. Preview channels use a `--` separator like
+    # `bar-handler--preview-abc.web.app`, which the regex below covers.
+    # Operators can still override with their own cors_origin_regex
+    # in config.yaml if they need something narrower.
+    cors_origin_regex = config["server"].get("cors_origin_regex") or (
+        r"^https://[a-zA-Z0-9-]+\.(web\.app|firebaseapp\.com)$"
+    )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
