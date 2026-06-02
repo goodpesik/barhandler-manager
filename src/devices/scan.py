@@ -298,8 +298,17 @@ def discover_network_terminals(
 
     subnet = _local_subnet()
     if subnet is None:
+        logger.warning(
+            "terminal discovery: could not detect local subnet — no Wi-Fi/"
+            "network interface? (UDP-connect to 8.8.8.8 failed)",
+        )
         return []
     hosts = [str(h) for h in subnet.hosts()]
+    logger.info(
+        "terminal discovery: scanning subnet %s (%d hosts) ports SSI=%d PB=%d "
+        "tcp_timeout=%.1fs",
+        subnet, len(hosts), SSI_TCP_PORT, PB_TCP_PORT, timeout,
+    )
     ssi_hosts: list[str] = []
     pb_hosts: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
@@ -316,7 +325,21 @@ def discover_network_terminals(
                 continue
             (ssi_hosts if kind == "ssi" else pb_hosts).append(host)
 
+    logger.info(
+        "terminal discovery: TCP-open hosts SSI=%s PB=%s",
+        ssi_hosts or "[]", pb_hosts or "[]",
+    )
     if not ssi_hosts and not pb_hosts:
+        logger.warning(
+            "terminal discovery: nothing answered on port %d (SSI) or %d (PB) "
+            "across %s. Common causes: terminal on a different Wi-Fi / "
+            "subnet; guest-network client isolation; manager host firewall; "
+            "Android Wi-Fi power-save dropping multicast (irrelevant here — "
+            "we use TCP unicast, but worth knowing). Verify with: "
+            "`curl -v --max-time 3 telnet://<terminal-ip>:%d` from the "
+            "manager host.",
+            SSI_TCP_PORT, PB_TCP_PORT, subnet, SSI_TCP_PORT,
+        )
         return []
 
     # Probes are async (asyncio.open_connection). Run them sequentially
