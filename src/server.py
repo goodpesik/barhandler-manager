@@ -85,8 +85,9 @@ def create_app(config: dict) -> FastAPI:
     # Default regex covers:
     #  - any Firebase Hosting subdomain (production + preview channels)
     #  - any *.firebaseapp.com fallback URL
-    #  - any *.barhandler.com subdomain (per-tenant deployments like
-    #    biergarten-lviv.barhandler.com), and the apex domain itself
+    #  - tenant deployments on barhandler.com / petshandler.com /
+    #    fitstudiocrm.com — apex domains AND any subdomain depth
+    #    (biergarten-lviv.barhandler.com, app.fitstudiocrm.com, etc.)
     #  - localhost on any port via http or https (covers dev servers
     #    and Capacitor Android wrappers, which use `https://localhost`)
     #  - capacitor://localhost (Capacitor 4+ native bridge)
@@ -98,6 +99,8 @@ def create_app(config: dict) -> FastAPI:
         r"|capacitor://localhost"
         r"|https://[a-zA-Z0-9-]+\.(web\.app|firebaseapp\.com)"
         r"|https://([a-zA-Z0-9-]+\.)*barhandler\.com"
+        r"|https://([a-zA-Z0-9-]+\.)*petshandler\.com"
+        r"|https://([a-zA-Z0-9-]+\.)*fitstudiocrm\.com"
         r")$"
     )
     app.add_middleware(
