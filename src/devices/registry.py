@@ -16,6 +16,7 @@ from typing import Dict, Optional
 from src.devices.printer import PrinterDevice
 from src.devices.scan import discover_all
 from src.models.printer import (
+    PrintProtocol,
     PrinterDescriptor,
     PrinterKind,
     PrinterRegistration,
@@ -52,13 +53,25 @@ class PrinterRegistry:
         except Exception as exc:
             logger.warning("printers.json unreadable: %s", exc)
             return
+        upgraded = False
         for entry in raw.get("printers", []):
             try:
                 reg = PrinterRegistration.model_validate(entry)
             except Exception as exc:
                 logger.warning("skipping bad registration: %s", exc)
                 continue
+            # Auto-upgrade: a label-kind printer registered before
+            # PrintProtocol existed loads with protocol=escpos (default),
+            # but XP-246B & friends ship in TSPL mode — keep them
+            # working without forcing the operator to re-register.
+            kind_value = reg.kind.value if hasattr(reg.kind, "value") else reg.kind
+            had_protocol = "protocol" in entry
+            if not had_protocol and kind_value == "label":
+                reg.protocol = PrintProtocol.tspl
+                upgraded = True
             self._registrations[reg.descriptor.id] = reg
+        if upgraded:
+            self.save()
         logger.info("loaded %d registered printers", len(self._registrations))
 
     def save(self) -> None:
@@ -104,7 +117,19 @@ class PrinterRegistry:
                     f"{req.id}: run /devices/discover first or provide a known id"
                 )
             descriptor = existing.descriptor
-        reg = PrinterRegistration(
+        # PrintProtocol auto-default: dedicated label printers default
+        # to TSPL (they ship in `Print mode: LABEL` and silently ignore
+        # ESC/POS) — everything else defaults to ESC/POS. The operator
+        # can override either way via the request.
+        if req.protocol is not None:
+            protocol = req.protocol
+        else:
+            protocol = (
+                PrintProtocol.tspl
+                if req.kind == PrinterKind.label
+                else PrintProtocol.escpos
+            )
+        kwargs = dict(
             descriptor=descriptor,
             kind=req.kind,
             nickname=req.nickname,
@@ -112,7 +137,13 @@ class PrinterRegistry:
             render_mode=req.render_mode,
             code_page=req.code_page,
             drawer_pin=req.drawer_pin,
+            protocol=protocol,
         )
+        if req.label_height is not None:
+            kwargs["label_height"] = req.label_height
+        if req.label_gap is not None:
+            kwargs["label_gap"] = req.label_gap
+        reg = PrinterRegistration(**kwargs)
         self._registrations[descriptor.id] = reg
         self.save()
         return reg

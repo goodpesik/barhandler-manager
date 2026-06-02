@@ -32,6 +32,24 @@ class PrinterTransport(str, Enum):
     bluetooth = "bluetooth"
 
 
+class PrintProtocol(str, Enum):
+    """Wire protocol the printer's firmware speaks.
+
+    Most 58/80mm thermal receipt printers default to ESC/POS — that's
+    what `esc._raw(GS v 0 ...)` expects. Dedicated label printers like
+    Xprinter XP-246B/235B ship in "LABEL" / TSPL mode (`Print mode:
+    LABEL` on self-test) and silently ignore ESC/POS commands. For
+    those we send TSPL bitmap commands instead.
+
+    Operators can flip an XP-246B to ESC/POS via the Xprinter Diag
+    Tool, but TSPL is the better default for label printers because
+    it has proper label/gap awareness and tear-off positioning.
+    """
+
+    escpos = "escpos"
+    tspl = "tspl"
+
+
 class UsbAddress(BaseModel):
     vendor_id: int
     product_id: int
@@ -75,6 +93,14 @@ class PrinterRegistration(BaseModel):
     render_mode: str = "bitmap"            # "bitmap" (default) | "native"
     code_page: Optional[str] = None        # only used when render_mode=native
     drawer_pin: Optional[int] = 0          # 0 / 1 / None to disable
+    # Wire protocol — see PrintProtocol. Default escpos covers every
+    # receipt-style printer; flip to tspl for dedicated label printers
+    # (XP-246B / 235B / 237B) shipping in `Print mode: LABEL`.
+    protocol: PrintProtocol = PrintProtocol.escpos
+    # Label-specific layout (used by `/print/label` when protocol=tspl).
+    # Default 48×25mm + 2.25mm gap matches the XP-246B factory roll.
+    label_height: int = 25                 # mm — physical label length
+    label_gap: float = 2.25                # mm — gap between labels
 
     @property
     def chars_per_line(self) -> int:
@@ -92,6 +118,9 @@ class RegistrationRequest(BaseModel):
     render_mode: str = "bitmap"
     code_page: Optional[str] = None
     drawer_pin: Optional[int] = 0
+    protocol: Optional[PrintProtocol] = None  # None → auto: tspl for label, escpos otherwise
+    label_height: Optional[int] = None
+    label_gap: Optional[float] = None
 
 
 def make_id(transport: PrinterTransport, *parts: str) -> str:
