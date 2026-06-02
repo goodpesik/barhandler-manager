@@ -140,38 +140,62 @@ def create_app(config: dict) -> FastAPI:
         cors_origins, cors_origin_regex,
     )
 
+    from starlette.responses import Response as _StarletteResponse
+
     @app.middleware("http")
-    async def log_cors_rejections(request, call_next):
+    async def cors_and_pna(request, call_next):
         origin = request.headers.get("origin")
-        if origin and request.method == "OPTIONS":
-            allowed = (
-                origin in _cors_origins_set
-                or (_cors_regex_compiled is not None
-                    and _cors_regex_compiled.match(origin) is not None)
+        is_preflight = request.method == "OPTIONS" and origin is not None
+        is_pna_preflight = (
+            is_preflight
+            and request.headers.get("access-control-request-private-network") == "true"
+        )
+        allowed = origin is not None and (
+            origin in _cors_origins_set
+            or (_cors_regex_compiled is not None
+                and _cors_regex_compiled.match(origin) is not None)
+        )
+
+        # Private Network Access (PNA, Chrome 117+) — fetches from a
+        # "public" origin to a "private" target (anything in 127/8)
+        # need an extra preflight signal: `Access-Control-Request-
+        # Private-Network: true` from the browser, and we MUST echo
+        # `Access-Control-Allow-Private-Network: true` back. Starlette's
+        # CORSMiddleware knows about PNA but refuses it by default
+        # (returns 400 "Disallowed CORS private-network"), and exposes
+        # no flag to opt in. So we short-circuit the PNA preflight
+        # ourselves before CORSMiddleware sees it.
+        if is_pna_preflight and allowed:
+            requested_method = request.headers.get(
+                "access-control-request-method", "GET",
             )
-            if not allowed:
-                _cors_logger.warning(
-                    "preflight REJECTED origin=%s path=%s "
-                    "(not in allow_origins and doesn't match regex)",
-                    origin, request.url.path,
-                )
-        response = await call_next(request)
-        # Private Network Access (PNA) — Chrome 117+ blocks fetches
-        # from a "public" origin (https://...barhandler.com) to a
-        # "private" network (localhost) unless the preflight explicitly
-        # echoes the PNA header. Starlette's CORSMiddleware doesn't
-        # know about this. Surface symptom is identical to a generic
-        # CORS failure ("HTTP status of preflight didn't indicate
-        # success") with no other clue. Echo it back whenever the
-        # client requests it — by spec, the standard CORS check has
-        # already gated this preflight; PNA is additive on top.
-        if request.headers.get("access-control-request-private-network") == "true":
-            response.headers["access-control-allow-private-network"] = "true"
+            requested_headers = request.headers.get(
+                "access-control-request-headers", "*",
+            )
             _cors_logger.info(
                 "PNA preflight from origin=%s path=%s — allowing",
                 origin, request.url.path,
             )
-        return response
+            return _StarletteResponse(
+                status_code=200,
+                headers={
+                    "access-control-allow-origin": origin,
+                    "access-control-allow-methods": requested_method,
+                    "access-control-allow-headers": requested_headers,
+                    "access-control-allow-private-network": "true",
+                    "access-control-max-age": "600",
+                    "vary": "Origin",
+                },
+            )
+
+        if is_preflight and not allowed:
+            _cors_logger.warning(
+                "preflight REJECTED origin=%s path=%s "
+                "(not in allow_origins and doesn't match regex)",
+                origin, request.url.path,
+            )
+
+        return await call_next(request)
 
     async def verify_key(key: str = Security(API_KEY_HEADER)):
         if key != api_key:
