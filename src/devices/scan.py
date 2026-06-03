@@ -329,6 +329,14 @@ def discover_network_terminals(
         "terminal discovery: TCP-open hosts SSI=%s PB=%s",
         ssi_hosts or "[]", pb_hosts or "[]",
     )
+    from src.services.log_uplink import emit_event
+    emit_event(
+        "discovery_run",
+        subnet=str(subnet),
+        hosts_scanned=len(hosts),
+        ssi_found=len(ssi_hosts),
+        pb_found=len(pb_hosts),
+    )
     if not ssi_hosts and not pb_hosts:
         logger.warning(
             "terminal discovery: nothing answered on port %d (SSI) or %d (PB) "

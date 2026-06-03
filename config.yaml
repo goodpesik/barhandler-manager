@@ -45,3 +45,13 @@ devices:
     enabled: false         # Phase 2 — Monobank acquiring, Ethernet
     host: null
     port: null
+
+# Remote log uplink. When enabled, the manager streams its bhm.log lines
+# and business events to the central server, and accepts whitelist
+# diagnostic commands from there. Tenant subdomain identifies this
+# install on the server side.
+# uplink:
+#   enabled: false
+#   url: "https://manager.barhandler.com"
+#   tenant: ""            # e.g. "biergarten-lviv.barhandler.com"
+#   reconnect_delay: 2

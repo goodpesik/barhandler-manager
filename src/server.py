@@ -59,7 +59,31 @@ def create_app(config: dict) -> FastAPI:
         registry.load()
         terminal_registry.load()
         heartbeat = asyncio.create_task(_printer_heartbeat(), name="printer-heartbeat")
+
+        # Optional uplink — streams logs + business events to the central
+        # barhandler-manager-logs server. Fully opt-in via config.yaml.
+        uplink = None
+        uplink_cfg = config.get("uplink", {})
+        if uplink_cfg.get("enabled"):
+            from src.services.log_uplink import (
+                LogUplinkClient, get_or_create_install_id, set_active,
+            )
+            install_id_path = Path(__file__).resolve().parent.parent / "install_id.txt"
+            install_id = get_or_create_install_id(install_id_path)
+            version_path = Path(__file__).resolve().parent.parent / "VERSION"
+            version = version_path.read_text().strip() if version_path.exists() else "0.0.0"
+            uplink = LogUplinkClient(uplink_cfg)
+            uplink.attach_handler_to_root()
+            from src.services.diagnostics import make_callback
+            uplink.set_diagnostics_callback(make_callback(config))
+            set_active(uplink)
+            app.state.uplink = uplink
+            asyncio.create_task(uplink.start(install_id, version))
+
         yield
+
+        if uplink is not None:
+            await uplink.stop()
         heartbeat.cancel()
         await registry.disconnect_all()
 
@@ -141,6 +165,31 @@ def create_app(config: dict) -> FastAPI:
     )
 
     from starlette.responses import Response as _StarletteResponse
+
+    import time as _time
+
+    @app.middleware("http")
+    async def _request_uplink(request, call_next):
+        """Emit each HTTP request as a business event so the central
+        logs server gets per-tenant access audit. Wraps after
+        cors_and_pna so we capture the real response (after CORS short-
+        circuit decisions). Fire-and-forget — never affects the
+        response."""
+        started = _time.perf_counter()
+        response = await call_next(request)
+        try:
+            from src.services.log_uplink import emit_event
+            emit_event(
+                "request_seen",
+                origin=request.headers.get("origin", ""),
+                method=request.method,
+                path=request.url.path,
+                status=response.status_code,
+                duration_ms=int((_time.perf_counter() - started) * 1000),
+            )
+        except Exception:
+            pass
+        return response
 
     @app.middleware("http")
     async def cors_and_pna(request, call_next):
