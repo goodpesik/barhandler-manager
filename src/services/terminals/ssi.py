@@ -336,6 +336,15 @@ class SSITerminalAdapter(TerminalAdapter):
             merchant_id,
             request.transaction_uid,
         )
+        from src.services.log_uplink import emit_event
+        emit_event(
+            "charge_started",
+            terminal_id=self.descriptor.id,
+            amount_kopecks=request.amount_kopecks,
+            currency=request.currency,
+            merchant_id=merchant_id,
+            transaction_uid=request.transaction_uid,
+        )
         ack = await self._send(
             {"method": "Purchase", "step": "1", "params": params},
         )
@@ -417,6 +426,19 @@ class SSITerminalAdapter(TerminalAdapter):
             result.raw_transaction_result,
             result.rrn,
             result.auth_code,
+        )
+        _status_to_event = {
+            "ok": "charge_approved",
+            "declined": "charge_declined",
+            "cancelled": "charge_cancelled",
+        }
+        emit_event(
+            _status_to_event.get(result.status, "charge_other"),
+            terminal_id=self.descriptor.id,
+            rrn=result.rrn,
+            auth_code=result.auth_code,
+            raw=result.raw_transaction_result,
+            transaction_uid=request.transaction_uid,
         )
         # Mono SSI doesn't auto-print the cardholder slip when an ECR
         # is driving the transaction — that responsibility shifts to

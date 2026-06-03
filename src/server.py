@@ -17,7 +17,10 @@ from fastapi.security.api_key import APIKeyHeader
 from src.constants import DEFAULT_API_KEY
 from src.devices.registry import PrinterRegistry
 from src.devices.terminal_registry import TerminalRegistry
-from src.routes import dashboard, devices, drawer, health, print_routes, system, terminal
+from src.routes import (
+    dashboard, devices, drawer, health, print_routes, system, terminal, version,
+)
+from src.services.update_check import UpdateChecker
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,16 @@ def create_app(config: dict) -> FastAPI:
                         logger.info("[heartbeat] %s unreachable — disconnecting", printer_id)
                         await device.disconnect()
 
+    # Read the installed VERSION once at startup — this is what the
+    # operator's `update.sh` writes after a release. Don't re-read on
+    # every request; if the file changes mid-flight the process is about
+    # to restart anyway.
+    version_path = Path(__file__).resolve().parent.parent / "VERSION"
+    current_version = version_path.read_text().strip() if version_path.exists() else "0.0.0"
+    # Expose so health/version routes can fall back when the checker
+    # hasn't started yet.
+    config["version"] = current_version
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.config = config
@@ -59,7 +72,39 @@ def create_app(config: dict) -> FastAPI:
         registry.load()
         terminal_registry.load()
         heartbeat = asyncio.create_task(_printer_heartbeat(), name="printer-heartbeat")
+
+        update_checker = UpdateChecker(current_version=current_version)
+        app.state.update_checker = update_checker
+        update_task = asyncio.create_task(
+            update_checker.run_forever(), name="update-check",
+        )
+
+        # Optional uplink — streams logs + business events to the central
+        # barhandler-manager-logs server. Fully opt-in via config.yaml.
+        uplink = None
+        uplink_cfg = config.get("uplink", {})
+        if uplink_cfg.get("enabled"):
+            from src.services.log_uplink import (
+                LogUplinkClient, get_or_create_install_id, set_active,
+            )
+            install_id_path = Path(__file__).resolve().parent.parent / "install_id.txt"
+            install_id = get_or_create_install_id(install_id_path)
+            version_path = Path(__file__).resolve().parent.parent / "VERSION"
+            version = version_path.read_text().strip() if version_path.exists() else "0.0.0"
+            uplink = LogUplinkClient(uplink_cfg)
+            uplink.attach_handler_to_root()
+            from src.services.diagnostics import make_callback
+            uplink.set_diagnostics_callback(make_callback(config))
+            set_active(uplink)
+            app.state.uplink = uplink
+            asyncio.create_task(uplink.start(install_id, version))
+
         yield
+
+        if uplink is not None:
+            await uplink.stop()
+        await update_checker.stop()
+        update_task.cancel()
         heartbeat.cancel()
         await registry.disconnect_all()
 
@@ -142,6 +187,31 @@ def create_app(config: dict) -> FastAPI:
 
     from starlette.responses import Response as _StarletteResponse
 
+    import time as _time
+
+    @app.middleware("http")
+    async def _request_uplink(request, call_next):
+        """Emit each HTTP request as a business event so the central
+        logs server gets per-tenant access audit. Wraps after
+        cors_and_pna so we capture the real response (after CORS short-
+        circuit decisions). Fire-and-forget — never affects the
+        response."""
+        started = _time.perf_counter()
+        response = await call_next(request)
+        try:
+            from src.services.log_uplink import emit_event
+            emit_event(
+                "request_seen",
+                origin=request.headers.get("origin", ""),
+                method=request.method,
+                path=request.url.path,
+                status=response.status_code,
+                duration_ms=int((_time.perf_counter() - started) * 1000),
+            )
+        except Exception:
+            pass
+        return response
+
     @app.middleware("http")
     async def cors_and_pna(request, call_next):
         origin = request.headers.get("origin")
@@ -202,6 +272,7 @@ def create_app(config: dict) -> FastAPI:
             raise HTTPException(status_code=401, detail="Invalid API key")
 
     app.include_router(health.router)
+    app.include_router(version.router)
     app.include_router(dashboard.router)
     app.include_router(devices.router, prefix="/devices", dependencies=[Depends(verify_key)])
     app.include_router(print_routes.router, prefix="/print", dependencies=[Depends(verify_key)])

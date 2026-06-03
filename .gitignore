@@ -26,3 +26,7 @@ terminals.json
 
 # CLI runtime — PID of the detached server (written by `python cli.py start`)
 bhm.pid
+
+# Per-install identifier — generated at first uplink start, NOT a secret
+# but unique per machine and shouldn't be committed.
+install_id.txt
