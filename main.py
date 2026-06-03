@@ -1,6 +1,20 @@
 import logging
 import logging.handlers
+import os
 from pathlib import Path
+
+# macOS Python installs (Apple CLT, some Homebrew variants) ship without
+# a usable CA bundle, so aiohttp / requests / ssl module all fail with
+# `SSL: CERTIFICATE_VERIFY_FAILED unable to get local issuer certificate`
+# on every HTTPS call. Point them at certifi's Mozilla bundle, which is
+# already a transitive dep via httpx. setdefault keeps any operator-set
+# override (e.g. corporate CA path).
+try:
+    import certifi as _certifi
+    os.environ.setdefault("SSL_CERT_FILE", _certifi.where())
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", _certifi.where())
+except ImportError:
+    pass
 
 import uvicorn
 
