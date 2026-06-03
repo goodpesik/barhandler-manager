@@ -1,4 +1,4 @@
-"""System management endpoints — update + version info.
+"""System management endpoints — update + version info + uplink toggle.
 
 POST /system/update  — spawns update.sh as a detached process and returns
                        immediately. The manager will restart itself within
@@ -6,16 +6,25 @@ POST /system/update  — spawns update.sh as a detached process and returns
 GET  /system/version — returns the running version so the dashboard JS
                        can compare it with the latest GitHub release without
                        needing a dedicated GitHub API proxy.
+GET  /system/uplink  — current uplink config + live connection status.
+POST /system/uplink  — write a new uplink block into config.yaml and
+                       SIGTERM self so the service manager respawns with
+                       the new state.
 """
 
 from __future__ import annotations
 
+import asyncio
 import datetime as _dt
 import os
+import re
+import signal
 import subprocess
 from pathlib import Path
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, Field
 
 router = APIRouter()
 
@@ -172,6 +181,127 @@ async def usb_probe() -> dict:
         "exit_code": proc.returncode,
         "stdout": proc.stdout,
         "stderr": proc.stderr,
+    }
+
+
+class UplinkPayload(BaseModel):
+    """POST /system/uplink body. `enabled=false` is allowed without
+    tenant/url since we're turning the feature off; `enabled=true`
+    requires both. `tenant` is restricted to FQDN-shaped strings so we
+    don't have to YAML-escape quotes/colons when writing config."""
+    enabled: bool
+    tenant: Optional[str] = Field(
+        default=None,
+        description="FQDN, e.g. biergarten-lviv.barhandler.com",
+        pattern=r"^[a-zA-Z0-9.\-]{0,253}$",
+    )
+    url: Optional[str] = Field(
+        default="https://manager.barhandler.com",
+        pattern=r"^https?://[a-zA-Z0-9./:\-]{1,253}$",
+    )
+    reconnect_delay: int = Field(default=2, ge=1, le=60)
+
+
+_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config.yaml"
+
+# Match an `uplink:` block (active or commented out) and consume all
+# subsequent lines that belong to it: indented under `uplink:` (lines
+# starting with whitespace), commented out (`#` lines), or blank. Stop at
+# the next top-level non-comment key.
+#
+# Conservatively limited to the END of the file because `uplink:` is the
+# last block by convention — the comment block immediately above
+# `uplink:` (the documentation) is preserved by the leading anchor.
+_UPLINK_BLOCK_RE = re.compile(
+    r'(^|\n)(# Remote log uplink[^\n]*\n(?:#[^\n]*\n)*)?'
+    r'(^|\n)(# )?uplink:[ \t]*\n'
+    r'(?:(?:[ \t][^\n]*|#[^\n]*|[ \t]*)\n)*',
+    re.MULTILINE,
+)
+
+
+def _render_uplink_block(payload: UplinkPayload) -> str:
+    return (
+        "# Remote log uplink — managed by the dashboard. Toggle via\n"
+        "# POST /system/uplink. Editing this block by hand is fine, but the\n"
+        "# UI overwrites the entire block on each save, so any comments you\n"
+        "# add INSIDE the block will be lost on the next toggle.\n"
+        "uplink:\n"
+        f"  enabled: {'true' if payload.enabled else 'false'}\n"
+        f"  url: \"{payload.url or 'https://manager.barhandler.com'}\"\n"
+        f"  tenant: \"{payload.tenant or ''}\"\n"
+        f"  reconnect_delay: {payload.reconnect_delay}\n"
+    )
+
+
+def _replace_uplink_in_config(text: str, payload: UplinkPayload) -> str:
+    new_block = _render_uplink_block(payload)
+    m = _UPLINK_BLOCK_RE.search(text)
+    if m:
+        # Preserve a blank line before the new block if there was one.
+        prefix = text[:m.start()].rstrip() + "\n\n"
+        suffix = text[m.end():]
+        return prefix + new_block + ("" if not suffix.strip() else suffix)
+    # No existing block — append.
+    base = text.rstrip() + "\n\n"
+    return base + new_block
+
+
+@router.get("/uplink")
+async def get_uplink(request: Request) -> dict:
+    state = request.app.state
+    cfg = getattr(state, "config", {})
+    uplink_cfg = cfg.get("uplink", {})
+    client = getattr(state, "uplink", None)
+    return {
+        "enabled": bool(uplink_cfg.get("enabled", False)),
+        "url": uplink_cfg.get("url", ""),
+        "tenant": uplink_cfg.get("tenant", ""),
+        "reconnect_delay": int(uplink_cfg.get("reconnect_delay", 2)),
+        "connected": bool(client and client.connected),
+    }
+
+
+@router.post("/uplink")
+async def set_uplink(payload: UplinkPayload) -> dict:
+    """Write the new uplink block to config.yaml, then SIGTERM ourselves
+    so the service manager (launchd / systemd / PM2 / runit) respawns
+    the manager with the new config in effect. The 2-second sleep gives
+    the HTTP response time to reach the dashboard before we die.
+
+    Operators running via `python main.py` directly (CLI mode) will see
+    the process exit and need to restart manually — same trade-off as
+    the existing `/system/update` flow.
+    """
+    if payload.enabled and not payload.tenant:
+        raise HTTPException(status_code=400, detail="enabled=true requires tenant")
+    if payload.enabled and not payload.url:
+        raise HTTPException(status_code=400, detail="enabled=true requires url")
+
+    try:
+        text = _CONFIG_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"can't read {_CONFIG_PATH}: {exc}") from exc
+    new_text = _replace_uplink_in_config(text, payload)
+    try:
+        _CONFIG_PATH.write_text(new_text, encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"can't write {_CONFIG_PATH}: {exc}") from exc
+
+    async def _suicide() -> None:
+        await asyncio.sleep(2)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    asyncio.create_task(_suicide())
+    return {
+        "status": "saved",
+        "message": "config.yaml оновлено, менеджер перезапуститься за 2 секунди",
+        "uplink": {
+            "enabled": payload.enabled,
+            "tenant": payload.tenant or "",
+            "url": payload.url or "",
+            "reconnect_delay": payload.reconnect_delay,
+        },
     }
 
 

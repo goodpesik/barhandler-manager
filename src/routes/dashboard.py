@@ -76,6 +76,34 @@ _HTML_TEMPLATE = r"""<!doctype html>
     background: var(--amber); color: #fff; border-color: transparent;
   }
   .btn-update:hover:not(:disabled) { opacity: 0.85; }
+  .modal-backdrop {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.45);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 50;
+  }
+  .modal {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px; padding: 24px; max-width: 480px; width: 92%;
+    box-shadow: 0 24px 48px rgba(0,0,0,0.2);
+  }
+  .modal h2 { margin: 0 0 8px 0; font-size: 16px; }
+  .modal-desc { color: var(--muted); font-size: 13px; margin: 0 0 16px 0; }
+  .modal-desc code { background: rgba(127,127,127,0.15); padding: 1px 4px; border-radius: 3px; }
+  .modal-row {
+    display: flex; flex-direction: column; gap: 4px;
+    margin-bottom: 12px; font-size: 13px;
+  }
+  .modal-row > span:first-child { color: var(--muted); font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; }
+  .modal-row input {
+    padding: 8px 10px; border-radius: 6px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 13px;
+  }
+  .modal-row input:focus { outline: 2px solid var(--blue); outline-offset: -1px; }
+  .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+  .muted { color: var(--muted); }
+  .ok-text { color: var(--green); font-weight: 600; }
+  .err-text { color: var(--red); font-weight: 600; }
   section {
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 8px; padding: 16px; margin-bottom: 16px;
@@ -146,6 +174,36 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <button class="btn btn-default" onclick="scanTerminals(this)">🔍 Сканувати термінали</button>
     <button class="btn btn-default" onclick="openLogs()">📋 Логи</button>
     <button class="btn btn-default" onclick="runUsbProbe()">🔌 USB діагностика</button>
+    <button id="btn-uplink" class="btn btn-default" onclick="openUplinkModal()">📡 Віддалена діагностика</button>
+  </div>
+
+  <div id="uplink-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal">
+      <h2>Віддалена діагностика</h2>
+      <p class="modal-desc">
+        Стрімить логи менеджера на <code>manager.barhandler.com</code>
+        і дозволяє підтримці запускати безпечні діагностичні команди
+        (USB-сканування, перевірка мережі, перевірка терміналу,
+        тест підключення). Без чутливих даних — api-key редактиться.
+      </p>
+      <label class="modal-row">
+        <span>Статус підключення</span>
+        <span id="uplink-status" class="muted">—</span>
+      </label>
+      <label class="modal-row">
+        <span>Tenant (FQDN)</span>
+        <input id="uplink-tenant" type="text" placeholder="biergarten-lviv.barhandler.com" />
+      </label>
+      <label class="modal-row">
+        <span>Сервер</span>
+        <input id="uplink-url" type="text" value="https://manager.barhandler.com" />
+      </label>
+      <div class="modal-actions">
+        <button class="btn btn-default" onclick="closeUplinkModal()">Скасувати</button>
+        <button id="uplink-disable" class="btn btn-default" onclick="saveUplink(false)" style="display:none;">Вимкнути</button>
+        <button id="uplink-enable" class="btn btn-update" onclick="saveUplink(true)">Підключити</button>
+      </div>
+    </div>
   </div>
 
   <section id="logs-panel" style="display:none;">
@@ -201,9 +259,13 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
   // ---- fetch helpers -------------------------------------------------------
 
-  async function api(method, path, withAuth) {
+  async function api(method, path, withAuth, body) {
     const opts = { method };
     if (withAuth) opts.headers = HEADERS;
+    if (body !== undefined) {
+      opts.headers = opts.headers || { "Content-Type": "application/json" };
+      opts.body = JSON.stringify(body);
+    }
     const res = await fetch(path, opts);
     if (!res.ok) throw new Error(path + " → " + res.status);
     return res.json();
@@ -434,6 +496,56 @@ _HTML_TEMPLATE = r"""<!doctype html>
       setTimeout(tick, POLL_MS);
     };
     setTimeout(tick, POLL_MS);
+  }
+
+  // ---- uplink modal --------------------------------------------------------
+
+  async function openUplinkModal() {
+    $("uplink-modal").style.display = "flex";
+    try {
+      const cur = await api("GET", "/system/uplink", true);
+      $("uplink-tenant").value = cur.tenant || "";
+      $("uplink-url").value = cur.url || "https://manager.barhandler.com";
+      const status = cur.enabled
+        ? (cur.connected ? "<span class='ok-text'>підключено</span>" : "<span class='err-text'>вимкнено сокетом</span>")
+        : "<span class='muted'>вимкнено</span>";
+      $("uplink-status").innerHTML = status;
+      $("uplink-enable").textContent = cur.enabled ? "Зберегти" : "Підключити";
+      $("uplink-disable").style.display = cur.enabled ? "" : "none";
+    } catch (e) {
+      $("uplink-status").innerHTML = "<span class='err-text'>помилка: " + e.message + "</span>";
+    }
+  }
+
+  function closeUplinkModal() {
+    $("uplink-modal").style.display = "none";
+  }
+
+  async function saveUplink(enabled) {
+    const tenant = $("uplink-tenant").value.trim();
+    const url = $("uplink-url").value.trim();
+    if (enabled && !tenant) {
+      showToast("Вкажи tenant subdomain", "err");
+      return;
+    }
+    $("uplink-enable").disabled = true;
+    $("uplink-disable").disabled = true;
+    try {
+      const res = await api("POST", "/system/uplink", true, {
+        enabled, tenant, url, reconnect_delay: 2,
+      });
+      showToast(res.message || "Збережено", "ok", 6000);
+      closeUplinkModal();
+      // Manager is about to SIGTERM itself; the next /health poll will
+      // fail, the error banner will appear, then once the service
+      // manager respawns it'll come back and the modal will reflect
+      // the new state.
+    } catch (e) {
+      showToast("Помилка: " + (e.message || e), "err");
+    } finally {
+      $("uplink-enable").disabled = false;
+      $("uplink-disable").disabled = false;
+    }
   }
 
   // ---- main poll loop ------------------------------------------------------
