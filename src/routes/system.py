@@ -184,22 +184,24 @@ async def usb_probe() -> dict:
     }
 
 
+_DEFAULT_UPLINK_URL = "https://manager.barhandler.com"
+_ORIGIN_HOST_RE = re.compile(r"^https?://([a-zA-Z0-9.\-]{1,253})(:\d+)?$")
+
+
+def _extract_tenant_from_origin(origin: str) -> Optional[str]:
+    """`https://biergarten-lviv.barhandler.com` → `biergarten-lviv.barhandler.com`.
+    Returns None for anything that doesn't look like a clean HTTPS origin."""
+    m = _ORIGIN_HOST_RE.match(origin)
+    return m.group(1) if m else None
+
+
 class UplinkPayload(BaseModel):
-    """POST /system/uplink body. `enabled=false` is allowed without
-    tenant/url since we're turning the feature off; `enabled=true`
-    requires both. `tenant` is restricted to FQDN-shaped strings so we
-    don't have to YAML-escape quotes/colons when writing config."""
+    """POST /system/uplink body — just a toggle now. Tenant is auto-detected
+    from the most recent PWA Origin seen by the manager (see server.py's
+    `last_tenant_origin`); URL is hardcoded to manager.barhandler.com.
+    Operator can override via direct config.yaml edit if they need a
+    custom host."""
     enabled: bool
-    tenant: Optional[str] = Field(
-        default=None,
-        description="FQDN, e.g. biergarten-lviv.barhandler.com",
-        pattern=r"^[a-zA-Z0-9.\-]{0,253}$",
-    )
-    url: Optional[str] = Field(
-        default="https://manager.barhandler.com",
-        pattern=r"^https?://[a-zA-Z0-9./:\-]{1,253}$",
-    )
-    reconnect_delay: int = Field(default=2, ge=1, le=60)
 
 
 _CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config.yaml"
@@ -220,22 +222,22 @@ _UPLINK_BLOCK_RE = re.compile(
 )
 
 
-def _render_uplink_block(payload: UplinkPayload) -> str:
+def _render_uplink_block(enabled: bool, tenant: str, url: str = _DEFAULT_UPLINK_URL) -> str:
     return (
         "# Remote log uplink — managed by the dashboard. Toggle via\n"
         "# POST /system/uplink. Editing this block by hand is fine, but the\n"
         "# UI overwrites the entire block on each save, so any comments you\n"
         "# add INSIDE the block will be lost on the next toggle.\n"
         "uplink:\n"
-        f"  enabled: {'true' if payload.enabled else 'false'}\n"
-        f"  url: \"{payload.url or 'https://manager.barhandler.com'}\"\n"
-        f"  tenant: \"{payload.tenant or ''}\"\n"
-        f"  reconnect_delay: {payload.reconnect_delay}\n"
+        f"  enabled: {'true' if enabled else 'false'}\n"
+        f"  url: \"{url}\"\n"
+        f"  tenant: \"{tenant}\"\n"
+        "  reconnect_delay: 2\n"
     )
 
 
-def _replace_uplink_in_config(text: str, payload: UplinkPayload) -> str:
-    new_block = _render_uplink_block(payload)
+def _replace_uplink_in_config(text: str, enabled: bool, tenant: str, url: str = _DEFAULT_UPLINK_URL) -> str:
+    new_block = _render_uplink_block(enabled, tenant, url)
     m = _UPLINK_BLOCK_RE.search(text)
     if m:
         # Preserve a blank line before the new block if there was one.
@@ -253,36 +255,50 @@ async def get_uplink(request: Request) -> dict:
     cfg = getattr(state, "config", {})
     uplink_cfg = cfg.get("uplink", {})
     client = getattr(state, "uplink", None)
+    # `last_tenant_origin` is populated by the request middleware in
+    # src/server.py whenever a non-localhost Origin hits the manager.
+    last_origin = getattr(state, "last_tenant_origin", "")
+    detected_tenant = _extract_tenant_from_origin(last_origin) if last_origin else None
     return {
         "enabled": bool(uplink_cfg.get("enabled", False)),
         "url": uplink_cfg.get("url", ""),
         "tenant": uplink_cfg.get("tenant", ""),
-        "reconnect_delay": int(uplink_cfg.get("reconnect_delay", 2)),
         "connected": bool(client and client.connected),
+        "detected_tenant": detected_tenant,
     }
 
 
 @router.post("/uplink")
-async def set_uplink(payload: UplinkPayload) -> dict:
-    """Write the new uplink block to config.yaml, then SIGTERM ourselves
-    so the service manager (launchd / systemd / PM2 / runit) respawns
-    the manager with the new config in effect. The 2-second sleep gives
-    the HTTP response time to reach the dashboard before we die.
+async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
+    """Toggle uplink on/off. When turning ON: tenant is auto-detected
+    from the most recent PWA Origin we've seen — if none, returns 400 so
+    the dashboard can tell the operator to open the POS app first.
 
-    Operators running via `python main.py` directly (CLI mode) will see
-    the process exit and need to restart manually — same trade-off as
-    the existing `/system/update` flow.
+    Writes the new uplink block to config.yaml, then SIGTERM ourselves
+    so the service manager (launchd / systemd / PM2 / runit) respawns
+    the manager with the new config. Operators on bare `python main.py`
+    will need to restart manually.
     """
-    if payload.enabled and not payload.tenant:
-        raise HTTPException(status_code=400, detail="enabled=true requires tenant")
-    if payload.enabled and not payload.url:
-        raise HTTPException(status_code=400, detail="enabled=true requires url")
+    if payload.enabled:
+        last_origin = getattr(request.app.state, "last_tenant_origin", "")
+        tenant = _extract_tenant_from_origin(last_origin) if last_origin else None
+        if not tenant:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "no tenant detected — open your POS app at its "
+                    "subdomain (e.g. biergarten-lviv.barhandler.com) "
+                    "and let it ping the manager once, then try again"
+                ),
+            )
+    else:
+        tenant = ""
 
     try:
         text = _CONFIG_PATH.read_text(encoding="utf-8")
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"can't read {_CONFIG_PATH}: {exc}") from exc
-    new_text = _replace_uplink_in_config(text, payload)
+    new_text = _replace_uplink_in_config(text, payload.enabled, tenant)
     try:
         _CONFIG_PATH.write_text(new_text, encoding="utf-8")
     except OSError as exc:
@@ -298,9 +314,8 @@ async def set_uplink(payload: UplinkPayload) -> dict:
         "message": "config.yaml оновлено, менеджер перезапуститься за 2 секунди",
         "uplink": {
             "enabled": payload.enabled,
-            "tenant": payload.tenant or "",
-            "url": payload.url or "",
-            "reconnect_delay": payload.reconnect_delay,
+            "tenant": tenant,
+            "url": _DEFAULT_UPLINK_URL,
         },
     }
 

@@ -191,13 +191,14 @@ _HTML_TEMPLATE = r"""<!doctype html>
         <span id="uplink-status" class="muted">—</span>
       </label>
       <label class="modal-row">
-        <span>Tenant (FQDN)</span>
-        <input id="uplink-tenant" type="text" placeholder="biergarten-lviv.barhandler.com" />
+        <span>Виявлений клієнт</span>
+        <span id="uplink-detected" class="muted">—</span>
       </label>
-      <label class="modal-row">
-        <span>Сервер</span>
-        <input id="uplink-url" type="text" value="https://manager.barhandler.com" />
-      </label>
+      <p id="uplink-hint" class="modal-desc" style="margin-top:8px;">
+        Щоб активувати з'єднання, відкрий свій POS-додаток
+        (BarHandler / FitStudio / PetsHandler) у браузері — менеджер
+        автоматично визначить tenant з домену клієнта.
+      </p>
       <div class="modal-actions">
         <button class="btn btn-default" onclick="closeUplinkModal()">Скасувати</button>
         <button id="uplink-disable" class="btn btn-default" onclick="saveUplink(false)" style="display:none;">Вимкнути</button>
@@ -504,13 +505,23 @@ _HTML_TEMPLATE = r"""<!doctype html>
     $("uplink-modal").style.display = "flex";
     try {
       const cur = await api("GET", "/system/uplink", true);
-      $("uplink-tenant").value = cur.tenant || "";
-      $("uplink-url").value = cur.url || "https://manager.barhandler.com";
       const status = cur.enabled
         ? (cur.connected ? "<span class='ok-text'>підключено</span>" : "<span class='err-text'>вимкнено сокетом</span>")
         : "<span class='muted'>вимкнено</span>";
       $("uplink-status").innerHTML = status;
-      $("uplink-enable").textContent = cur.enabled ? "Зберегти" : "Підключити";
+      // Current tenant (if enabled) takes priority; otherwise show what
+      // we've detected from recent PWA Origin headers.
+      const tenantToShow = cur.tenant || cur.detected_tenant;
+      if (tenantToShow) {
+        $("uplink-detected").innerHTML = "<span class='ok-text'>" + tenantToShow + "</span>";
+        $("uplink-hint").style.display = "none";
+        $("uplink-enable").disabled = false;
+      } else {
+        $("uplink-detected").innerHTML = "<span class='err-text'>не виявлено</span>";
+        $("uplink-hint").style.display = "";
+        $("uplink-enable").disabled = true;
+      }
+      $("uplink-enable").textContent = cur.enabled ? "Перепідключити" : "Підключити";
       $("uplink-disable").style.display = cur.enabled ? "" : "none";
     } catch (e) {
       $("uplink-status").innerHTML = "<span class='err-text'>помилка: " + e.message + "</span>";
@@ -522,18 +533,10 @@ _HTML_TEMPLATE = r"""<!doctype html>
   }
 
   async function saveUplink(enabled) {
-    const tenant = $("uplink-tenant").value.trim();
-    const url = $("uplink-url").value.trim();
-    if (enabled && !tenant) {
-      showToast("Вкажи tenant subdomain", "err");
-      return;
-    }
     $("uplink-enable").disabled = true;
     $("uplink-disable").disabled = true;
     try {
-      const res = await api("POST", "/system/uplink", true, {
-        enabled, tenant, url, reconnect_delay: 2,
-      });
+      const res = await api("POST", "/system/uplink", true, { enabled });
       showToast(res.message || "Збережено", "ok", 6000);
       closeUplinkModal();
       // Manager is about to SIGTERM itself; the next /health poll will
@@ -541,7 +544,14 @@ _HTML_TEMPLATE = r"""<!doctype html>
       // manager respawns it'll come back and the modal will reflect
       // the new state.
     } catch (e) {
-      showToast("Помилка: " + (e.message || e), "err");
+      // FastAPI wraps the 400 in `{detail: "..."}` — pull it out for a
+      // readable error toast.
+      let msg = e.message || String(e);
+      try {
+        const m = msg.match(/→ (\d+)/);
+        if (m && m[1] === "400") msg = "Не виявлено клієнта — спочатку відкрий POS-додаток";
+      } catch (_) {}
+      showToast("Помилка: " + msg, "err");
     } finally {
       $("uplink-enable").disabled = false;
       $("uplink-disable").disabled = false;

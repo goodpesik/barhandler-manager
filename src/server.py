@@ -189,20 +189,38 @@ def create_app(config: dict) -> FastAPI:
 
     import time as _time
 
+    # Tracks the most recent Origin from a remote (non-localhost) caller
+    # so the uplink toggle can pick up the tenant subdomain without
+    # asking the operator to type it. localhost / 127.x / capacitor are
+    # ignored because they're the operator's own browser hitting the
+    # dashboard, not a tenant PWA.
+    app.state.last_tenant_origin = ""
+    _LOCALHOST_ORIGIN_RE = _re.compile(
+        r"^(https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?|capacitor://.*)$",
+        _re.IGNORECASE,
+    )
+
     @app.middleware("http")
     async def _request_uplink(request, call_next):
         """Emit each HTTP request as a business event so the central
         logs server gets per-tenant access audit. Wraps after
         cors_and_pna so we capture the real response (after CORS short-
         circuit decisions). Fire-and-forget — never affects the
-        response."""
+        response.
+
+        Also remembers the most recent non-localhost Origin so the
+        uplink modal can auto-detect tenant.
+        """
         started = _time.perf_counter()
         response = await call_next(request)
+        origin = request.headers.get("origin", "")
+        if origin and not _LOCALHOST_ORIGIN_RE.match(origin):
+            app.state.last_tenant_origin = origin
         try:
             from src.services.log_uplink import emit_event
             emit_event(
                 "request_seen",
-                origin=request.headers.get("origin", ""),
+                origin=origin,
                 method=request.method,
                 path=request.url.path,
                 status=response.status_code,
