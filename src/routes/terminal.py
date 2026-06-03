@@ -17,14 +17,32 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 
+from pydantic import BaseModel, Field
+
 from src.devices.terminal_registry import TerminalRegistry, UnknownTerminal
 from src.models.terminal import (
     ChargeRequest,
     MerchantBinding,
     MerchantNicknameUpdate,
+    TerminalKind,
     TerminalRegistrationRequest,
 )
 from src.services.terminals.base import TerminalUnavailable
+
+
+class ManualTerminalRequest(BaseModel):
+    """Body for POST /terminal/register-manual.
+
+    Use when the scan can't reach the terminal (CGNAT / mobile hotspot /
+    VLAN). Operator looks up the terminal's IP in its admin menu and
+    types it in. `kind` picks the SSI variant — picks `mono_pos` /
+    `privat_pos` /  `raif_pos` / `pivdenny_pos` / `generic_ssi`.
+    """
+    host: str = Field(min_length=1)
+    port: int = Field(default=3000, ge=1, le=65535)
+    kind: TerminalKind = TerminalKind.generic_ssi
+    nickname: Optional[str] = None
+    label: Optional[str] = None
 
 router = APIRouter()
 
@@ -112,6 +130,28 @@ async def register(payload: TerminalRegistrationRequest, request: Request) -> di
             status_code=404,
             detail={"code": "unknown_terminal", "message": str(exc)},
         )
+    return {"terminal": reg.model_dump()}
+
+
+@router.post("/register-manual")
+async def register_manual(payload: ManualTerminalRequest, request: Request) -> dict:
+    """Skip discovery and register a terminal directly by IP/port.
+    Needed when the LAN scan can't reach the terminal (planet's mobile
+    hotspot, carrier CGNAT, VLAN). Returns the same shape as
+    /terminal/register so the dashboard can refresh in one call."""
+    registry = _registry(request)
+    descriptor = registry.add_manual_descriptor(
+        host=payload.host,
+        port=payload.port,
+        kind=payload.kind,
+        label=payload.label,
+    )
+    reg_req = TerminalRegistrationRequest(
+        id=descriptor.id,
+        kind=payload.kind,
+        nickname=payload.nickname,
+    )
+    reg = registry.register(reg_req)
     return {"terminal": reg.model_dump()}
 
 

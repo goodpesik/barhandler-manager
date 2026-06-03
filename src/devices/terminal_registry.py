@@ -12,14 +12,17 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Type
+from typing import Dict, Optional, Type
 
 from src.models.terminal import (
     MerchantBinding,
     TerminalDescriptor,
     TerminalKind,
+    TerminalNetworkAddress,
     TerminalRegistration,
     TerminalRegistrationRequest,
+    TerminalTransport,
+    make_terminal_id,
 )
 from src.services.terminals.base import TerminalAdapter
 from src.services.terminals.privatbank import PrivatBankTerminalAdapter
@@ -117,6 +120,38 @@ class TerminalRegistry:
         return None
 
     # ---------- mutations ----------
+
+    def add_manual_descriptor(
+        self,
+        host: str,
+        port: int,
+        kind: TerminalKind = TerminalKind.generic_ssi,
+        label: Optional[str] = None,
+    ) -> TerminalDescriptor:
+        """Stage a TerminalDescriptor from operator-provided host/port
+        without going through `/terminal/discover` — needed when the
+        terminal is reachable but on a subnet our scan can't enumerate
+        (carrier CGNAT, mobile hotspot with non-standard subnet, VLAN
+        across switches). Same shape as discovery — the descriptor goes
+        into `_last_discovery` so the existing `register()` path picks
+        it up.
+
+        Serial is unknown until the first probe — we hash without it,
+        and the id stays stable across re-registrations of the same
+        host:port. If the operator later moves the terminal to a new
+        IP, the id changes (same as discovery's behavior)."""
+        terminal_id = make_terminal_id(
+            TerminalTransport.network, host, str(port), "",
+        )
+        descriptor = TerminalDescriptor(
+            id=terminal_id,
+            transport=TerminalTransport.network,
+            label=label or f"{kind.value} @ {host}",
+            kind=kind,
+            network=TerminalNetworkAddress(host=host, port=port),
+        )
+        self._last_discovery[terminal_id] = descriptor
+        return descriptor
 
     def register(self, req: TerminalRegistrationRequest) -> TerminalRegistration:
         descriptor = self._last_discovery.get(req.id)

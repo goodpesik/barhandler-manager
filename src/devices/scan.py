@@ -120,13 +120,15 @@ MDNS_SERVICES = (
 
 
 def _local_subnet() -> Optional[ipaddress.IPv4Network]:
-    """Find the host's primary /24 — what we'll port-scan for printers.
-    Uses a UDP-connect trick to read the default-route interface IP
-    without resolving DNS or relying on netifaces."""
+    """Find the host's primary /24 via UDP-connect to a public IP.
+
+    Kept for backwards-compatibility — internally we now use
+    `_local_subnets()` which enumerates ALL local interfaces, but a few
+    older call sites (printer LAN scan + tests) still expect the
+    "outgoing default route" single-subnet behavior.
+    """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        # Doesn't actually send anything; just makes the kernel pick the
-        # outgoing interface.
         s.connect(("8.8.8.8", 80))
         local_ip = s.getsockname()[0]
     except OSError:
@@ -134,10 +136,95 @@ def _local_subnet() -> Optional[ipaddress.IPv4Network]:
     finally:
         s.close()
     try:
-        # /24 covers the typical SOHO router subnet.
         return ipaddress.ip_network(f"{local_ip}/24", strict=False)
     except ValueError:
         return None
+
+
+def _local_subnets() -> list[ipaddress.IPv4Network]:
+    """All local /24 subnets the host has an interface on.
+
+    Why not just `_local_subnet()`: the UDP-connect trick returns the
+    *outgoing* default-route IP only. On a tablet with both cellular
+    (default outgoing) and Wi-Fi/hotspot (separate subnet for local
+    devices), it misses the subnet where the POS terminal actually
+    lives.
+
+    Three independent sources, deduplicated:
+      1. UDP-connect default-route IP (handles most desktops/Pi setups
+         and confirms a working interface)
+      2. `socket.if_nameindex()` + per-interface `ioctl(SIOCGIFADDR)`
+         via fcntl — covers Linux/Android/macOS
+      3. `getaddrinfo(gethostname())` — fallback for stdlib-only hosts
+
+    Each detected IP becomes a /24. Loopback and link-local (169.254.x)
+    are dropped. Result is ordered: default-route first, others after,
+    so terminals on the "primary" network are still found fastest.
+    """
+    out: list[ipaddress.IPv4Network] = []
+    seen: set[ipaddress.IPv4Network] = set()
+
+    def _add(ip: str) -> None:
+        try:
+            addr = ipaddress.IPv4Address(ip)
+        except (ipaddress.AddressValueError, ValueError):
+            return
+        if addr.is_loopback or addr.is_link_local or addr.is_multicast:
+            return
+        try:
+            net = ipaddress.ip_network(f"{ip}/24", strict=False)
+        except ValueError:
+            return
+        if net not in seen:
+            seen.add(net)
+            out.append(net)
+
+    # Source 1 — UDP-connect (default outgoing route, e.g. cellular on
+    # a phone or Wi-Fi on a desktop). First so it stays the primary.
+    default = _local_subnet()
+    if default is not None:
+        seen.add(default)
+        out.append(default)
+
+    # Source 2 — per-interface ioctl. Linux/Android/macOS friendly,
+    # avoids needing `iproute2` / netifaces. Wrapped in best-effort —
+    # if any single iface fails we just skip it.
+    try:
+        import fcntl
+        import struct
+        SIOCGIFADDR = 0x8915
+        for _, name in socket.if_nameindex():
+            try:
+                ifname_bytes = name.encode("utf-8")[:15]
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    packed = fcntl.ioctl(
+                        s.fileno(),
+                        SIOCGIFADDR,
+                        struct.pack("256s", ifname_bytes),
+                    )
+                    ip = socket.inet_ntoa(packed[20:24])
+                    _add(ip)
+                finally:
+                    s.close()
+            except (OSError, ValueError):
+                continue
+    except (ImportError, AttributeError):
+        # fcntl not available on Windows / some embedded Pythons.
+        pass
+
+    # Source 3 — fallback via gethostname. On Android emulator this
+    # usually only resolves to loopback (which we'll filter), but on
+    # desktops it picks up the LAN IP when ioctl above missed.
+    try:
+        for info in socket.getaddrinfo(
+            socket.gethostname(), None, family=socket.AF_INET,
+        ):
+            _add(info[4][0])
+    except (socket.gaierror, OSError):
+        pass
+
+    return out
 
 
 def _probe_tcp(host: str, port: int, timeout: float = 0.3) -> bool:
@@ -296,18 +383,21 @@ def discover_network_terminals(
     from src.services.terminals.privatbank import PrivatBankTerminalAdapter
     from src.services.terminals.ssi import SSITerminalAdapter
 
-    subnet = _local_subnet()
-    if subnet is None:
+    subnets = _local_subnets()
+    if not subnets:
         logger.warning(
-            "terminal discovery: could not detect local subnet — no Wi-Fi/"
-            "network interface? (UDP-connect to 8.8.8.8 failed)",
+            "terminal discovery: could not detect any local subnet — no "
+            "Wi-Fi/network interface? (all enumeration methods failed)",
         )
         return []
-    hosts = [str(h) for h in subnet.hosts()]
+    hosts: list[str] = []
+    for sn in subnets:
+        hosts.extend(str(h) for h in sn.hosts())
     logger.info(
-        "terminal discovery: scanning subnet %s (%d hosts) ports SSI=%d PB=%d "
-        "tcp_timeout=%.1fs",
-        subnet, len(hosts), SSI_TCP_PORT, PB_TCP_PORT, timeout,
+        "terminal discovery: scanning %d subnet(s) %s (%d hosts total) "
+        "ports SSI=%d PB=%d tcp_timeout=%.1fs",
+        len(subnets), [str(s) for s in subnets], len(hosts),
+        SSI_TCP_PORT, PB_TCP_PORT, timeout,
     )
     ssi_hosts: list[str] = []
     pb_hosts: list[str] = []
@@ -332,7 +422,7 @@ def discover_network_terminals(
     from src.services.log_uplink import emit_event
     emit_event(
         "discovery_run",
-        subnet=str(subnet),
+        subnets=[str(s) for s in subnets],
         hosts_scanned=len(hosts),
         ssi_found=len(ssi_hosts),
         pb_found=len(pb_hosts),
@@ -340,13 +430,13 @@ def discover_network_terminals(
     if not ssi_hosts and not pb_hosts:
         logger.warning(
             "terminal discovery: nothing answered on port %d (SSI) or %d (PB) "
-            "across %s. Common causes: terminal on a different Wi-Fi / "
-            "subnet; guest-network client isolation; manager host firewall; "
-            "Android Wi-Fi power-save dropping multicast (irrelevant here — "
-            "we use TCP unicast, but worth knowing). Verify with: "
-            "`curl -v --max-time 3 telnet://<terminal-ip>:%d` from the "
-            "manager host.",
-            SSI_TCP_PORT, PB_TCP_PORT, subnet, SSI_TCP_PORT,
+            "across %s. Common causes: terminal on yet another subnet not "
+            "enumerated by our interface scan (rare — usually CGNAT carrier "
+            "isolating the terminal SIM from this device); guest-network "
+            "client isolation; manager host firewall; terminal offline. "
+            "If you know the terminal's IP, use 'Додати термінал руками' "
+            "in the dashboard.",
+            SSI_TCP_PORT, PB_TCP_PORT, [str(s) for s in subnets],
         )
         return []
 

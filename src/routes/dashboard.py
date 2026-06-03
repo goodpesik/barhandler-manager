@@ -172,9 +172,47 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <span class="controls-label">Дії</span>
     <button class="btn btn-default" onclick="scanPrinters(this)">🔍 Сканувати принтери</button>
     <button class="btn btn-default" onclick="scanTerminals(this)">🔍 Сканувати термінали</button>
+    <button class="btn btn-default" onclick="openManualTerminalModal()">➕ Додати термінал руками</button>
     <button class="btn btn-default" onclick="openLogs()">📋 Логи</button>
     <button class="btn btn-default" onclick="runUsbProbe()">🔌 USB діагностика</button>
     <button id="btn-uplink" class="btn btn-default" onclick="openUplinkModal()">📡 Віддалена діагностика</button>
+  </div>
+
+  <div id="manual-terminal-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal">
+      <h2>Додати термінал вручну</h2>
+      <p class="modal-desc">
+        Резерв на випадок коли скан не побачив (CGNAT мобільного
+        оператора, hotspot планшета з нестандартним subnet, окрема
+        VLAN). IP терміналу дивись у його admin меню.
+      </p>
+      <label class="modal-row">
+        <span>IP / Host</span>
+        <input id="mt-host" type="text" placeholder="10.245.122.201" />
+      </label>
+      <label class="modal-row">
+        <span>Port</span>
+        <input id="mt-port" type="number" value="3000" />
+      </label>
+      <label class="modal-row">
+        <span>Банк</span>
+        <select id="mt-kind">
+          <option value="mono_pos">Monobank (SSI)</option>
+          <option value="privat_pos">ПриватБанк (PB)</option>
+          <option value="raif_pos">Райффайзен (SSI)</option>
+          <option value="pivdenny_pos">Південний (SSI)</option>
+          <option value="generic_ssi">Інший SSI</option>
+        </select>
+      </label>
+      <label class="modal-row">
+        <span>Псевдонім (опційно)</span>
+        <input id="mt-nickname" type="text" placeholder="Бар / Каса 1" />
+      </label>
+      <div class="modal-actions">
+        <button class="btn btn-default" onclick="closeManualTerminalModal()">Скасувати</button>
+        <button id="mt-save" class="btn btn-update" onclick="saveManualTerminal()">Додати</button>
+      </div>
+    </div>
   </div>
 
   <div id="uplink-modal" class="modal-backdrop" style="display:none;">
@@ -445,6 +483,47 @@ _HTML_TEMPLATE = r"""<!doctype html>
     } finally {
       btn.disabled = false;
       btn.textContent = "🔍 Сканувати термінали";
+    }
+  }
+
+  // ---- manual terminal modal ----------------------------------------------
+
+  function openManualTerminalModal() {
+    $("manual-terminal-modal").style.display = "flex";
+    $("mt-host").value = "";
+    $("mt-port").value = "3000";
+    $("mt-kind").value = "mono_pos";
+    $("mt-nickname").value = "";
+  }
+
+  function closeManualTerminalModal() {
+    $("manual-terminal-modal").style.display = "none";
+  }
+
+  async function saveManualTerminal() {
+    const host = $("mt-host").value.trim();
+    const port = Number($("mt-port").value) || 3000;
+    const kind = $("mt-kind").value;
+    const nickname = $("mt-nickname").value.trim() || null;
+    if (!host) {
+      showToast("Введи IP/host", "err");
+      return;
+    }
+    const btn = $("mt-save");
+    btn.disabled = true;
+    btn.textContent = "Додаємо…";
+    try {
+      await api("POST", "/terminal/register-manual", true, {
+        host, port, kind, nickname,
+      });
+      showToast("Термінал додано", "ok");
+      closeManualTerminalModal();
+      await refresh();
+    } catch (e) {
+      showToast("Помилка: " + (e.message || e), "err");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Додати";
     }
   }
 
