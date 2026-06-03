@@ -106,6 +106,48 @@ def test_register_unknown_id_returns_404(
     assert response.json()["detail"]["code"] == "unknown_terminal"
 
 
+def test_register_manual_skips_discovery(
+    client_with_terminal: TestClient, auth_headers: dict,
+) -> None:
+    """Operator can register a terminal by direct IP/port without first
+    running discover. Use case: CGNAT / mobile hotspot where the scan's
+    local subnet detection misses the terminal's actual subnet."""
+    response = client_with_terminal.post(
+        "/terminal/register-manual",
+        headers=auth_headers,
+        json={
+            "host": "10.245.122.201",
+            "port": 3000,
+            "kind": "mono_pos",
+            "nickname": "Бар",
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()["terminal"]
+    assert body["descriptor"]["network"]["host"] == "10.245.122.201"
+    assert body["descriptor"]["network"]["port"] == 3000
+    assert body["kind"] == "mono_pos"
+    assert body["nickname"] == "Бар"
+
+    # And it shows up in the registry list — same as scan-then-register.
+    listing = client_with_terminal.get("/terminal", headers=auth_headers).json()
+    assert any(
+        t["descriptor"]["network"]["host"] == "10.245.122.201"
+        for t in listing["terminals"]
+    )
+
+
+def test_register_manual_rejects_bad_port(
+    client_with_terminal: TestClient, auth_headers: dict,
+) -> None:
+    response = client_with_terminal.post(
+        "/terminal/register-manual",
+        headers=auth_headers,
+        json={"host": "1.2.3.4", "port": 0, "kind": "mono_pos"},
+    )
+    assert response.status_code == 422  # pydantic ge=1 validation
+
+
 def test_charge_without_registered_terminal_returns_no_terminal(
     client_with_terminal: TestClient, auth_headers: dict,
 ) -> None:
