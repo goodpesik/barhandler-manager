@@ -5,6 +5,11 @@ For each registered printer we report:
   - `connected`     — device is reachable
   - `disconnected`  — registered but not currently open (lazy connect)
   - `unavailable`   — open attempt failed (hardware unplugged / busy)
+
+The response also embeds the same `version` / `latest_version` /
+`has_update` block exposed by GET /version so callers that already
+poll /health don't need a second round-trip to decide whether to
+show an "update available" modal.
 """
 
 from fastapi import APIRouter, Request
@@ -37,8 +42,23 @@ async def health(request: Request):
                 ),
                 "status": status,
             })
+
+    checker = getattr(state, "update_checker", None)
+    if checker is not None:
+        update = checker.snapshot()
+    else:
+        cfg = getattr(state, "config", {})
+        update = {
+            "version": cfg.get("version", "unknown"),
+            "latest_version": None,
+            "has_update": False,
+            "release_url": None,
+            "release_published_at": None,
+            "checked_at": None,
+        }
+
     return {
         "status": "ok",
-        "version": "0.3.0",
+        **update,
         "printers": printers,
     }

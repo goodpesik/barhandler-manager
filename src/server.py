@@ -17,7 +17,10 @@ from fastapi.security.api_key import APIKeyHeader
 from src.constants import DEFAULT_API_KEY
 from src.devices.registry import PrinterRegistry
 from src.devices.terminal_registry import TerminalRegistry
-from src.routes import dashboard, devices, drawer, health, print_routes, system, terminal
+from src.routes import (
+    dashboard, devices, drawer, health, print_routes, system, terminal, version,
+)
+from src.services.update_check import UpdateChecker
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +54,16 @@ def create_app(config: dict) -> FastAPI:
                         logger.info("[heartbeat] %s unreachable — disconnecting", printer_id)
                         await device.disconnect()
 
+    # Read the installed VERSION once at startup — this is what the
+    # operator's `update.sh` writes after a release. Don't re-read on
+    # every request; if the file changes mid-flight the process is about
+    # to restart anyway.
+    version_path = Path(__file__).resolve().parent.parent / "VERSION"
+    current_version = version_path.read_text().strip() if version_path.exists() else "0.0.0"
+    # Expose so health/version routes can fall back when the checker
+    # hasn't started yet.
+    config["version"] = current_version
+
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.config = config
@@ -59,6 +72,12 @@ def create_app(config: dict) -> FastAPI:
         registry.load()
         terminal_registry.load()
         heartbeat = asyncio.create_task(_printer_heartbeat(), name="printer-heartbeat")
+
+        update_checker = UpdateChecker(current_version=current_version)
+        app.state.update_checker = update_checker
+        update_task = asyncio.create_task(
+            update_checker.run_forever(), name="update-check",
+        )
 
         # Optional uplink — streams logs + business events to the central
         # barhandler-manager-logs server. Fully opt-in via config.yaml.
@@ -84,6 +103,8 @@ def create_app(config: dict) -> FastAPI:
 
         if uplink is not None:
             await uplink.stop()
+        await update_checker.stop()
+        update_task.cancel()
         heartbeat.cancel()
         await registry.disconnect_all()
 
@@ -251,6 +272,7 @@ def create_app(config: dict) -> FastAPI:
             raise HTTPException(status_code=401, detail="Invalid API key")
 
     app.include_router(health.router)
+    app.include_router(version.router)
     app.include_router(dashboard.router)
     app.include_router(devices.router, prefix="/devices", dependencies=[Depends(verify_key)])
     app.include_router(print_routes.router, prefix="/print", dependencies=[Depends(verify_key)])
