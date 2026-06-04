@@ -113,11 +113,39 @@ async def _cmd_dump_config(args: dict, config: Optional[dict] = None) -> dict:
     return {"ok": True, "output": json.dumps(redacted, indent=2, sort_keys=True)}
 
 
+async def _cmd_list_subnets(args: dict) -> dict:
+    """Show every /24 the multi-interface enumerator detected.
+    Useful for confirming the scan will actually look where the
+    terminal lives — e.g. CGNAT carrier subnet on a phone, or hotspot
+    AP subnet on a tablet."""
+    try:
+        from src.devices.scan import _local_subnets
+        nets = [str(n) for n in _local_subnets()]
+        return {"ok": True, "output": "\n".join(nets) if nets else "(no subnets)"}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
+async def _cmd_terminal_discover(args: dict) -> dict:
+    """Run /terminal/discover synchronously and return the JSON-able list of
+    descriptors. Equivalent to a dashboard 'Сканувати термінали' click but
+    callable remotely without X-Api-Key."""
+    try:
+        from src.devices.scan import discover_network_terminals
+        descriptors = await asyncio.to_thread(discover_network_terminals)
+        out = [d.model_dump(mode="json") for d in descriptors]
+        return {"ok": True, "output": json.dumps(out, indent=2, ensure_ascii=False)}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 _DIAGNOSTICS: dict[str, Callable[..., Awaitable[dict]]] = {
     "usb_probe": _cmd_usb_probe,
     "list_interfaces": _cmd_list_interfaces,
+    "list_subnets": _cmd_list_subnets,
     "ping": _cmd_ping,
     "terminal_probe": _cmd_terminal_probe,
+    "terminal_discover": _cmd_terminal_discover,
     "tail_log": _cmd_tail_log,
     "dump_config": _cmd_dump_config,
 }
