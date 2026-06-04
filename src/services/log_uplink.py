@@ -138,6 +138,11 @@ class LogUplinkClient:
         self._handler = h
         return h
 
+    def detach_handler_from_root(self) -> None:
+        if self._handler is not None:
+            logging.getLogger().removeHandler(self._handler)
+            self._handler = None
+
     def set_diagnostics_callback(
         self, cb: Callable[[str, str, dict], Awaitable[dict]],
     ) -> None:
@@ -224,7 +229,7 @@ def get_or_create_install_id(install_id_path: Path) -> str:
 _active: Optional[LogUplinkClient] = None
 
 
-def set_active(client: LogUplinkClient) -> None:
+def set_active(client: Optional[LogUplinkClient]) -> None:
     global _active
     _active = client
 

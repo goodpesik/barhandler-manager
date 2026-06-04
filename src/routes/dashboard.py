@@ -104,6 +104,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
   .muted { color: var(--muted); }
   .ok-text { color: var(--green); font-weight: 600; }
   .err-text { color: var(--red); font-weight: 600; }
+  .badge {
+    display: inline-block; margin-left: 6px; padding: 1px 6px;
+    border-radius: 4px; font-size: 11px; font-weight: 600;
+    background: rgba(63, 185, 80, 0.18); color: var(--green);
+  }
   section {
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 8px; padding: 16px; margin-bottom: 16px;
@@ -175,7 +180,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <button class="btn btn-default" onclick="openManualTerminalModal()">➕ Додати термінал руками</button>
     <button class="btn btn-default" onclick="openLogs()">📋 Логи</button>
     <button class="btn btn-default" onclick="runUsbProbe()">🔌 USB діагностика</button>
-    <button id="btn-uplink" class="btn btn-default" onclick="openUplinkModal()">📡 Віддалена діагностика</button>
+    <button id="btn-uplink" class="btn btn-default" onclick="openUplinkModal()">📡 Віддалена діагностика<span id="uplink-badge" class="badge" style="display:none;">● підключено</span></button>
   </div>
 
   <div id="manual-terminal-modal" class="modal-backdrop" style="display:none;">
@@ -228,7 +233,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
         <span>Статус підключення</span>
         <span id="uplink-status" class="muted">—</span>
       </label>
-      <label class="modal-row">
+      <label class="modal-row" id="uplink-detected-row">
         <span>Виявлений клієнт</span>
         <span id="uplink-detected" class="muted">—</span>
       </label>
@@ -238,7 +243,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
         автоматично визначить tenant з домену клієнта.
       </p>
       <div class="modal-actions">
-        <button class="btn btn-default" onclick="closeUplinkModal()">Скасувати</button>
+        <button class="btn btn-default" onclick="closeUplinkModal()">Закрити</button>
         <button id="uplink-disable" class="btn btn-default" onclick="saveUplink(false)" style="display:none;">Вимкнути</button>
         <button id="uplink-enable" class="btn btn-update" onclick="saveUplink(true)">Підключити</button>
       </div>
@@ -584,24 +589,33 @@ _HTML_TEMPLATE = r"""<!doctype html>
     $("uplink-modal").style.display = "flex";
     try {
       const cur = await api("GET", "/system/uplink", true);
-      const status = cur.enabled
-        ? (cur.connected ? "<span class='ok-text'>підключено</span>" : "<span class='err-text'>вимкнено сокетом</span>")
-        : "<span class='muted'>вимкнено</span>";
-      $("uplink-status").innerHTML = status;
-      // Current tenant (if enabled) takes priority; otherwise show what
-      // we've detected from recent PWA Origin headers.
-      const tenantToShow = cur.tenant || cur.detected_tenant;
-      if (tenantToShow) {
-        $("uplink-detected").innerHTML = "<span class='ok-text'>" + tenantToShow + "</span>";
+      if (cur.connected) {
+        // Connected mode — minimal: status + tenant + one button to disconnect.
+        $("uplink-status").innerHTML = "<span class='ok-text'>підключено</span>";
+        $("uplink-detected").innerHTML = "<span class='ok-text'>" + (cur.tenant || "—") + "</span>";
         $("uplink-hint").style.display = "none";
-        $("uplink-enable").disabled = false;
+        $("uplink-enable").style.display = "none";
+        $("uplink-disable").style.display = "";
+        $("uplink-disable").textContent = "Вимкнути";
       } else {
-        $("uplink-detected").innerHTML = "<span class='err-text'>не виявлено</span>";
-        $("uplink-hint").style.display = "";
-        $("uplink-enable").disabled = true;
+        // Disconnected mode — allow Підключити if tenant detected.
+        $("uplink-status").innerHTML = cur.enabled
+          ? "<span class='err-text'>вимкнено сокетом</span>"
+          : "<span class='muted'>вимкнено</span>";
+        const tenantToShow = cur.tenant || cur.detected_tenant;
+        if (tenantToShow) {
+          $("uplink-detected").innerHTML = "<span class='ok-text'>" + tenantToShow + "</span>";
+          $("uplink-hint").style.display = "none";
+          $("uplink-enable").disabled = false;
+        } else {
+          $("uplink-detected").innerHTML = "<span class='err-text'>не виявлено</span>";
+          $("uplink-hint").style.display = "";
+          $("uplink-enable").disabled = true;
+        }
+        $("uplink-enable").style.display = "";
+        $("uplink-enable").textContent = "Підключити";
+        $("uplink-disable").style.display = "none";
       }
-      $("uplink-enable").textContent = cur.enabled ? "Перепідключити" : "Підключити";
-      $("uplink-disable").style.display = cur.enabled ? "" : "none";
     } catch (e) {
       $("uplink-status").innerHTML = "<span class='err-text'>помилка: " + e.message + "</span>";
     }
@@ -648,11 +662,13 @@ _HTML_TEMPLATE = r"""<!doctype html>
         currentVersion = ver;
         checkLatestVersion();
       }
-      let devices, terminals;
+      let devices, terminals, uplink;
       try { devices = await api("GET", "/devices", true); } catch (_) { devices = null; }
       try { terminals = await api("GET", "/terminal", true); } catch (_) { terminals = null; }
+      try { uplink = await api("GET", "/system/uplink", true); } catch (_) { uplink = null; }
       renderPrinters(devices, health);
       renderTerminals(terminals);
+      $("uplink-badge").style.display = (uplink && uplink.connected) ? "" : "none";
       $("updated").textContent = new Date().toLocaleTimeString("uk-UA");
       $("status-dot").className = "dot ok";
       $("error-banner").className = "error-banner";
