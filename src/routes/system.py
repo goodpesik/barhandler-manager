@@ -18,7 +18,6 @@ import asyncio
 import datetime as _dt
 import os
 import re
-import signal
 import subprocess
 from pathlib import Path
 from typing import Optional
@@ -270,18 +269,31 @@ async def get_uplink(request: Request) -> dict:
 
 @router.post("/uplink")
 async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
-    """Toggle uplink on/off. When turning ON: tenant is auto-detected
-    from the most recent PWA Origin we've seen — if none, returns 400 so
-    the dashboard can tell the operator to open the POS app first.
+    """Toggle uplink on/off at runtime — no manager restart.
 
-    Writes the new uplink block to config.yaml, then SIGTERM ourselves
-    so the service manager (launchd / systemd / PM2 / runit) respawns
-    the manager with the new config. Operators on bare `python main.py`
-    will need to restart manually.
+    Enabling: tenant is auto-detected from the most recent PWA Origin
+    header. The config block is updated so the connection persists
+    across restarts, and a `LogUplinkClient` is spun up RIGHT NOW —
+    handler attached to root logger, socket.io connecting in the
+    background.
+
+    Disabling: stop the existing client (disconnect socket, detach log
+    handler), clear the active singleton, write `enabled: false` to
+    the config so a fresh boot doesn't reconnect.
+
+    Both paths return synchronously — no SIGTERM, no respawn.
     """
+    state = request.app.state
+    cfg = getattr(state, "config", {})
+
     if payload.enabled:
-        last_origin = getattr(request.app.state, "last_tenant_origin", "")
+        last_origin = getattr(state, "last_tenant_origin", "")
         tenant = _extract_tenant_from_origin(last_origin) if last_origin else None
+        # If we already have a saved tenant in config (e.g. operator
+        # clicked enable earlier), reuse it — origin tracking might be
+        # stale right after a restart before the PWA pings the manager.
+        if not tenant:
+            tenant = cfg.get("uplink", {}).get("tenant") or None
         if not tenant:
             raise HTTPException(
                 status_code=400,
@@ -292,26 +304,66 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
                 ),
             )
     else:
-        tenant = ""
+        tenant = cfg.get("uplink", {}).get("tenant", "")
 
+    # Persist to config.yaml so the next boot reflects this state.
     try:
         text = _CONFIG_PATH.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"can't read {_CONFIG_PATH}: {exc}") from exc
-    new_text = _replace_uplink_in_config(text, payload.enabled, tenant)
-    try:
+        new_text = _replace_uplink_in_config(text, payload.enabled, tenant)
         _CONFIG_PATH.write_text(new_text, encoding="utf-8")
     except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"can't write {_CONFIG_PATH}: {exc}") from exc
+        raise HTTPException(
+            status_code=500, detail=f"can't write {_CONFIG_PATH}: {exc}",
+        ) from exc
 
-    async def _suicide() -> None:
-        await asyncio.sleep(2)
-        os.kill(os.getpid(), signal.SIGTERM)
+    # Update the in-memory config so subsequent /system/uplink GETs
+    # reflect the new state without a restart.
+    cfg.setdefault("uplink", {})
+    cfg["uplink"]["enabled"] = payload.enabled
+    cfg["uplink"]["tenant"] = tenant
+    cfg["uplink"]["url"] = _DEFAULT_UPLINK_URL
 
-    asyncio.create_task(_suicide())
+    # Runtime toggle — start or stop the LogUplinkClient in place.
+    from src.services.log_uplink import (
+        LogUplinkClient, get_or_create_install_id, set_active,
+    )
+    from src.services.diagnostics import make_callback
+
+    existing = getattr(state, "uplink", None)
+
+    if payload.enabled:
+        # If a client is already there, just update its tenant (and
+        # restart its socket so the handshake re-runs with the right
+        # tenant), otherwise spin up a fresh one.
+        if existing is not None:
+            await existing.stop()
+            existing.detach_handler_from_root()
+        install_id_path = Path(__file__).resolve().parent.parent.parent / "install_id.txt"
+        install_id = get_or_create_install_id(install_id_path)
+        version_path = Path(__file__).resolve().parent.parent.parent / "VERSION"
+        version = version_path.read_text().strip() if version_path.exists() else "0.0.0"
+        client = LogUplinkClient({
+            "url": _DEFAULT_UPLINK_URL,
+            "tenant": tenant,
+            "reconnect_delay": 2,
+        })
+        client.attach_handler_to_root()
+        client.set_diagnostics_callback(make_callback(cfg))
+        set_active(client)
+        state.uplink = client
+        asyncio.create_task(client.start(install_id, version))
+    else:
+        if existing is not None:
+            await existing.stop()
+            existing.detach_handler_from_root()
+        set_active(None)
+        state.uplink = None
+
     return {
         "status": "saved",
-        "message": "config.yaml оновлено, менеджер перезапуститься за 2 секунди",
+        "message": (
+            "uplink увімкнено" if payload.enabled else "uplink вимкнено"
+        ),
         "uplink": {
             "enabled": payload.enabled,
             "tenant": tenant,
