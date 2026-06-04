@@ -187,13 +187,18 @@ def _local_subnets() -> list[ipaddress.IPv4Network]:
         out.append(default)
 
     # Source 2 — per-interface ioctl. Linux/Android/macOS friendly,
-    # avoids needing `iproute2` / netifaces. Wrapped in best-effort —
-    # if any single iface fails we just skip it.
+    # avoids needing `iproute2` / netifaces. On Android, `if_nameindex`
+    # OR the ioctl can raise PermissionError under the sandbox — catch
+    # broadly so we just skip this source and fall through to source 3.
     try:
         import fcntl
         import struct
         SIOCGIFADDR = 0x8915
-        for _, name in socket.if_nameindex():
+        try:
+            iface_list = list(socket.if_nameindex())
+        except (OSError, PermissionError):
+            iface_list = []
+        for _, name in iface_list:
             try:
                 ifname_bytes = name.encode("utf-8")[:15]
                 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -207,15 +212,41 @@ def _local_subnets() -> list[ipaddress.IPv4Network]:
                     _add(ip)
                 finally:
                     s.close()
-            except (OSError, ValueError):
+            except (OSError, ValueError, PermissionError):
                 continue
     except (ImportError, AttributeError):
         # fcntl not available on Windows / some embedded Pythons.
         pass
 
-    # Source 3 — fallback via gethostname. On Android emulator this
+    # Source 3 — /proc/net/route fallback. Linux/Android friendly, no
+    # ioctl permissions needed; Termux reads it as the unprivileged
+    # user. Format: each line is a routing entry with hex destination
+    # + genmask. We collect every non-default-route destination, treat
+    # its /24 as a candidate subnet.
+    try:
+        with open("/proc/net/route", "r", encoding="utf-8") as fh:
+            for raw in fh.readlines()[1:]:  # skip header
+                parts = raw.strip().split()
+                if len(parts) < 3:
+                    continue
+                dest_hex = parts[1]
+                if dest_hex == "00000000":
+                    continue  # default route — no useful subnet
+                try:
+                    # little-endian hex per kernel convention
+                    dest = ".".join(
+                        str(int(dest_hex[i:i + 2], 16))
+                        for i in (6, 4, 2, 0)
+                    )
+                    _add(dest)
+                except (ValueError, IndexError):
+                    continue
+    except (OSError, IOError):
+        pass
+
+    # Source 4 — fallback via gethostname. On Android emulator this
     # usually only resolves to loopback (which we'll filter), but on
-    # desktops it picks up the LAN IP when ioctl above missed.
+    # desktops it picks up the LAN IP when ioctl + /proc both missed.
     try:
         for info in socket.getaddrinfo(
             socket.gethostname(), None, family=socket.AF_INET,
