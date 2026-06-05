@@ -68,11 +68,17 @@ if ((Test-Installed) -and (-not $Force)) {
 
 # --- ensure Python 3.11+ ---------------------------------------------
 function Get-PythonExe {
-    foreach ($name in 'python3.11', 'python3.12', 'python3', 'python') {
+    foreach ($name in 'python3.11', 'python3.12', 'python3.13', 'python3', 'python') {
         $cmd = Get-Command $name -ErrorAction SilentlyContinue
-        if ($cmd) {
-            $ver = & $cmd.Source --version 2>&1
-            if ($ver -match 'Python 3\.(11|12|13)') { return $cmd.Source }
+        if (-not $cmd) { continue }
+        # Skip Microsoft Store app-execution-alias stubs — they live in
+        # %LOCALAPPDATA%\Microsoft\WindowsApps and only exist to nag the
+        # user to install Python from the Store ("Python was not found…").
+        # Invoking them dumps that message to stderr and exits non-zero.
+        if ($cmd.Source -like '*\WindowsApps\*') { continue }
+        $ver = & $cmd.Source --version 2>$null
+        if ($LASTEXITCODE -eq 0 -and $ver -match 'Python 3\.(11|12|13|14)') {
+            return $cmd.Source
         }
     }
     return $null
