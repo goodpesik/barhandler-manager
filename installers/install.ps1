@@ -33,6 +33,23 @@
 param([switch]$Force)
 
 $ErrorActionPreference = 'Stop'
+
+# Console output must be UTF-8 or the box-drawing characters and arrows
+# in the final report show up as â®/â°/â garbage. PowerShell 5.1 ships
+# with $OutputEncoding = ASCII and [Console]::OutputEncoding tied to the
+# OEM codepage (cp866/cp1252) by default; force both to UTF-8 for this
+# session. chcp covers external commands (winget, python) printing into
+# our stream — without it the codepage swap only catches PowerShell's
+# own Write-Host.
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+    & chcp.com 65001 | Out-Null
+} catch {
+    # Older terminals (legacy conhost on Server Core) can refuse — non-fatal,
+    # just means the final box may render as ASCII garbage.
+}
+
 $Repo         = 'goodpesik/barhandler-manager'
 $InstallDir   = Join-Path $env:USERPROFILE '.barhandler-manager'
 $TaskName     = 'BarhandlerManager'
