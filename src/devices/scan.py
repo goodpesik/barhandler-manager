@@ -400,16 +400,11 @@ def discover_network_terminals(
 ) -> list:
     """LAN scan for SSI- and PrivatBank-protocol POS terminals.
 
-    Two-phase per port: fast TCP connect across the host's /24, then a
-    protocol-specific probe (SSI framed PingDevice on 3000, PB null-
-    terminated PingDevice on 2000) on hosts that accepted the connect.
-    Same probe shape, different adapters — the bank-specific handshake
-    is what tells a real terminal apart from "something listening on
-    that port" (a dev server, mDNS responder, etc).
-
-    A single host can in theory respond on both ports — unlikely in
-    practice but we'd surface two descriptors and let the operator
-    pick the right one.
+    Two-phase: fast TCP connect across the host's /24 on both ports,
+    then every open host:port is probed with BOTH SSI and PB protocols —
+    because Mono terminals can listen on 2000 and PB terminals on 3000.
+    The bank-specific handshake is what tells a real terminal apart from
+    "something listening on that port".
     """
     from src.services.terminals.privatbank import PrivatBankTerminalAdapter
     from src.services.terminals.ssi import SSITerminalAdapter
@@ -430,35 +425,38 @@ def discover_network_terminals(
         len(subnets), [str(s) for s in subnets], len(hosts),
         SSI_TCP_PORT, PB_TCP_PORT, timeout,
     )
-    ssi_hosts: list[str] = []
-    pb_hosts: list[str] = []
+    # Collect open host:port pairs — both protocols tried on each
+    open_pairs: list[tuple[str, int]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
         future_map: dict = {}
         for host in hosts:
-            future_map[pool.submit(_probe_tcp, host, SSI_TCP_PORT, timeout)] = (host, "ssi")
-            future_map[pool.submit(_probe_tcp, host, PB_TCP_PORT, timeout)] = (host, "pb")
+            future_map[pool.submit(_probe_tcp, host, SSI_TCP_PORT, timeout)] = (host, SSI_TCP_PORT)
+            future_map[pool.submit(_probe_tcp, host, PB_TCP_PORT, timeout)] = (host, PB_TCP_PORT)
         for future in concurrent.futures.as_completed(future_map):
-            host, kind = future_map[future]
+            host, port = future_map[future]
             try:
                 if not future.result():
                     continue
             except Exception:  # noqa: BLE001
                 continue
-            (ssi_hosts if kind == "ssi" else pb_hosts).append(host)
+            open_pairs.append((host, port))
 
+    open_on_ssi_port = [h for h, p in open_pairs if p == SSI_TCP_PORT]
+    open_on_pb_port  = [h for h, p in open_pairs if p == PB_TCP_PORT]
     logger.info(
-        "terminal discovery: TCP-open hosts SSI=%s PB=%s",
-        ssi_hosts or "[]", pb_hosts or "[]",
+        "terminal discovery: TCP-open hosts port%d=%s port%d=%s",
+        SSI_TCP_PORT, open_on_ssi_port or "[]",
+        PB_TCP_PORT,  open_on_pb_port  or "[]",
     )
     from src.services.log_uplink import emit_event
     emit_event(
         "discovery_run",
         subnets=[str(s) for s in subnets],
         hosts_scanned=len(hosts),
-        ssi_found=len(ssi_hosts),
-        pb_found=len(pb_hosts),
+        ssi_port_found=len(open_on_ssi_port),
+        pb_port_found=len(open_on_pb_port),
     )
-    if not ssi_hosts and not pb_hosts:
+    if not open_pairs:
         logger.warning(
             "terminal discovery: nothing answered on port %d (SSI) or %d (PB) "
             "across %s. Common causes: terminal on yet another subnet not "
@@ -471,20 +469,27 @@ def discover_network_terminals(
         )
         return []
 
-    # Probes are async (asyncio.open_connection). Run them sequentially
-    # on a fresh event loop — keeps the function callable from both
-    # sync (FastAPI startup) and async (route via asyncio.to_thread)
-    # contexts without nested-loop trouble.
+    # Probe every open host:port with BOTH protocols — a Mono terminal
+    # may answer on port 2000, a PB terminal on port 3000.
+    # Dedup by (host, port, protocol) so we don't double-report.
     async def _probe_all() -> list:
         out: list = []
-        for host in ssi_hosts:
-            descriptor = await SSITerminalAdapter.probe(host, SSI_TCP_PORT)
-            if descriptor is not None:
-                out.append(descriptor)
-        for host in pb_hosts:
-            descriptor = await PrivatBankTerminalAdapter.probe(host, PB_TCP_PORT)
-            if descriptor is not None:
-                out.append(descriptor)
+        seen: set[str] = set()
+        for host, port in open_pairs:
+            for adapter, label in (
+                (SSITerminalAdapter, "ssi"),
+                (PrivatBankTerminalAdapter, "pb"),
+            ):
+                key = f"{host}:{port}:{label}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    descriptor = await adapter.probe(host, port)
+                except Exception:  # noqa: BLE001
+                    descriptor = None
+                if descriptor is not None:
+                    out.append(descriptor)
         return out
 
     import asyncio
