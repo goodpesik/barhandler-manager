@@ -126,6 +126,46 @@ async def _cmd_list_subnets(args: dict) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+async def _cmd_terminal_probe_protocol(args: dict) -> dict:
+    """Probe a specific host:port with SSI (Mono), PB (PrivatBank), or both protocols.
+    Args: ip, port (default 3000), protocol: 'ssi' | 'pb' | 'both' (default 'both')
+    """
+    host = str(args.get("ip", ""))
+    if not _HOST_RE.match(host):
+        return {"ok": False, "error": "invalid ip"}
+    try:
+        port = int(args.get("port", 3000))
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "invalid port"}
+    protocol = str(args.get("protocol", "both")).lower()
+    if protocol not in ("ssi", "pb", "both"):
+        return {"ok": False, "error": "protocol must be ssi, pb, or both"}
+
+    from src.services.terminals.ssi import SSITerminalAdapter
+    from src.services.terminals.privatbank import PrivatBankTerminalAdapter
+
+    results = {}
+    if protocol in ("ssi", "both"):
+        try:
+            descriptor = await SSITerminalAdapter.probe(host, port)
+            results["ssi"] = descriptor.model_dump(mode="json") if descriptor else None
+        except Exception as e:
+            results["ssi"] = {"error": f"{type(e).__name__}: {e}"}
+    if protocol in ("pb", "both"):
+        try:
+            descriptor = await PrivatBankTerminalAdapter.probe(host, port)
+            results["pb"] = descriptor.model_dump(mode="json") if descriptor else None
+        except Exception as e:
+            results["pb"] = {"error": f"{type(e).__name__}: {e}"}
+
+    found = {k: v for k, v in results.items() if v is not None and "error" not in v}
+    return {
+        "ok": True,
+        "found": bool(found),
+        "output": json.dumps(results, indent=2, ensure_ascii=False),
+    }
+
+
 async def _cmd_terminal_discover(args: dict) -> dict:
     """Run /terminal/discover synchronously and return the JSON-able list of
     descriptors. Equivalent to a dashboard 'Сканувати термінали' click but
@@ -145,6 +185,7 @@ _DIAGNOSTICS: dict[str, Callable[..., Awaitable[dict]]] = {
     "list_subnets": _cmd_list_subnets,
     "ping": _cmd_ping,
     "terminal_probe": _cmd_terminal_probe,
+    "terminal_probe_protocol": _cmd_terminal_probe_protocol,
     "terminal_discover": _cmd_terminal_discover,
     "tail_log": _cmd_tail_log,
     "dump_config": _cmd_dump_config,
