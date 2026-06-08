@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     barhandler-manager installer for Windows.
 
@@ -145,6 +145,18 @@ foreach ($keep in 'config.yaml', 'printers.json', 'terminals.json') {
     if (Test-Path $bak) { Copy-Item $bak (Join-Path $InstallDir $keep) -Force }
 }
 
+# Seed the default config.yaml on a fresh install. It's excluded from the
+# copy above to protect an existing user config on upgrades, but a
+# first-time install has no backup to restore — without this the manager
+# crashes at startup with FileNotFoundError: config.yaml and the service
+# never comes up. printers.json / terminals.json aren't shipped (the app
+# creates them at runtime), so only config.yaml needs seeding.
+$cfgDst = Join-Path $InstallDir 'config.yaml'
+if (-not (Test-Path $cfgDst)) {
+    $cfgSrc = Join-Path $SrcRoot 'config.yaml'
+    if (Test-Path $cfgSrc) { Copy-Item $cfgSrc $cfgDst -Force }
+}
+
 Remove-Item $Tmp -Recurse -Force
 
 # --- venv + deps ------------------------------------------------------
@@ -228,23 +240,38 @@ $UpdatePs1 = @"
 Invoke-Expression "& { `$(`$script.Content) } -Force"
 "@
 
-Set-Content -Path (Join-Path $InstallDir 'start.ps1')  -Value $StartPs1
-Set-Content -Path (Join-Path $InstallDir 'stop.ps1')   -Value $StopPs1
-Set-Content -Path (Join-Path $InstallDir 'status.ps1') -Value $StatusPs1
-Set-Content -Path (Join-Path $InstallDir 'update.ps1') -Value $UpdatePs1
+# Write the .ps1 helpers as UTF-8 *with BOM*. These contain non-ASCII
+# glyphs (✓ ▸ ⚠ ✗); Windows PowerShell 5.1 reads a BOM-less script using
+# the system ANSI codepage (cp1251/cp1252), which mangles those bytes and
+# breaks parsing when the .cmd wrappers launch them via `powershell -File`.
+# The BOM forces the parser to treat them as UTF-8. (`Set-Content
+# -Encoding UTF8` emits a BOM on PS 5.1.)
+Set-Content -Path (Join-Path $InstallDir 'start.ps1')  -Value $StartPs1  -Encoding UTF8
+Set-Content -Path (Join-Path $InstallDir 'stop.ps1')   -Value $StopPs1   -Encoding UTF8
+Set-Content -Path (Join-Path $InstallDir 'status.ps1') -Value $StatusPs1 -Encoding UTF8
+Set-Content -Path (Join-Path $InstallDir 'update.ps1') -Value $UpdatePs1 -Encoding UTF8
 
-# .cmd wrappers so double-click works without changing execution policy
-Set-Content -Path (Join-Path $InstallDir 'start.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0start.ps1`""
-Set-Content -Path (Join-Path $InstallDir 'stop.cmd')  -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0stop.ps1`""
-Set-Content -Path (Join-Path $InstallDir 'status.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0status.ps1`""
-Set-Content -Path (Join-Path $InstallDir 'update.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0update.ps1`""
+# .cmd wrappers so double-click works without changing execution policy.
+# Keep these ASCII (no BOM) — a UTF-8 BOM at the top of a .cmd makes
+# cmd.exe choke on the first `@powershell` line.
+Set-Content -Path (Join-Path $InstallDir 'start.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0start.ps1`"" -Encoding Ascii
+Set-Content -Path (Join-Path $InstallDir 'stop.cmd')  -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0stop.ps1`"" -Encoding Ascii
+Set-Content -Path (Join-Path $InstallDir 'status.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0status.ps1`"" -Encoding Ascii
+Set-Content -Path (Join-Path $InstallDir 'update.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0update.ps1`"" -Encoding Ascii
 
 # --- smoke test -------------------------------------------------------
-Start-Sleep -Seconds 3
-if (Test-Running) {
+# Cold start imports fastapi/uvicorn/pydantic/zeroconf/aiohttp before the
+# port opens — that's well over 3s on a fresh box, so a single 3s check
+# false-alarms on a perfectly good install. Poll up to ~20s instead.
+$up = $false
+foreach ($i in 1..30) {
+    if (Test-Running) { $up = $true; break }
+    Start-Sleep -Seconds 1
+}
+if ($up) {
     Write-Step "✓ manager is up at http://localhost:9999"
 } else {
-    Write-Warn "manager didn't answer /health within 3s — check $InstallDir\bhm.log"
+    Write-Warn "manager didn't answer /health within 30s — check $InstallDir\bhm.log"
 }
 
 Write-Host @"
