@@ -177,7 +177,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <span class="controls-label">Дії</span>
     <button class="btn btn-default" onclick="scanPrinters(this)">🔍 Сканувати принтери</button>
     <button class="btn btn-default" onclick="scanTerminals(this)">🔍 Сканувати термінали</button>
-    <button class="btn btn-default" onclick="openManualTerminalModal()">➕ Додати термінал руками</button>
+    <button class="btn btn-default" onclick="openManualTerminalModal()">➕ Додати термінал вручну</button>
     <button class="btn btn-default" onclick="openLogs()">📋 Логи</button>
     <button class="btn btn-default" onclick="runUsbProbe()">🔌 USB діагностика</button>
     <button id="btn-uplink" class="btn btn-default" onclick="openUplinkModal()">📡 Віддалена діагностика<span id="uplink-badge" class="badge" style="display:none;">● підключено</span></button>
