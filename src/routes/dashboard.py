@@ -538,15 +538,19 @@ _HTML_TEMPLATE = r"""<!doctype html>
     const btn = $("btn-update");
     btn.disabled = true;
     btn.textContent = "Запускаємо…";
+    // Remember what we're updating FROM so we can tell a real update
+    // (version changed) from a silent no-op (came back on the same
+    // version — failed download, port conflict, never restarted).
+    let beforeVer = null;
+    try {
+      const v = await api("GET", "/version", false);
+      beforeVer = v.version || null;
+    } catch (_) {}
     try {
       const res = await api("POST", "/system/update", true);
       showToast(res.message || "Оновлення запущено!", "ok", 10000);
       btn.textContent = "Перезапуск…";
-      // Poll update.log so the operator sees real progress (curl
-      // downloads, pip output, launchctl reload). If we go silent for
-      // 60s with the manager still alive, surface the log so they
-      // know why the update isn't taking.
-      pollUpdateLog();
+      watchUpdate(beforeVer);
     } catch (e) {
       showToast("Помилка оновлення: " + e.message, "err");
       btn.disabled = false;
@@ -554,31 +558,69 @@ _HTML_TEMPLATE = r"""<!doctype html>
     }
   }
 
-  async function pollUpdateLog() {
-    const started = Date.now();
+  // Watch the update through to a verdict instead of spinning forever.
+  // Outcomes:
+  //   • version changed         → success, reset the button
+  //   • came back same version  → no-op, surface update.log so the
+  //                               operator sees WHY (download failed,
+  //                               old process still holding the port…)
+  //   • never recovered in time → timeout, surface update.log
+  async function watchUpdate(beforeVer) {
     const POLL_MS = 3000;
-    const REPORT_AFTER_MS = 60000;
-    let reported = false;
-    const tick = async () => {
+    const DEADLINE_MS = 150000;       // 2.5 min — covers venv rebuilds
+    const started = Date.now();
+    let sawDown = false;              // did the manager actually restart?
+    let progressShown = false;
+
+    const finishFail = async (headline) => {
+      let last = "";
       try {
         const log = await api("GET", "/system/update-log?tail=30", true);
-        const elapsed = Date.now() - started;
-        if (elapsed > REPORT_AFTER_MS && !reported && log.exists) {
-          reported = true;
-          const last = (log.lines || []).slice(-6).join("\n");
-          showToast(
-            "Оновлення ще йде, останні рядки логу:\n" + last,
-            "ok", 15000,
-          );
-        }
+        last = (log.lines || []).slice(-8).join("\n");
+      } catch (_) {}
+      showToast(headline + (last ? "\n\n" + last : ""), "err", 20000);
+      const btn = $("btn-update");
+      btn.disabled = false;
+      btn.textContent = "⬆ Оновити";
+    };
+
+    const tick = async () => {
+      const elapsed = Date.now() - started;
+      let cur = null;
+      try {
+        const v = await api("GET", "/version", false);
+        cur = v.version || null;
       } catch (_) {
-        // /health throws too when the manager restarts — that's the
-        // happy path. Stop polling.
+        // /version throws while the manager is restarting — that's the
+        // expected mid-update dip, not a failure.
+        sawDown = true;
+        if (elapsed < DEADLINE_MS) return setTimeout(tick, POLL_MS);
+        return finishFail("Менеджер не піднявся після оновлення. Останній лог:");
+      }
+      // Reachable again.
+      if (cur && beforeVer && cur !== beforeVer) {
+        showToast("Оновлено до v" + cur + " ✓", "ok", 8000);
+        const btn = $("btn-update");
+        btn.disabled = false;
+        btn.textContent = "⬆ Оновити";
         return;
       }
-      // Stop once the manager itself reboots (next /health call will
-      // fail and trigger error banner via the main refresh loop).
-      setTimeout(tick, POLL_MS);
+      // Still on the old version. If it already bounced and came back
+      // unchanged, the update didn't take — report now. Otherwise keep
+      // waiting (the restart may not have happened yet).
+      if (sawDown && cur && beforeVer && cur === beforeVer) {
+        return finishFail("Оновлення не застосувалось — версія не змінилась (v" + cur + "). Лог:");
+      }
+      if (elapsed > 60000 && !progressShown) {
+        progressShown = true;
+        try {
+          const log = await api("GET", "/system/update-log?tail=30", true);
+          const last = (log.lines || []).slice(-6).join("\n");
+          showToast("Оновлення ще йде, останні рядки логу:\n" + last, "ok", 15000);
+        } catch (_) {}
+      }
+      if (elapsed < DEADLINE_MS) return setTimeout(tick, POLL_MS);
+      return finishFail("Оновлення не завершилось за " + Math.round(DEADLINE_MS / 1000) + "с. Лог:");
     };
     setTimeout(tick, POLL_MS);
   }

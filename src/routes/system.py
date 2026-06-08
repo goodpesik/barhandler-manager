@@ -27,6 +27,8 @@ from pydantic import BaseModel, Field
 
 router = APIRouter()
 
+IS_WIN = os.name == "nt"
+
 _INSTALL_DIR = Path.home() / ".barhandler-manager"
 _UPDATE_LOG = _INSTALL_DIR / "update.log"
 
@@ -38,28 +40,80 @@ async def get_version() -> dict:
     return {"version": version}
 
 
-@router.post("/update")
-async def trigger_update() -> dict:
-    """Spawn update.sh in a new session (detached from the manager process)
-    so it survives the manager restart it triggers. A 2-second sleep gives
-    the HTTP response time to reach the browser before the process dies.
+def _build_update_argv() -> tuple[list[str], str]:
+    """Return the (argv, human-readable description) for the update
+    command on this OS. POSIX runs update.sh via bash; Windows runs
+    update.ps1 via powershell. Each falls back to pulling the upstream
+    installer directly when the on-disk helper is missing (e.g. a dev
+    checkout that was never `install`-ed).
 
-    stdout+stderr go to update.log (NOT DEVNULL) so when the update fails
-    silently — curl can't reach GitHub, launchctl refuses the reload,
-    install.sh errors out on a missing dep — the operator has something
-    to read instead of a frozen "Перезапуск…" button. Append-mode so a
-    failed update doesn't wipe the previous attempt's trail.
+    The 2-second sleep gives the HTTP response time to reach the browser
+    before the manager restarts out from under it.
     """
+    if IS_WIN:
+        script = _INSTALL_DIR / "update.ps1"
+        if script.exists():
+            inner = f"Start-Sleep -Seconds 2; & '{script}'"
+        else:
+            # Fallback: pull install.ps1 and run it in upgrade mode.
+            # Invoke-WebRequest throws on a failed download (unlike a
+            # silent `curl|bash`), so a network blip surfaces in the log.
+            inner = (
+                "Start-Sleep -Seconds 2; "
+                "$r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 30 -Uri "
+                "'https://github.com/goodpesik/barhandler-manager"
+                "/releases/latest/download/install.ps1'; "
+                "if (-not $r.Content -or $r.Content.Length -lt 100) { "
+                "Write-Host 'update: empty installer downloaded — nothing changed'; exit 1 }; "
+                'Invoke-Expression "& { $($r.Content) } -Force"'
+            )
+        argv = [
+            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-Command", inner,
+        ]
+        return argv, inner
+
     script = _INSTALL_DIR / "update.sh"
     if not script.exists():
-        # Fallback: inline the update command directly.
+        # Fallback: inline the update command directly. Download to a
+        # temp file and verify it's non-empty BEFORE running it — a
+        # piped `curl | bash` turns a transient GitHub failure into an
+        # empty script that bash runs as a silent no-op (exit 0, nothing
+        # changed). Here a failed download exits non-zero and lands in
+        # update.log instead of pretending success.
         cmd = (
-            "sleep 2 && curl -fsSL "
-            "https://github.com/goodpesik/barhandler-manager"
-            "/releases/latest/download/install.sh | bash -s -- --force"
+            "sleep 2 && set -o pipefail && "
+            'TMP="$(mktemp "${TMPDIR:-/tmp}/bhm-install.XXXXXX")" && '
+            "curl -fsSL https://github.com/goodpesik/barhandler-manager"
+            '/releases/latest/download/install.sh -o "$TMP" && '
+            '{ [ -s "$TMP" ] || { echo "✗ update: empty installer downloaded — nothing changed" >&2; rm -f "$TMP"; exit 1; }; } && '
+            'bash "$TMP" --force; rc=$?; rm -f "$TMP"; exit $rc'
         )
     else:
         cmd = f"sleep 2 && bash {script}"
+    return ["bash", "-c", cmd], cmd
+
+
+@router.post("/update")
+async def trigger_update() -> dict:
+    """Spawn the platform updater fully detached from the manager so it
+    survives the restart it triggers, and return immediately.
+
+    Detachment differs per OS:
+      * POSIX  — `start_new_session=True` (own session, survives the
+        SIGTERM the installer sends the manager).
+      * Windows — DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP, plus
+        CREATE_BREAKAWAY_FROM_JOB so the updater leaves the Scheduled
+        Task's job object. Without breakaway, stopping the manager task
+        tree-kills this updater mid-flight. Some job configs forbid
+        breakaway (CreateProcess fails); we retry without it in that case.
+
+    stdout+stderr go to update.log (NOT DEVNULL) so a silent failure —
+    GitHub unreachable, launchctl/systemd refusing the reload, a missing
+    dep — leaves the operator something to read instead of a frozen
+    "Перезапуск…" button. Append-mode preserves earlier attempts.
+    """
+    argv, desc = _build_update_argv()
 
     try:
         _INSTALL_DIR.mkdir(parents=True, exist_ok=True)
@@ -70,33 +124,54 @@ async def trigger_update() -> dict:
                 f"\n=== update triggered {_dt.datetime.now().isoformat()} "
                 f"(pid={os.getpid()}) ===\n",
             )
-            fh.write(f"cmd: {cmd}\n")
+            fh.write(f"cmd: {desc}\n")
             fh.flush()
-        # When the manager runs under launchd / systemd the inherited
-        # PATH is the bare service-context one and doesn't include
-        # Homebrew. install.sh itself prepends those prefixes now, but
-        # set a sane PATH here too so we're not relying solely on the
-        # downstream script — anything that runs before install.sh
-        # sources its own PATH still resolves brew/python3.
-        env = {
-            **os.environ,
-            "PATH": (
-                "/opt/homebrew/bin:/opt/homebrew/sbin:"
-                "/usr/local/bin:/usr/local/sbin:"
-                + os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-            ),
-        }
-        log_fh = _UPDATE_LOG.open("a")
-        subprocess.Popen(
-            ["bash", "-c", cmd],
-            start_new_session=True,
-            stdout=log_fh,
+
+        popen_kwargs: dict = dict(
+            stdout=None,  # set below to the dup'd log fd
             stderr=subprocess.STDOUT,
             close_fds=True,
-            env=env,
         )
-        # Popen dup'd the fd; close our handle so it doesn't leak.
-        log_fh.close()
+        if IS_WIN:
+            popen_kwargs["creationflags"] = (
+                subprocess.DETACHED_PROCESS
+                | subprocess.CREATE_NEW_PROCESS_GROUP
+                | 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
+            # When the manager runs under launchd / systemd the inherited
+            # PATH is the bare service-context one and doesn't include
+            # Homebrew. install.sh prepends those prefixes itself now, but
+            # set a sane PATH here too so anything that runs before
+            # install.sh sources its own PATH still resolves brew/python3.
+            popen_kwargs["env"] = {
+                **os.environ,
+                "PATH": (
+                    "/opt/homebrew/bin:/opt/homebrew/sbin:"
+                    "/usr/local/bin:/usr/local/sbin:"
+                    + os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+                ),
+            }
+
+        log_fh = _UPDATE_LOG.open("a")
+        popen_kwargs["stdout"] = log_fh
+        try:
+            subprocess.Popen(argv, **popen_kwargs)
+        except OSError:
+            # Breakaway can be refused by the job object — retry without
+            # it rather than failing the whole update.
+            if IS_WIN:
+                popen_kwargs["creationflags"] = (
+                    subprocess.DETACHED_PROCESS
+                    | subprocess.CREATE_NEW_PROCESS_GROUP
+                )
+                subprocess.Popen(argv, **popen_kwargs)
+            else:
+                raise
+        finally:
+            # Popen dup'd the fd; close our handle so it doesn't leak.
+            log_fh.close()
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"не вдалось запустити оновлення: {exc}") from exc
 
