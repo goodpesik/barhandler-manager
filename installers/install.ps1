@@ -165,8 +165,9 @@ if (-not (Test-Path $VenvDir)) {
     Write-Step "creating virtualenv"
     & $python -m venv $VenvDir
 }
-$VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
-$VenvPip    = Join-Path $VenvDir 'Scripts\pip.exe'
+$VenvPython  = Join-Path $VenvDir 'Scripts\python.exe'
+$VenvPythonw = Join-Path $VenvDir 'Scripts\pythonw.exe'
+$VenvPip     = Join-Path $VenvDir 'Scripts\pip.exe'
 
 Write-Step "installing Python dependencies"
 & $VenvPython -m pip install --upgrade pip | Out-Null
@@ -174,16 +175,25 @@ Write-Step "installing Python dependencies"
 
 # --- scheduled task --------------------------------------------------
 Write-Step "registering Scheduled Task '$TaskName' (runs at logon)"
+# Run via pythonw.exe (the windowless interpreter): it never allocates a
+# console, so closing the terminal that launched the task can't deliver a
+# CTRL_CLOSE/CTRL_C event to it. With plain python.exe the server inherited
+# the launching console and died with STATUS_CONTROL_C_EXIT (0xC000013A)
+# when the terminal was closed.
 $Action  = New-ScheduledTaskAction `
-    -Execute $VenvPython `
+    -Execute $VenvPythonw `
     -Argument "$InstallDir\main.py" `
     -WorkingDirectory $InstallDir
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+# Resilience: if the server ever exits, restart it (up to 3 times, 1 min
+# apart) instead of staying down until the next logon.
 $Settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -DontStopOnIdleEnd `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit (New-TimeSpan -Days 365)
 $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
 

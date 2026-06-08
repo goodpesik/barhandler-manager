@@ -40,10 +40,13 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+IS_WIN = os.name == "nt"
+
 ROOT = Path(__file__).resolve().parent
 PIDFILE = ROOT / "bhm.pid"
 LOGFILE = ROOT / "bhm.log"
-VENV_PY = ROOT / ".venv" / "bin" / "python"
+# venv layout differs per-OS: Scripts\python.exe on Windows, bin/python on POSIX.
+VENV_PY = ROOT / ".venv" / ("Scripts" if IS_WIN else "bin") / ("python.exe" if IS_WIN else "python")
 DEFAULT_URL = "http://localhost:9999"
 
 # Token shipped with the manager — same constant as
@@ -57,6 +60,25 @@ console = Console()
 # --- lifecycle ----------------------------------------------------------------
 
 
+def _pid_running(pid: int) -> bool:
+    """True if a process with this PID exists.
+
+    POSIX uses the harmless signal-0 probe. On Windows that is NOT safe:
+    `os.kill(pid, 0)` calls TerminateProcess and would *kill* the server,
+    so we query `tasklist` instead."""
+    if IS_WIN:
+        out = subprocess.run(
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, text=True,
+        )
+        return str(pid) in out.stdout
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
 def read_pid() -> Optional[int]:
     if not PIDFILE.exists():
         return None
@@ -66,9 +88,7 @@ def read_pid() -> Optional[int]:
         return None
     # Stale pidfile (process already gone) — clean up to avoid
     # confusing the next start.
-    try:
-        os.kill(pid, 0)
-    except OSError:
+    if not _pid_running(pid):
         PIDFILE.unlink(missing_ok=True)
         return None
     return pid
@@ -81,18 +101,28 @@ def cmd_start(args: argparse.Namespace) -> int:
         return 0
     py = str(VENV_PY) if VENV_PY.exists() else sys.executable
     log = open(LOGFILE, "ab", buffering=0)
-    # `start_new_session=True` is the POSIX equivalent of nohup —
-    # gives the child its own process group so it survives the shell
-    # closing, terminal hang-up, and tab close.
-    proc = subprocess.Popen(
-        [py, str(ROOT / "main.py")],
+    popen_kwargs = dict(
         cwd=str(ROOT),
         stdout=log,
         stderr=subprocess.STDOUT,
         stdin=subprocess.DEVNULL,
-        start_new_session=True,
         close_fds=True,
     )
+    if IS_WIN:
+        # Windows has no setsid. Detach via creation flags so the child
+        # survives the console window / terminal tab closing
+        # (DETACHED_PROCESS) and gets its own process group
+        # (CREATE_NEW_PROCESS_GROUP). Without this the server dies the
+        # moment the shell that launched it goes away.
+        popen_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        )
+    else:
+        # `start_new_session=True` is the POSIX equivalent of nohup —
+        # gives the child its own session so it survives the shell
+        # closing, terminal hang-up, and tab close.
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen([py, str(ROOT / "main.py")], **popen_kwargs)
     PIDFILE.write_text(str(proc.pid))
     console.print(f"[green]Started.[/] PID {proc.pid}, logs → {LOGFILE}")
     # Give it a moment to bind the port so a follow-up `status` finds it.
@@ -111,22 +141,29 @@ def cmd_stop(_args: argparse.Namespace) -> int:
     if pid is None:
         console.print("[yellow]Not running.[/]")
         return 0
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except OSError as exc:
-        console.print(f"[red]kill failed: {exc}[/]")
-        return 1
+    if IS_WIN:
+        # No POSIX signals on Windows — taskkill (graceful) first.
+        subprocess.run(["taskkill", "/PID", str(pid)], capture_output=True)
+    else:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError as exc:
+            console.print(f"[red]kill failed: {exc}[/]")
+            return 1
     # Wait briefly for the process to exit cleanly before reporting.
-    # If it's stuck, escalate to SIGKILL — better than leaving a
+    # If it's stuck, escalate to a forceful kill — better than leaving a
     # zombie holding port 9999.
     for _ in range(20):  # 2 seconds total
-        try:
-            os.kill(pid, 0)
-        except OSError:
+        if not _pid_running(pid):
             break
         time.sleep(0.1)
     else:
-        os.kill(pid, signal.SIGKILL)
+        if IS_WIN:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True
+            )
+        else:
+            os.kill(pid, signal.SIGKILL)
     PIDFILE.unlink(missing_ok=True)
     console.print(f"[green]Stopped[/] (PID {pid}).")
     return 0
@@ -141,9 +178,16 @@ def cmd_logs(_args: argparse.Namespace) -> int:
     if not LOGFILE.exists():
         console.print(f"[yellow]No log yet at {LOGFILE}[/]")
         return 0
-    # Hand off to `tail -F` — the CLI itself doesn't need to be a log
-    # viewer when the OS already has one that does the right thing
-    # (handles log rotation, Ctrl+C, etc.).
+    # Hand off to the OS's own follower — the CLI itself doesn't need to
+    # be a log viewer when the OS already has one that does the right
+    # thing (handles log rotation, Ctrl+C, etc.). Windows has no `tail`,
+    # so use PowerShell's `Get-Content -Wait` equivalent.
+    if IS_WIN:
+        subprocess.run([
+            "powershell", "-NoProfile", "-Command",
+            f"Get-Content -LiteralPath '{LOGFILE}' -Tail 50 -Wait",
+        ])
+        return 0
     os.execvp("tail", ["tail", "-F", str(LOGFILE)])
 
 
