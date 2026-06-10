@@ -103,6 +103,18 @@ async def _cmd_tail_log(args: dict) -> dict:
     return {"ok": True, "output": "\n".join(lines)}
 
 
+async def _cmd_list_terminals(args: dict) -> dict:
+    """Read terminals.json and return registered terminals."""
+    terminals_path = _INSTALL_ROOT / "terminals.json"
+    if not terminals_path.exists():
+        return {"ok": True, "output": "[]", "note": f"terminals.json not found at {terminals_path}"}
+    try:
+        content = terminals_path.read_text(encoding="utf-8", errors="replace")
+        return {"ok": True, "output": content}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 async def _cmd_dump_config(args: dict, config: Optional[dict] = None) -> dict:
     if config is None:
         return {"ok": False, "error": "no config in context"}
@@ -166,6 +178,67 @@ async def _cmd_terminal_probe_protocol(args: dict) -> dict:
     }
 
 
+async def _cmd_terminal_scan_subnet(args: dict) -> dict:
+    """Scan a specific subnet for terminals using both SSI and PB protocols.
+    Args: subnet — CIDR notation, e.g. '10.245.122.0/24'
+    """
+    import ipaddress
+    subnet_str = str(args.get("subnet", ""))
+    try:
+        subnet = ipaddress.ip_network(subnet_str, strict=False)
+    except ValueError:
+        return {"ok": False, "error": f"invalid subnet: {subnet_str!r}"}
+    if subnet.prefixlen < 16:
+        return {"ok": False, "error": "subnet too large (minimum /16)"}
+
+    try:
+        from src.devices.scan import SSI_TCP_PORT, PB_TCP_PORT, _probe_tcp, discover_network_terminals
+        import concurrent.futures
+
+        hosts = [str(h) for h in subnet.hosts()]
+        open_pairs: list[tuple[str, int]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
+            future_map = {}
+            for host in hosts:
+                future_map[pool.submit(_probe_tcp, host, SSI_TCP_PORT, 0.3)] = (host, SSI_TCP_PORT)
+                future_map[pool.submit(_probe_tcp, host, PB_TCP_PORT, 0.3)] = (host, PB_TCP_PORT)
+            for future in concurrent.futures.as_completed(future_map):
+                host, port = future_map[future]
+                try:
+                    if future.result():
+                        open_pairs.append((host, port))
+                except Exception:
+                    pass
+
+        if not open_pairs:
+            return {"ok": True, "found": False, "output": "[]"}
+
+        from src.services.terminals.ssi import SSITerminalAdapter
+        from src.services.terminals.privatbank import PrivatBankTerminalAdapter
+
+        async def _probe_all() -> list:
+            out, seen = [], set()
+            for host, port in open_pairs:
+                for adapter, label in ((SSITerminalAdapter, "ssi"), (PrivatBankTerminalAdapter, "pb")):
+                    key = f"{host}:{port}:{label}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    try:
+                        d = await adapter.probe(host, port)
+                    except Exception:
+                        d = None
+                    if d is not None:
+                        out.append(d)
+            return out
+
+        descriptors = await _probe_all()
+        out = [d.model_dump(mode="json") for d in descriptors]
+        return {"ok": True, "found": bool(out), "output": json.dumps(out, indent=2, ensure_ascii=False)}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 async def _cmd_terminal_discover(args: dict) -> dict:
     """Run /terminal/discover synchronously and return the JSON-able list of
     descriptors. Equivalent to a dashboard 'Сканувати термінали' click but
@@ -186,8 +259,10 @@ _DIAGNOSTICS: dict[str, Callable[..., Awaitable[dict]]] = {
     "ping": _cmd_ping,
     "terminal_probe": _cmd_terminal_probe,
     "terminal_probe_protocol": _cmd_terminal_probe_protocol,
+    "terminal_scan_subnet": _cmd_terminal_scan_subnet,
     "terminal_discover": _cmd_terminal_discover,
     "tail_log": _cmd_tail_log,
+    "list_terminals": _cmd_list_terminals,
     "dump_config": _cmd_dump_config,
 }
 

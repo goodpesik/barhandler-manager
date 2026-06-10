@@ -77,4 +77,27 @@ _configure_logging(config)
 app = create_app(config)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=config["server"]["port"])
+    # When launched windowless (Windows `pythonw.exe`, or any detached
+    # service with no console) `sys.stdout` / `sys.stderr` are None.
+    # Uvicorn's default log config and any stray `print` would then crash
+    # on write, so route them to the rotating log file before use.
+    import sys
+
+    if sys.stdout is None or sys.stderr is None:
+        _devlog = open(
+            Path(__file__).resolve().parent / "bhm.log", "a", encoding="utf-8"
+        )
+        if sys.stdout is None:
+            sys.stdout = _devlog
+        if sys.stderr is None:
+            sys.stderr = _devlog
+
+    # log_config=None keeps the file handlers wired up in
+    # `_configure_logging` instead of letting uvicorn reinstall its own
+    # stdout/stderr handlers (which would crash under pythonw).
+    uvicorn.run(
+        app,
+        host="127.0.0.1",
+        port=config["server"]["port"],
+        log_config=None,
+    )

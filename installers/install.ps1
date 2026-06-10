@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     barhandler-manager installer for Windows.
 
@@ -133,6 +133,32 @@ foreach ($keep in 'config.yaml', 'printers.json', 'terminals.json') {
     if (Test-Path $src) { Copy-Item $src (Join-Path $Tmp "$keep.bak") -Force }
 }
 
+# --- stop the running instance before swapping code ------------------
+# On an upgrade the old pythonw is still running and holding port 9999.
+# If we don't stop it: (a) Copy-Item below can fail on locked modules,
+# and (b) the freshly-started task can't bind 9999, exits, and the OLD
+# code keeps serving — the update silently does nothing.
+#
+# Kill the python PROCESS by PID (matched on our own main.py) — NOT
+# Stop-ScheduledTask. When the update is triggered from the dashboard
+# this very script runs (via update.ps1) as a descendant of the
+# manager's Scheduled Task; Stop-ScheduledTask tree-kills the task and
+# would take this updater down with it mid-flight.
+Write-Step "stopping the running manager before swapping code"
+try {
+    $procs = Get-CimInstance Win32_Process -Filter "Name = 'pythonw.exe' OR Name = 'python.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine -like "*$InstallDir\main.py*" }
+    foreach ($p in $procs) {
+        Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+} catch {}
+# Wait for port 9999 to actually free (health stops answering) before we
+# start the new one — up to ~15s for uvicorn's graceful shutdown.
+foreach ($i in 1..15) {
+    if (-not (Test-Running)) { break }
+    Start-Sleep -Seconds 1
+}
+
 # Copy source over, excluding our venv + user data.
 $exclude = @('.venv', 'config.yaml', 'printers.json', 'terminals.json')
 Get-ChildItem -Path $SrcRoot | Where-Object { $exclude -notcontains $_.Name } | ForEach-Object {
@@ -145,6 +171,18 @@ foreach ($keep in 'config.yaml', 'printers.json', 'terminals.json') {
     if (Test-Path $bak) { Copy-Item $bak (Join-Path $InstallDir $keep) -Force }
 }
 
+# Seed the default config.yaml on a fresh install. It's excluded from the
+# copy above to protect an existing user config on upgrades, but a
+# first-time install has no backup to restore — without this the manager
+# crashes at startup with FileNotFoundError: config.yaml and the service
+# never comes up. printers.json / terminals.json aren't shipped (the app
+# creates them at runtime), so only config.yaml needs seeding.
+$cfgDst = Join-Path $InstallDir 'config.yaml'
+if (-not (Test-Path $cfgDst)) {
+    $cfgSrc = Join-Path $SrcRoot 'config.yaml'
+    if (Test-Path $cfgSrc) { Copy-Item $cfgSrc $cfgDst -Force }
+}
+
 Remove-Item $Tmp -Recurse -Force
 
 # --- venv + deps ------------------------------------------------------
@@ -153,8 +191,9 @@ if (-not (Test-Path $VenvDir)) {
     Write-Step "creating virtualenv"
     & $python -m venv $VenvDir
 }
-$VenvPython = Join-Path $VenvDir 'Scripts\python.exe'
-$VenvPip    = Join-Path $VenvDir 'Scripts\pip.exe'
+$VenvPython  = Join-Path $VenvDir 'Scripts\python.exe'
+$VenvPythonw = Join-Path $VenvDir 'Scripts\pythonw.exe'
+$VenvPip     = Join-Path $VenvDir 'Scripts\pip.exe'
 
 Write-Step "installing Python dependencies"
 & $VenvPython -m pip install --upgrade pip | Out-Null
@@ -162,16 +201,25 @@ Write-Step "installing Python dependencies"
 
 # --- scheduled task --------------------------------------------------
 Write-Step "registering Scheduled Task '$TaskName' (runs at logon)"
+# Run via pythonw.exe (the windowless interpreter): it never allocates a
+# console, so closing the terminal that launched the task can't deliver a
+# CTRL_CLOSE/CTRL_C event to it. With plain python.exe the server inherited
+# the launching console and died with STATUS_CONTROL_C_EXIT (0xC000013A)
+# when the terminal was closed.
 $Action  = New-ScheduledTaskAction `
-    -Execute $VenvPython `
+    -Execute $VenvPythonw `
     -Argument "$InstallDir\main.py" `
     -WorkingDirectory $InstallDir
 $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+# Resilience: if the server ever exits, restart it (up to 3 times, 1 min
+# apart) instead of staying down until the next logon.
 $Settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
     -DontStopOnIdleEnd `
     -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries `
+    -RestartCount 3 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
     -ExecutionTimeLimit (New-TimeSpan -Days 365)
 $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
 
@@ -223,28 +271,75 @@ $UpdatePs1 = @"
 # Pull the latest release. Equivalent to:
 #   irm https://github.com/$Repo/releases/latest/download/install.ps1 | iex
 # but with -Force so install.ps1 runs upgrade-mode without prompting.
+#
+# Download first, then verify it's a real (non-empty) installer before
+# running it. A transient GitHub failure must surface as an error in
+# update.log, not silently run an empty script as a no-op "success".
 `$url = 'https://github.com/$Repo/releases/latest/download/install.ps1'
-`$script = Invoke-WebRequest -Uri `$url -UseBasicParsing
-Invoke-Expression "& { `$(`$script.Content) } -Force"
+try {
+    `$resp = Invoke-WebRequest -Uri `$url -UseBasicParsing -TimeoutSec 30
+} catch {
+    Write-Host "✗ update: could not download install.ps1 (`$(`$_.Exception.Message))" -ForegroundColor Red
+    exit 1
+}
+if (-not `$resp.Content -or `$resp.Content.Length -lt 100) {
+    Write-Host '✗ update: empty installer downloaded — nothing changed' -ForegroundColor Red
+    exit 1
+}
+Invoke-Expression "& { `$(`$resp.Content) } -Force"
 "@
 
-Set-Content -Path (Join-Path $InstallDir 'start.ps1')  -Value $StartPs1
-Set-Content -Path (Join-Path $InstallDir 'stop.ps1')   -Value $StopPs1
-Set-Content -Path (Join-Path $InstallDir 'status.ps1') -Value $StatusPs1
-Set-Content -Path (Join-Path $InstallDir 'update.ps1') -Value $UpdatePs1
+# Write the .ps1 helpers as UTF-8 *with BOM*. These contain non-ASCII
+# glyphs (✓ ▸ ⚠ ✗); Windows PowerShell 5.1 reads a BOM-less script using
+# the system ANSI codepage (cp1251/cp1252), which mangles those bytes and
+# breaks parsing when the .cmd wrappers launch them via `powershell -File`.
+# The BOM forces the parser to treat them as UTF-8. (`Set-Content
+# -Encoding UTF8` emits a BOM on PS 5.1.)
+Set-Content -Path (Join-Path $InstallDir 'start.ps1')  -Value $StartPs1  -Encoding UTF8
+Set-Content -Path (Join-Path $InstallDir 'stop.ps1')   -Value $StopPs1   -Encoding UTF8
+Set-Content -Path (Join-Path $InstallDir 'status.ps1') -Value $StatusPs1 -Encoding UTF8
+Set-Content -Path (Join-Path $InstallDir 'update.ps1') -Value $UpdatePs1 -Encoding UTF8
 
-# .cmd wrappers so double-click works without changing execution policy
-Set-Content -Path (Join-Path $InstallDir 'start.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0start.ps1`""
-Set-Content -Path (Join-Path $InstallDir 'stop.cmd')  -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0stop.ps1`""
-Set-Content -Path (Join-Path $InstallDir 'status.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0status.ps1`""
-Set-Content -Path (Join-Path $InstallDir 'update.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0update.ps1`""
+# .cmd wrappers so double-click works without changing execution policy.
+# Keep these ASCII (no BOM) — a UTF-8 BOM at the top of a .cmd makes
+# cmd.exe choke on the first `@powershell` line.
+Set-Content -Path (Join-Path $InstallDir 'start.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0start.ps1`"" -Encoding Ascii
+Set-Content -Path (Join-Path $InstallDir 'stop.cmd')  -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0stop.ps1`"" -Encoding Ascii
+Set-Content -Path (Join-Path $InstallDir 'status.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0status.ps1`"" -Encoding Ascii
+Set-Content -Path (Join-Path $InstallDir 'update.cmd') -Value "@powershell -NoProfile -ExecutionPolicy Bypass -File `"%~dp0update.ps1`"" -Encoding Ascii
 
 # --- smoke test -------------------------------------------------------
-Start-Sleep -Seconds 3
-if (Test-Running) {
-    Write-Step "✓ manager is up at http://localhost:9999"
+# Cold start imports fastapi/uvicorn/pydantic/zeroconf/aiohttp before the
+# port opens — that's well over 3s on a fresh box, so a single 3s check
+# false-alarms on a perfectly good install. Poll up to ~30s instead.
+#
+# Match the running version against the VERSION file we just copied in.
+# A plain "did /health answer 200" check is a false pass on upgrades: a
+# stale pythonw that outlived its kill can answer a few requests with the
+# OLD version and trick us into declaring success while the new code
+# never bound the port.
+$ExpectedVersion = ''
+$verFile = Join-Path $InstallDir 'VERSION'
+if (Test-Path $verFile) { $ExpectedVersion = (Get-Content $verFile -Raw).Trim() }
+
+function Test-RunningVersion($expected) {
+    try {
+        $r = Invoke-WebRequest -Uri 'http://localhost:9999/health' -UseBasicParsing -TimeoutSec 1
+        if ($r.StatusCode -ne 200) { return $false }
+        if (-not $expected) { return $true }
+        return ($r.Content -match ('"version"\s*:\s*"' + [regex]::Escape($expected) + '"'))
+    } catch { return $false }
+}
+
+$up = $false
+foreach ($i in 1..30) {
+    if (Test-RunningVersion $ExpectedVersion) { $up = $true; break }
+    Start-Sleep -Seconds 1
+}
+if ($up) {
+    Write-Step "✓ manager v$ExpectedVersion is up at http://localhost:9999"
 } else {
-    Write-Warn "manager didn't answer /health within 3s — check $InstallDir\bhm.log"
+    Write-Warn "manager didn't come up on v$ExpectedVersion within 30s — check $InstallDir\bhm.log"
 }
 
 Write-Host @"

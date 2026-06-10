@@ -99,10 +99,8 @@ def _surface_terminal_error(exc: TerminalUnavailable) -> HTTPException:
 
 @router.post("/discover")
 async def discover(request: Request) -> dict:
-    """LAN-scan + probe stub. Real LAN-scan extension lands in commit 3.
-    For now we return whatever's cached from the last call (so unit
-    tests that monkey-patch the discovery hook still work) plus the
-    Bluetooth-style platform warnings the printer endpoint uses.
+    """LAN-scan + probe. Returns discovered terminals merged with
+    manually registered ones so the frontend always sees the full list.
     """
     import asyncio
 
@@ -111,7 +109,17 @@ async def discover(request: Request) -> dict:
     registry = _registry(request)
     descriptors = await asyncio.to_thread(discover_network_terminals)
     registry.remember_descriptors(descriptors)
-    return {"terminals": [d.model_dump() for d in descriptors]}
+
+    # Merge: start with discovered, then add manually registered ones
+    # that didn't show up in the scan (different subnet, offline, etc.)
+    seen_ids = {d.id for d in descriptors}
+    manual = [
+        reg.descriptor
+        for reg in registry.all_registrations()
+        if reg.descriptor.id not in seen_ids
+    ]
+
+    return {"terminals": [d.model_dump() for d in descriptors + manual]}
 
 
 @router.get("")

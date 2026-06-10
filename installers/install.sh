@@ -354,6 +354,14 @@ User=${USER}
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${INSTALL_DIR}/.venv/bin/python ${INSTALL_DIR}/main.py
 Restart=on-failure
+# KillMode=process so a dashboard-triggered self-update survives the
+# restart it asks for. The updater (this install.sh, pulled via
+# curl|bash by update.sh) runs INSIDE this unit's cgroup. With the
+# default KillMode=control-group, \`systemctl restart\` SIGKILLs the
+# whole cgroup — the updater dies mid-flight, leaving new code on disk
+# but the old python still in RAM. \`process\` kills only the main
+# python, leaving the updater (and the restart it issued) to finish.
+KillMode=process
 StandardOutput=append:${INSTALL_DIR}/bhm.boot.log
 StandardError=append:${INSTALL_DIR}/bhm.boot.log
 
@@ -361,8 +369,14 @@ StandardError=append:${INSTALL_DIR}/bhm.boot.log
 WantedBy=multi-user.target
 EOF
         sudo systemctl daemon-reload
-        sudo systemctl enable --now "$SERVICE_NAME"
-        say "systemd service installed and started"
+        sudo systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+        # NOT \`enable --now\`: that's a no-op on an already-running unit,
+        # so a dashboard update would copy new files but keep the OLD
+        # code in memory until a manual restart/reboot. An explicit
+        # restart loads the new code on update AND starts the unit on a
+        # fresh install (restart starts a stopped unit too).
+        sudo systemctl restart "$SERVICE_NAME"
+        say "systemd service installed and (re)started"
         ;;
 esac
 
@@ -458,7 +472,21 @@ cat > "$INSTALL_DIR/update.sh" <<EOF
 # find brew/python3 — otherwise it dies with "Homebrew not installed"
 # even when brew is sitting right there in /opt/homebrew.
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:\$PATH"
-exec curl -fsSL https://github.com/${REPO}/releases/latest/download/install.sh | bash -s -- --force
+# Download to a temp file FIRST, then run it. Piping \`curl | bash\`
+# means a transient GitHub failure (rate-limit, DNS blip, 5xx) feeds an
+# EMPTY script into bash, which exits 0 having done nothing — a silent
+# "update succeeded but changed nothing". Verify we actually received a
+# non-empty installer before executing it, and leave a readable line in
+# update.log when the download fails so the operator isn't staring at a
+# frozen "Перезапуск…" with no clue why.
+set -o pipefail
+TMP="\$(mktemp "\${TMPDIR:-/tmp}/bhm-install.XXXXXX")" || exit 1
+trap 'rm -f "\$TMP"' EXIT
+if ! curl -fsSL "https://github.com/${REPO}/releases/latest/download/install.sh" -o "\$TMP" || [ ! -s "\$TMP" ]; then
+    echo "✗ update: could not download install.sh from GitHub (network / rate-limit?) — nothing changed" >&2
+    exit 1
+fi
+exec bash "\$TMP" --force
 EOF
 
 chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/stop.sh" "$INSTALL_DIR/status.sh" "$INSTALL_DIR/update.sh"
