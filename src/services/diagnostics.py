@@ -103,6 +103,18 @@ async def _cmd_tail_log(args: dict) -> dict:
     return {"ok": True, "output": "\n".join(lines)}
 
 
+async def _cmd_list_terminals(args: dict) -> dict:
+    """Read terminals.json and return registered terminals."""
+    terminals_path = _INSTALL_ROOT / "terminals.json"
+    if not terminals_path.exists():
+        return {"ok": True, "output": "[]", "note": f"terminals.json not found at {terminals_path}"}
+    try:
+        content = terminals_path.read_text(encoding="utf-8", errors="replace")
+        return {"ok": True, "output": content}
+    except Exception as e:
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 async def _cmd_dump_config(args: dict, config: Optional[dict] = None) -> dict:
     if config is None:
         return {"ok": False, "error": "no config in context"}
@@ -250,6 +262,7 @@ _DIAGNOSTICS: dict[str, Callable[..., Awaitable[dict]]] = {
     "terminal_scan_subnet": _cmd_terminal_scan_subnet,
     "terminal_discover": _cmd_terminal_discover,
     "tail_log": _cmd_tail_log,
+    "list_terminals": _cmd_list_terminals,
     "dump_config": _cmd_dump_config,
 }
 
