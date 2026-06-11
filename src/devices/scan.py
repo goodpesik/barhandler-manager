@@ -463,7 +463,7 @@ def discover_network_terminals(
             "enumerated by our interface scan (rare — usually CGNAT carrier "
             "isolating the terminal SIM from this device); guest-network "
             "client isolation; manager host firewall; terminal offline. "
-            "If you know the terminal's IP, use 'Додати термінал руками' "
+            "If you know the terminal's IP, use 'Додати термінал вручну' "
             "in the dashboard.",
             SSI_TCP_PORT, PB_TCP_PORT, [str(s) for s in subnets],
         )
