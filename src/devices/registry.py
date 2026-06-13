@@ -165,10 +165,10 @@ class PrinterRegistry:
     async def get_device(self, printer_id: str) -> PrinterDevice:
         device = self._devices.get(printer_id)
         if device is not None:
-            # Reconnect a cached device whose handle dropped (idle, or the
-            # heartbeat cleared it after a transient probe miss) instead of
-            # handing back a dead one — otherwise the next print fails with
-            # "printer unavailable". connect() never raises.
+            # Reconnect a cached device whose handle dropped — e.g. a previous
+            # print hit a socket/USB error and the worker cleared it — instead
+            # of handing back a dead one, so the next print self-heals rather
+            # than failing with "printer unavailable". connect() never raises.
             if not device.is_connected():
                 await device.connect()
             return device

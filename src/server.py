@@ -39,32 +39,12 @@ def create_app(config: dict) -> FastAPI:
     )
     terminal_registry = TerminalRegistry(path=terminal_registry_path)
 
-    async def _printer_heartbeat() -> None:
-        """Every 30 s probe each connected printer. Disconnect the stale
-        handle only after TWO consecutive misses — a USB printer is briefly
-        unreachable right after a job, and disconnecting on that single
-        transient miss made the next print fail with 'printer unavailable'.
-        (get_device also reconnects on demand, so this is belt-and-suspenders.)"""
-        misses: dict[str, int] = {}
-        while True:
-            await asyncio.sleep(30)
-            for printer_id, device in list(registry._devices.items()):  # noqa: SLF001
-                if device.is_connected():
-                    try:
-                        reachable = await device.async_probe()
-                    except Exception:
-                        reachable = False
-                    if reachable:
-                        misses[printer_id] = 0
-                    else:
-                        misses[printer_id] = misses.get(printer_id, 0) + 1
-                        if misses[printer_id] >= 2:
-                            logger.info(
-                                "[heartbeat] %s unreachable — disconnecting",
-                                printer_id,
-                            )
-                            await device.disconnect()
-                            misses[printer_id] = 0
+    # No printer heartbeat: the ESC/POS status probe (is_online()) is
+    # unreliable on USB receipt printers — most clones don't answer the
+    # status command and report "offline" while perfectly functional, so a
+    # background poll only ever killed working connections. We learn the real
+    # state at print/payment time (a failed job clears the handle; the next
+    # job reconnects via get_device). Removed deliberately.
 
     # Read the installed VERSION once at startup — this is what the
     # operator's `update.sh` writes after a release. Don't re-read on
@@ -83,7 +63,6 @@ def create_app(config: dict) -> FastAPI:
         app.state.terminal_registry = terminal_registry
         registry.load()
         terminal_registry.load()
-        heartbeat = asyncio.create_task(_printer_heartbeat(), name="printer-heartbeat")
 
         update_checker = UpdateChecker(current_version=current_version)
         app.state.update_checker = update_checker
@@ -117,7 +96,6 @@ def create_app(config: dict) -> FastAPI:
             await uplink.stop()
         await update_checker.stop()
         update_task.cancel()
-        heartbeat.cancel()
         await registry.disconnect_all()
 
     app = FastAPI(title="Barhandler Manager", version="0.3.42", lifespan=lifespan)
