@@ -76,6 +76,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
     background: var(--amber); color: #fff; border-color: transparent;
   }
   .btn-update:hover:not(:disabled) { opacity: 0.85; }
+  .btn-danger {
+    background: transparent; color: #ef4444; border-color: rgba(239,68,68,0.4);
+    padding: 4px 8px; font-size: 12px;
+  }
+  .btn-danger:hover:not(:disabled) { background: rgba(239,68,68,0.1); }
   .modal-backdrop {
     position: fixed; inset: 0; background: rgba(0,0,0,0.45);
     display: flex; align-items: center; justify-content: center;
@@ -175,6 +180,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
   <div class="controls">
     <span class="controls-label">Дії</span>
+    <button class="btn btn-default" onclick="refreshStatus(this)">↻ Оновити статус</button>
     <button class="btn btn-default" onclick="scanPrinters(this)">🔍 Сканувати принтери</button>
     <button class="btn btn-default" onclick="scanTerminals(this)">🔍 Сканувати термінали</button>
     <button class="btn btn-default" onclick="openManualTerminalModal()">➕ Додати термінал вручну</button>
@@ -271,9 +277,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
     </h2>
     <table>
       <thead>
-        <tr><th>ID</th><th>Назва</th><th>Роль</th><th>Transport</th><th>Стан</th></tr>
+        <tr><th>ID</th><th>Назва</th><th>Роль</th><th>Transport</th><th>Стан</th><th>Дії</th></tr>
       </thead>
-      <tbody id="printers"><tr><td class="empty" colspan="5">завантаження…</td></tr></tbody>
+      <tbody id="printers"><tr><td class="empty" colspan="6">завантаження…</td></tr></tbody>
     </table>
   </section>
 
@@ -281,9 +287,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <h2>POS-термінали / POS terminals</h2>
     <table>
       <thead>
-        <tr><th>ID</th><th>Назва</th><th>Банк</th><th>Адреса</th><th>Default merchant</th></tr>
+        <tr><th>ID</th><th>Назва</th><th>Банк</th><th>Адреса</th><th>Default merchant</th><th>Дії</th></tr>
       </thead>
-      <tbody id="terminals"><tr><td class="empty" colspan="5">завантаження…</td></tr></tbody>
+      <tbody id="terminals"><tr><td class="empty" colspan="6">завантаження…</td></tr></tbody>
     </table>
   </section>
 
@@ -351,11 +357,12 @@ _HTML_TEMPLATE = r"""<!doctype html>
         + "<td>" + escHtml(reg.kind || "") + "</td>"
         + "<td>" + escHtml(d.transport || "") + "</td>"
         + "<td>" + badge(status, kind) + "</td>"
+        + "<td><button class='btn btn-danger' onclick=\"removePrinter('" + escHtml(d.id) + "')\">🗑 Видалити</button></td>"
         + "</tr>";
     });
     $("printers").innerHTML = rows.length
       ? rows.join("")
-      : '<tr><td class="empty" colspan="5">— не зареєстровано —</td></tr>';
+      : '<tr><td class="empty" colspan="6">— не зареєстровано —</td></tr>';
   }
 
   function renderTerminals(terminals) {
@@ -369,11 +376,46 @@ _HTML_TEMPLATE = r"""<!doctype html>
         + "<td>" + escHtml(reg.kind || "") + "</td>"
         + "<td class='id'>" + addr + "</td>"
         + "<td>" + escHtml(reg.default_merchant_id || "—") + "</td>"
+        + "<td><button class='btn btn-danger' onclick=\"removeTerminal('" + escHtml(d.id) + "')\">🗑 Видалити</button></td>"
         + "</tr>";
     });
     $("terminals").innerHTML = rows.length
       ? rows.join("")
-      : '<tr><td class="empty" colspan="5">— не зареєстровано —</td></tr>';
+      : '<tr><td class="empty" colspan="6">— не зареєстровано —</td></tr>';
+  }
+
+  // ---- unregister + manual refresh ----------------------------------------
+
+  async function removePrinter(id) {
+    if (!id || !confirm("Видалити цей принтер із зареєстрованих?")) return;
+    try {
+      await api("DELETE", "/devices/" + encodeURIComponent(id), true);
+      showToast("Принтер видалено", "ok");
+      refresh();
+    } catch (e) {
+      showToast("Не вдалося видалити: " + e.message, "err");
+    }
+  }
+
+  async function removeTerminal(id) {
+    if (!id || !confirm("Видалити цей термінал із зареєстрованих?")) return;
+    try {
+      await api("DELETE", "/terminal/" + encodeURIComponent(id), true);
+      showToast("Термінал видалено", "ok");
+      refresh();
+    } catch (e) {
+      showToast("Не вдалося видалити: " + e.message, "err");
+    }
+  }
+
+  async function refreshStatus(btn) {
+    if (btn) { btn.disabled = true; }
+    try {
+      await refresh();
+      showToast("Статус оновлено", "ok", 1500);
+    } finally {
+      if (btn) { btn.disabled = false; }
+    }
   }
 
   // ---- version check (GitHub, once per 5 min) ------------------------------
