@@ -1,0 +1,3 @@
+# Local test tool only — NOT part of the manager runtime.
+questionary>=2.0.1
+rich>=13.7.0
