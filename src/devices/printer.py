@@ -234,8 +234,7 @@ class PrinterDevice:
         if getattr(printer, "_bh_bitmap_patched", False):
             return
 
-        # Read the canvas width per-flush (not captured once) so a config
-        # change is always reflected — `self.paper_width` reads live config.
+        width_px = dots_for(self.paper_width)
         state = {
             "bold": False,
             "align": "left",
@@ -251,7 +250,6 @@ class PrinterDevice:
             buffer.clear()
             if not chunk:
                 return
-            width_px = dots_for(self.paper_width)
             scale_h = 2.0 if state["double_height"] else 1.0
             scale_w = 2.0 if state["double_width"] else 1.0
             for piece in chunk.split("\n")[:-1] + (
