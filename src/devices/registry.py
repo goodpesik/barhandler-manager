@@ -145,17 +145,22 @@ class PrinterRegistry:
             kwargs["label_gap"] = req.label_gap
         reg = PrinterRegistration(**kwargs)
         self._registrations[descriptor.id] = reg
-        # A live device caches its config (paper_width, render_mode, code_page)
-        # and installs its bitmap patch once — capturing the canvas width at
-        # that moment. Re-registering with a new paper size therefore had no
-        # effect on an already-connected printer: an 80mm printer first seen
-        # as 58mm kept printing at 55mm. Drop the cached device so the next
-        # print rebuilds it from this fresh registration. (PET-199)
-        stale = self._devices.pop(descriptor.id, None)
-        if stale is not None:
-            import asyncio
-
-            asyncio.create_task(stale.disconnect())
+        # Apply the new settings to a live device IN PLACE rather than
+        # disconnecting it. paper_width drives the bitmap canvas width, which
+        # is read per-flush from this config, so a 58→80 change takes effect on
+        # the next print without a reconnect. (Earlier we popped + disconnected
+        # the device here, but that left the just-connected printer torn down,
+        # so the next sale failed with "printer unavailable" — PET-199 regr.)
+        live = self._devices.get(descriptor.id)
+        if live is not None:
+            live._config.update(  # noqa: SLF001
+                {
+                    "paper_width": reg.paper_width,
+                    "render_mode": reg.render_mode,
+                    "code_page": reg.code_page,
+                    "drawer_pin": reg.drawer_pin,
+                }
+            )
         self.save()
         return reg
 
