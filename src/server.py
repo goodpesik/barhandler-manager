@@ -40,31 +40,26 @@ def create_app(config: dict) -> FastAPI:
     terminal_registry = TerminalRegistry(path=terminal_registry_path)
 
     async def _printer_heartbeat() -> None:
-        """Every 30 s probe each connected printer. Disconnect the stale
-        handle only after TWO consecutive misses — a USB printer is briefly
-        unreachable right after a job, and disconnecting on that single
-        transient miss made the next print fail with 'printer unavailable'.
-        (get_device also reconnects on demand, so this is belt-and-suspenders.)"""
-        misses: dict[str, int] = {}
+        """Probe each connected printer every 30 s for visibility only — we do
+        NOT disconnect on a miss. A USB receipt printer reports
+        is_online()=False while idle/asleep, yet prints fine when a job wakes
+        it; tearing the handle down here is what made the printer "fall off
+        over time" / show 'unavailable'. Leave the handle open — a genuine
+        drop is recovered lazily by get_device (reconnect) and surfaces only
+        when an actual print fails."""
         while True:
             await asyncio.sleep(30)
             for printer_id, device in list(registry._devices.items()):  # noqa: SLF001
-                if device.is_connected():
-                    try:
-                        reachable = await device.async_probe()
-                    except Exception:
-                        reachable = False
-                    if reachable:
-                        misses[printer_id] = 0
-                    else:
-                        misses[printer_id] = misses.get(printer_id, 0) + 1
-                        if misses[printer_id] >= 2:
-                            logger.info(
-                                "[heartbeat] %s unreachable — disconnecting",
-                                printer_id,
-                            )
-                            await device.disconnect()
-                            misses[printer_id] = 0
+                if not device.is_connected():
+                    continue
+                try:
+                    ok = await device.async_probe()
+                except Exception:
+                    ok = False
+                if not ok:
+                    logger.debug(
+                        "[heartbeat] %s probe miss — left connected", printer_id
+                    )
 
     # Read the installed VERSION once at startup — this is what the
     # operator's `update.sh` writes after a release. Don't re-read on
