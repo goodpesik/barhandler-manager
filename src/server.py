@@ -40,8 +40,12 @@ def create_app(config: dict) -> FastAPI:
     terminal_registry = TerminalRegistry(path=terminal_registry_path)
 
     async def _printer_heartbeat() -> None:
-        """Every 30 s probe each connected printer. On failure, disconnect
-        the stale handle so /health reports 'unavailable' immediately."""
+        """Every 30 s probe each connected printer. Disconnect the stale
+        handle only after TWO consecutive misses — a USB printer is briefly
+        unreachable right after a job, and disconnecting on that single
+        transient miss made the next print fail with 'printer unavailable'.
+        (get_device also reconnects on demand, so this is belt-and-suspenders.)"""
+        misses: dict[str, int] = {}
         while True:
             await asyncio.sleep(30)
             for printer_id, device in list(registry._devices.items()):  # noqa: SLF001
@@ -50,9 +54,17 @@ def create_app(config: dict) -> FastAPI:
                         reachable = await device.async_probe()
                     except Exception:
                         reachable = False
-                    if not reachable:
-                        logger.info("[heartbeat] %s unreachable — disconnecting", printer_id)
-                        await device.disconnect()
+                    if reachable:
+                        misses[printer_id] = 0
+                    else:
+                        misses[printer_id] = misses.get(printer_id, 0) + 1
+                        if misses[printer_id] >= 2:
+                            logger.info(
+                                "[heartbeat] %s unreachable — disconnecting",
+                                printer_id,
+                            )
+                            await device.disconnect()
+                            misses[printer_id] = 0
 
     # Read the installed VERSION once at startup — this is what the
     # operator's `update.sh` writes after a release. Don't re-read on
