@@ -39,12 +39,22 @@ def create_app(config: dict) -> FastAPI:
     )
     terminal_registry = TerminalRegistry(path=terminal_registry_path)
 
-    # No printer heartbeat: the ESC/POS status probe (is_online()) is
-    # unreliable on USB receipt printers — most clones don't answer the
-    # status command and report "offline" while perfectly functional, so a
-    # background poll only ever killed working connections. We learn the real
-    # state at print/payment time (a failed job clears the handle; the next
-    # job reconnects via get_device). Removed deliberately.
+    async def _printer_connect_watcher() -> None:
+        """Connect-ONLY watcher — the safe inverse of the old heartbeat. Every
+        15 s it OPENS any registered printer that isn't currently connected
+        (get_device builds / reconnects the handle). It NEVER disconnects, so
+        it can't kill a working printer the way the status-probe heartbeat did:
+        a connected handle is left untouched; a printer that's off stays
+        disconnected until it's powered on, then the next tick opens it (the
+        dashboard flips to 'connected' on its own, no print needed). Runs once
+        immediately so a printer is ready right after startup."""
+        while True:
+            for reg in registry.all_registrations():
+                try:
+                    await registry.get_device(reg.descriptor.id)
+                except Exception:
+                    pass
+            await asyncio.sleep(15)
 
     # Read the installed VERSION once at startup — this is what the
     # operator's `update.sh` writes after a release. Don't re-read on
@@ -63,6 +73,9 @@ def create_app(config: dict) -> FastAPI:
         app.state.terminal_registry = terminal_registry
         registry.load()
         terminal_registry.load()
+        connect_watcher = asyncio.create_task(
+            _printer_connect_watcher(), name="printer-connect",
+        )
 
         update_checker = UpdateChecker(current_version=current_version)
         app.state.update_checker = update_checker
@@ -96,6 +109,7 @@ def create_app(config: dict) -> FastAPI:
             await uplink.stop()
         await update_checker.stop()
         update_task.cancel()
+        connect_watcher.cancel()
         await registry.disconnect_all()
 
     app = FastAPI(title="Barhandler Manager", version="0.3.34", lifespan=lifespan)
