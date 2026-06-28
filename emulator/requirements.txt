@@ -1,3 +1,6 @@
 # Local test tool only — NOT part of the manager runtime.
 questionary>=2.0.1
 rich>=13.7.0
+# Printer emulator reconstructs GS v 0 rasters into PNGs (same Pillow the
+# manager renders with). The live web viewer uses only the stdlib.
+Pillow>=10.0.0
