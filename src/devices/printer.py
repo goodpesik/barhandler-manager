@@ -266,8 +266,17 @@ class PrinterDevice:
                 # Bypass python-escpos image() — write raw GS v 0 directly
                 # so the printer's text/raster decoder boundaries stay
                 # exactly where we want them.
+                #
+                # Do NOT emit a trailing "\n": GS v 0 already feeds the
+                # paper by the raster's own height and returns the head to
+                # the start of the line (ESC/POS spec). An extra LF makes
+                # the firmware feed a *second* line at the default spacing
+                # (~1/6"), which double-spaces every line — exactly the
+                # loose look seen on the client's 80mm Xprinter. The
+                # render already carries per-line padding, so consecutive
+                # rasters stack tight on every printer. (Bottom margin is
+                # handled by cut()'s print-and-feed, which is unaffected.)
                 printer._raw(image_to_gs_v_0(img))
-                printer._raw(b"\n")
 
         def text(s: str) -> None:
             if not s:
