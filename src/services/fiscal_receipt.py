@@ -195,17 +195,28 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
         # native printer.qr() bypasses our bitmap patch and was always
         # left-justified on this hardware.
         paper_w = 576 if width >= 48 else 384
-        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=6, border=2)
+        # Target ~2×2 cm: 20 mm × 8 dots/mm ≈ 160 dots. Pick an INTEGER
+        # box_size (dots per module) sized to that target instead of a
+        # fixed box_size=6 — the old fixed value made the QR grow to 2-3×
+        # this size as the encoded URL got longer. An integer box keeps
+        # the modules crisp on the thermal head (no fractional dots).
+        TARGET_DOTS = 160
+        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=2)
         qr.add_data(receipt.qr_url)
         qr.make(fit=True)
+        modules_across = qr.modules_count + qr.border * 2
+        qr.box_size = max(2, round(TARGET_DOTS / modules_across))
         qr_img = qr.make_image(fill_color="black", back_color="white").convert("1")
-        if qr_img.width > paper_w:
-            scale = paper_w / qr_img.width
-            qr_img = qr_img.resize((paper_w, int(qr_img.height * scale)))
-        canvas = Image.new("1", (paper_w, qr_img.height), 1)
+        if qr_img.width > paper_w:                 # safety on very narrow paper
+            qr_img = qr_img.resize((paper_w, paper_w))
+        # Centre on the paper. A small bottom gap is baked into the canvas
+        # instead of a trailing LF: GS v 0 already feeds its own height, and
+        # an extra "\n" would add a firmware-dependent feed (the same issue
+        # fixed for text lines in the bitmap pipeline).
+        bottom_gap = 8
+        canvas = Image.new("1", (paper_w, qr_img.height + bottom_gap), 1)
         canvas.paste(qr_img, ((paper_w - qr_img.width) // 2, 0))
         printer._raw(image_to_gs_v_0(canvas))
-        printer._raw(b"\n")
 
     # ---- Pos footer ----
     printer.text(_separator(width) + "\n")
