@@ -21,14 +21,15 @@ The builders are pure (no I/O) so they can be golden-tested against the local
 and is the only thing the routes wrap in a thread.
 
 SPEC PROVENANCE — the element/attribute names, the SOAP transport, the response
-schema and error semantics below were verified against Epson's own SEIKO
-`fiscalprint.js` library and two working integrations (a C# EpsonFiscalPrinter
-lib + Microsoft D365's Epson FP-90III sample). Two details could NOT be pinned to
-a primary source (Epson's CDN blocks automated fetches) and stay marked
-`# TODO(confirm)`:
-  * the exact status-query element / statusType (`build_status_xml`);
-  * the full numeric error-code table (only code 17 is documented here).
-Everything else is verbatim from those sources.
+schema and error semantics below were verified against multiple real sources:
+Epson's own SEIKO `fiscalprint.js`, the Odoo `fp90iii.js` driver, a C#
+EpsonFiscalPrinter lib, Microsoft D365's Epson FP-90III sample, a
+real-hardware-verified Italian FPMate bridge (`tecnosiel/OfficinaPro`
+`FPmateXmlBuilder.java`, "Verificato sul registratore reale FP-81II"), and the
+efsta EPSON error-code table. Epson's own PDF guides sit behind an Akamai block
+(403 to curl AND real headless Chrome), so those primary PDFs were unreachable —
+but every literal below is cross-checked against the working sources above, so
+there are no remaining guesses.
 """
 
 from __future__ import annotations
@@ -90,21 +91,41 @@ DEFAULT_IVA_TO_DEPARTMENT = {
     0.0: 9,
 }
 
-# EpsonFPMate error codes → operator-facing message. The full numeric table
-# lives in Epson's "ePOS Fiscal Print Solution Development Guide" (not vendored;
-# CDN blocks automated fetch). Code 17 = "IMPOSSIBILE ORA" — a GENERIC
-# "command not allowed in the current printer state" error. A missing first
-# daily-close is ONE common cause, but so is e.g. a mis-flagged refund — so we
-# surface the printer status/last-command rather than hard-asserting the cause.
-# TODO(confirm): full Epson fiscal error-code table (only 17 documented here).
+# EpsonFPMate fiscal error codes → operator-facing message. Sourced from the
+# efsta EPSON error-code table (docs.efsta.eu/efr/IT/fiscal_epson) — the Italian
+# RT registrar-di-cassa (RT) error set. Code 17 ("IMPOSSIBILE ORA") is a GENERIC
+# "operation not possible at this time" state error: a missing first daily-close
+# is ONE common cause, but so is a mis-flagged refund — so we surface the printer
+# status/last-command rather than hard-asserting the cause.
 KNOWN_ERRORS = {
+    "02": "RT error 02 (CARTA SCONTRINO) — receipt paper is low.",
+    "03": "RT error 03 (OFFLINE) — printer offline: paper empty or cover open.",
+    "09": "RT error 09 (DATA INFERIORE) — date earlier than the last fiscal closure.",
+    "10": "RT error 10 (DATA ERRATA) — bad date format.",
+    "11": "RT error 11 (SEQUENZA ERRATA) — command not allowed at this point in the sequence.",
+    "12": "RT error 12 (DATI INESISTENTI) — inexistent data (e.g. unprogrammed PLU).",
+    "13": "RT error 13 (VALORE ERRATO) — one or more fields hold an invalid value.",
+    "14": "RT error 14 (PROG MATRICOLA) — no fiscal serial number programmed.",
+    "16": "RT error 16 (NON PREVISTO) — invalid index or unknown command pair.",
     "17": (
-        "RT printer error 17 (IMPOSSIBILE ORA) — the command is not allowed in "
-        "the printer's current state. Common causes: the first daily closure "
-        "(Z report) has not been run yet, or a refund/void was sent with the "
-        "wrong flag. Check the printer status and run a Z (POST /fiscal/it/z) "
-        "if this is the first use of the day."
+        "RT error 17 (IMPOSSIBILE ORA) — the operation is not possible in the "
+        "printer's current state. Common causes: the first daily closure (Z "
+        "report) has not been run yet, or a refund/void was sent with the wrong "
+        "flag. Check the printer status and run a Z (POST /fiscal/it/z) if this "
+        "is the first use of the day."
     ),
+    "18": "RT error 18 (NON POSSIBILE) — the operation cannot be carried out.",
+    "20": "RT error 20 (SUPERA VALORE) — amount above the maximum allowed.",
+    "21": "RT error 21 (SUPERA LIMITE) — a parameter is outside the permitted range.",
+    "22": "RT error 22 (NON PROGRAMMATO) — the command requires prior programming.",
+    "23": "RT error 23 (CHIUDI SCONTRINO) — max operations reached; close or cancel the receipt.",
+    "24": "RT error 24 (CHIUDI PAGAMENTO) — max operations reached during partial payments.",
+    "26": "RT error 26 (CASSA INFERIORE) — cash-out exceeds the current drawer total.",
+    "27": "RT error 27 (OLTRE PROGRAMMAZIONE) — line total above the department limit.",
+    "28": "RT error 28 (P.C. NON CONNESSO) — no PC/server connection or bad sequence end.",
+    "30": "RT error 30 (CHECKSUM ERRATO) — Partita IVA / codice fiscale checksum error.",
+    "34": "RT error 34 (MANCA ATTIVAZIONE) — missing activation for this operation.",
+    "38": "RT error 38 (EFT-POS in ERRORE) — the card terminal reported an error.",
 }
 
 
@@ -308,14 +329,14 @@ def build_x_report_xml() -> str:
 def build_status_xml() -> str:
     """Query the printer status (used to derive last-Z / blocked).
 
-    NOTE: unlike the rest of this module, the exact status-query element could
-    not be pinned to a primary Epson source — most fiscal state (last Z number,
-    receipt number, status bitfield) already rides the `addInfo` of every
-    command's response, so this call is a convenience.
+    The status verb is a bare `<queryPrinterStatus />` and — unlike the print
+    commands — it MUST be wrapped in `<printerCommand>`; without that wrapper the
+    RT registrar returns `code="INCOMPLETE FILE"` (verified on a real Epson
+    FP-81II RT via the tecnosiel/OfficinaPro FPMate bridge). `_soap_wrap` then
+    puts this inside the SOAP body.
     """
-    # TODO(confirm): Epson status-query element / statusType.
     root = ET.Element("printerCommand")
-    ET.SubElement(root, "queryPrinterStatus", {"statusType": "1"})
+    ET.SubElement(root, "queryPrinterStatus")
     return ET.tostring(root, encoding="unicode")
 
 
