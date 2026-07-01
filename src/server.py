@@ -112,7 +112,7 @@ def create_app(config: dict) -> FastAPI:
         connect_watcher.cancel()
         await registry.disconnect_all()
 
-    app = FastAPI(title="Barhandler Manager", version="0.3.47", lifespan=lifespan)
+    app = FastAPI(title="Barhandler Manager", version="0.3.48", lifespan=lifespan)
 
     # CORS — the browser drives this service directly from the
     # BarHandler/FitStudio web apps (and from any future local web UI).
