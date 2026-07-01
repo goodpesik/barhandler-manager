@@ -12,7 +12,7 @@ printed by Vchasno Kasa). We try to match that layout as closely as a
             Україна, м.Київ, вул. ...                  (centered)
                   ІД 3179210933                        (centered)
   ------------------------------------------------
-  Тестовий заклад                                      (establishment line, left)
+                  Тестовий заклад                        (establishment line, centered)
   ------------------------------------------------
   1 x 263.00
   УКТЗЕД 12345
@@ -119,8 +119,10 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
             printer.text(line + "\n")
 
     # ---- Establishment (venue header) ----
+    # Centered like the rest of the header (business_name / address / tax_id);
+    # the separator is full-width so centering only affects the venue lines.
     if receipt.establishment:
-        printer.set(align="left")
+        printer.set(align="center")
         printer.text(_separator(width) + "\n")
         for line in receipt.establishment.splitlines():
             line = line.strip()
