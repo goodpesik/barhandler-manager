@@ -7,6 +7,7 @@ manager flow with no hardware:
 |---|---|---|
 | `python -m emulator` | **POS terminal** (SSI ECR JSON) | approve / decline / cancel charges from a console menu |
 | `python -m emulator.printer` | **ESC/POS thermal printer** (RAW/9100) | watch receipts render live in your browser |
+| `python -m emulator.fiscal_epos` | **Epson RT fiscal printer** (Fiscal ePOS-Print / EpsonFPMate, HTTP) | watch Documenti Commerciali render live; test Z/X + error 17 |
 
 ---
 
