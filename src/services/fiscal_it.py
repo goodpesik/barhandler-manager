@@ -4,8 +4,8 @@ PET-237 Phase C — device-manager side.
 
 Unlike the Ukrainian path (`fiscal_receipt.py`), an Italian RT printer is a
 *sealed fiscal device*: we don't render ESC/POS ourselves, we hand the printer
-a signed **fiscal ePOS-Print XML** document over HTTP and it lays out + fiscally
-signs the receipt (Documento Commerciale) itself. Epson exposes this through its
+a **fiscal ePOS-Print XML** document over HTTP and it lays out + fiscally signs
+the receipt (Documento Commerciale) itself. Epson exposes this through its
 on-board **EpsonFPMate** web service (the "Fiscal ePOS-Print" API).
 
 Flow, mirroring the UA renderer's shape (pure builder + thin transport + error
@@ -16,17 +16,19 @@ mapping):
                   ──post_to_printer()─▶ HTTP POST to http://<ip>/cgi-bin/fpmate.cgi
                   ──parse_response()─▶ {receiptId, receiptNumber, raw}
 
-The builders are pure (no I/O) so they can be golden-tested; the network call
-lives in `post_to_printer()` and is the only thing the routes wrap in a thread.
+The builders are pure (no I/O) so they can be golden-tested against the local
+`emulator.fiscal_epos` emulator; the network call lives in `post_to_printer()`
+and is the only thing the routes wrap in a thread.
 
-IMPORTANT — the exact Epson ePOS-Print XML schema, the EpsonFPMate URL/query
-string, the status-query command and the response field names are defined in
-Epson's "Fiscal ePOS-Print XML" reference, which is not vendored here. Every
-place where a literal (element/attribute name, URL, code) could not be verified
-against that reference is marked with:
-    # TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
-The STRUCTURE below is correct and syntactically valid; treat the marked
-literals as best-effort until confirmed on real hardware.
+SPEC PROVENANCE — the element/attribute names, the SOAP transport, the response
+schema and error semantics below were verified against Epson's own SEIKO
+`fiscalprint.js` library and two working integrations (a C# EpsonFiscalPrinter
+lib + Microsoft D365's Epson FP-90III sample). Two details could NOT be pinned to
+a primary source (Epson's CDN blocks automated fetches) and stay marked
+`# TODO(confirm)`:
+  * the exact status-query element / statusType (`build_status_xml`);
+  * the full numeric error-code table (only code 17 is documented here).
+Everything else is verbatim from those sources.
 """
 
 from __future__ import annotations
@@ -46,18 +48,18 @@ logger = logging.getLogger(__name__)
 
 # EpsonFPMate / Fiscal ePOS-Print endpoint. `devid=local_printer` addresses the
 # printer's own fiscal device; `timeout` is the printer-side wait in ms.
-# TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
 FPMATE_PATH = "/cgi-bin/fpmate.cgi"
 FPMATE_QUERY = "devid=local_printer&timeout=10000"
 # Fiscal ePOS-Print rides plain HTTP on port 80 (the printer's web service),
 # NOT the raw ESC/POS port 9100 that the registry stores for network printers.
-# TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
 DEFAULT_HTTP_PORT = 80
 DEFAULT_TIMEOUT_SECONDS = 15.0
 
-# SOAP action for the ePOS-Print service.
-# TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
+# SOAP action for the ePOS-Print service — literally an empty quoted string.
 SOAP_ACTION = '""'
+# Epson's own JS client sends this fixed value so caches never serve a stale
+# fiscal response.
+IF_MODIFIED_SINCE = "Thu, 01 Jan 1970 00:00:00 GMT"
 
 # Sales are blocked once the last daily close is older than this (RT rule: a Z
 # must be run at least every 24h; the printer starts refusing sales after the
@@ -66,34 +68,42 @@ BLOCKED_AFTER = timedelta(hours=48)
 
 # Operator index printed on every fiscal command. RT printers key their journal
 # per-operator; 1 is the conventional single-till default.
-# TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
 DEFAULT_OPERATOR = "1"
 
-# Italian RT cash payment type (contante). Cash totals are rounded to 5 cents
-# ("arrotondamento") before being sent as the tendered amount.
+# Italian RT payment types (Epson `paymentType`): 0 = contanti (cash),
+# 1 = assegno (cheque), 2 = carta / pagamento elettronico (card). Cash totals
+# are rounded to 5 cents ("arrotondamento") before being tendered.
 CASH_PAYMENT_TYPE = 0
+CARD_PAYMENT_TYPE = 2
 
-# Fallback IVA-rate → department (reparto) map. The reparto is configured on the
-# printer itself; this only kicks in when the caller doesn't pin a department on
-# the line. Keys are the VAT percentage.
-# TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
+# Fallback IVA-rate → department (reparto) map. The VAT rate is configured on
+# the printer *per department*; the line only carries `department="N"`. These
+# are the Italian conventional repartos (per Microsoft's Epson FP-90III sample:
+# 01=22%, 03=10%, 05=5%, 07=4%, 09=0/esente). Used only when the caller leaves a
+# line's department blank — normally the shop's Tax.rtDepartment is passed in and
+# must match the printer's own reparto configuration.
 DEFAULT_IVA_TO_DEPARTMENT = {
     22.0: 1,
-    10.0: 2,
-    5.0: 3,
-    4.0: 4,
-    0.0: 5,
+    10.0: 3,
+    5.0: 5,
+    4.0: 7,
+    0.0: 9,
 }
 
-# Known EpsonFPMate error codes → operator-facing message. Code 17 is the one
-# PET-237 cares about most: the printer has never had its first daily close, so
-# it refuses every sale until a Z is run.
-# TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
+# EpsonFPMate error codes → operator-facing message. The full numeric table
+# lives in Epson's "ePOS Fiscal Print Solution Development Guide" (not vendored;
+# CDN blocks automated fetch). Code 17 = "IMPOSSIBILE ORA" — a GENERIC
+# "command not allowed in the current printer state" error. A missing first
+# daily-close is ONE common cause, but so is e.g. a mis-flagged refund — so we
+# surface the printer status/last-command rather than hard-asserting the cause.
+# TODO(confirm): full Epson fiscal error-code table (only 17 documented here).
 KNOWN_ERRORS = {
     "17": (
-        "PRINTER ERROR 17 — first daily closure (Z report) has not been run. "
-        "The RT printer refuses all sales until you execute the first Z "
-        "(POST /fiscal/it/z)."
+        "RT printer error 17 (IMPOSSIBILE ORA) — the command is not allowed in "
+        "the printer's current state. Common causes: the first daily closure "
+        "(Z report) has not been run yet, or a refund/void was sent with the "
+        "wrong flag. Check the printer status and run a Z (POST /fiscal/it/z) "
+        "if this is the first use of the day."
     ),
 }
 
@@ -131,6 +141,9 @@ class ItDocument:
     payment: ItPayment
     payment_type_map: Optional[dict] = field(default=None)
     is_refund: bool = False
+    # Optional "RESO MERCE N.<z>-<doc> del <date>" reference tying a refund to
+    # the original document; printed as the reso header when present.
+    refund_reference: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -176,15 +189,17 @@ def resolve_payment_type(payment: ItPayment, payment_type_map: Optional[dict]) -
         mapped = payment_type_map.get(payment.type)
         if mapped is not None:
             return int(mapped)
-    # Best-effort textual fallback so a bare "cash"/"contanti" still lands on 0.
-    if payment.type and payment.type.strip().lower() in {"cash", "contante", "contanti"}:
+    key = (payment.type or "").strip().lower()
+    if key in {"cash", "contante", "contanti"}:
         return CASH_PAYMENT_TYPE
+    if key in {"card", "carta", "electronic", "pos"}:
+        return CARD_PAYMENT_TYPE
     return CASH_PAYMENT_TYPE
 
 
 def _fmt_qty(value: float) -> str:
-    # RT firmware expects fixed-point quantities.
-    # TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
+    # RT firmware expects fixed-point quantities (Epson uses '.' decimals in the
+    # request; the printer echoes ',' decimals in the response).
     return f"{value:.3f}"
 
 
@@ -203,24 +218,36 @@ def build_commercial_document_xml(
     *,
     payment_type_map: Optional[dict] = None,
     is_refund: bool = False,
+    refund_reference: Optional[str] = None,
 ) -> str:
     """Build the fiscal ePOS-Print body for a Documento Commerciale.
 
-    A normal sale uses `<printRecItem>` lines; a refund/void ("reso merce" —
-    a negative document) uses `<printRecRefund>` lines instead. The total is
-    emitted with the resolved RT payment type, and cash totals are rounded to
-    5 cents first.
+    A normal sale uses `<printRecItem>` lines; a refund ("reso merce") is a
+    `<printerFiscalReceipt>` prefixed with a `<printRecMessage messageType="4">`
+    reso header and using `<printRecRefund>` lines. The total is emitted with
+    the resolved RT payment type, and cash totals are rounded to 5 cents.
 
     Returns the inner `<printerFiscalReceipt>…` XML (SOAP wrapping happens in
     `_soap_wrap`).
     """
-    # TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
     root = ET.Element("printerFiscalReceipt")
+
+    # A refund is a normal fiscal receipt preceded by the "RESO MERCE" header
+    # (messageType 4) that ties it to the original document.
+    if is_refund:
+        ET.SubElement(
+            root,
+            "printRecMessage",
+            {
+                "operator": DEFAULT_OPERATOR,
+                "messageType": "4",
+                "message": refund_reference or "RESO MERCE",
+            },
+        )
 
     ET.SubElement(root, "beginFiscalReceipt", {"operator": DEFAULT_OPERATOR})
 
-    # `printRecItem` for a sale, `printRecRefund` for a negative document.
-    # TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
+    # `printRecItem` for a sale, `printRecRefund` for a reso (negative document).
     line_tag = "printRecRefund" if is_refund else "printRecItem"
     for item in items:
         department = item.department
@@ -244,16 +271,17 @@ def build_commercial_document_xml(
     if payment_type == CASH_PAYMENT_TYPE:
         total = round_to_5_cents(total)
 
-    # TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
+    # printRecTotal carries the tender + amount; reaching the total settles and
+    # closes the fiscal receipt.
     ET.SubElement(
         root,
         "printRecTotal",
         {
             "operator": DEFAULT_OPERATOR,
-            "description": payment.type or "Contante",
+            "description": "RIMBORSO" if is_refund else (payment.type or "Contante"),
             "payment": _fmt_money(total),
             "paymentType": str(payment_type),
-            "index": "0",
+            "index": "1",
             "justification": "1",
         },
     )
@@ -265,7 +293,6 @@ def build_commercial_document_xml(
 
 def build_z_report_xml() -> str:
     """Daily close (Z report / chiusura giornaliera)."""
-    # TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
     root = ET.Element("printerFiscalReport")
     ET.SubElement(root, "printZReport", {"operator": DEFAULT_OPERATOR})
     return ET.tostring(root, encoding="unicode")
@@ -273,15 +300,20 @@ def build_z_report_xml() -> str:
 
 def build_x_report_xml() -> str:
     """X read (non-resetting daily read / lettura giornaliera)."""
-    # TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
     root = ET.Element("printerFiscalReport")
     ET.SubElement(root, "printXReport", {"operator": DEFAULT_OPERATOR})
     return ET.tostring(root, encoding="unicode")
 
 
 def build_status_xml() -> str:
-    """Query the printer status (used to derive last-Z / blocked)."""
-    # TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
+    """Query the printer status (used to derive last-Z / blocked).
+
+    NOTE: unlike the rest of this module, the exact status-query element could
+    not be pinned to a primary Epson source — most fiscal state (last Z number,
+    receipt number, status bitfield) already rides the `addInfo` of every
+    command's response, so this call is a convenience.
+    """
+    # TODO(confirm): Epson status-query element / statusType.
     root = ET.Element("printerCommand")
     ET.SubElement(root, "queryPrinterStatus", {"statusType": "1"})
     return ET.tostring(root, encoding="unicode")
@@ -289,7 +321,6 @@ def build_status_xml() -> str:
 
 def _soap_wrap(inner_xml: str) -> str:
     """Wrap a fiscal ePOS-Print body in the SOAP envelope EpsonFPMate expects."""
-    # TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
     return (
         '<?xml version="1.0" encoding="utf-8"?>'
         '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/">'
@@ -306,7 +337,6 @@ def _soap_wrap(inner_xml: str) -> str:
 
 
 def _endpoint_url(host: str, port: int = DEFAULT_HTTP_PORT) -> str:
-    # TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
     base = f"http://{host}" if port == 80 else f"http://{host}:{port}"
     return f"{base}{FPMATE_PATH}?{FPMATE_QUERY}"
 
@@ -330,8 +360,9 @@ def post_to_printer(
         data=data,
         method="POST",
         headers={
-            "Content-Type": 'text/xml; charset="utf-8"',
+            "Content-Type": "text/xml; charset=UTF-8",
             "SOAPAction": SOAP_ACTION,
+            "If-Modified-Since": IF_MODIFIED_SINCE,
             "Content-Length": str(len(data)),
         },
     )
@@ -371,13 +402,11 @@ def _find_response_element(root: ET.Element) -> Optional[ET.Element]:
 def parse_response(xml_text: str) -> dict:
     """Parse an EpsonFPMate response into a structured dict.
 
-    On `success="false"` (or an embedded PRINTER ERROR) raises `FiscalItError`
-    with the mapped code/message. On success returns:
-        {success, code, status, fields: {..addInfo..}, raw_xml}
-
-    `fields` holds the flattened `<addInfo>` children (fiscalReceiptNumber,
-    zRepNumber, lastZDate, …) the RT printer returns.
-    TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
+    The printer replies with `<response success="true|false" code="" status="">`
+    wrapping an `<addInfo>` block whose children carry the fiscal fields
+    (fiscalReceiptNumber, zRepNumber, fiscalReceiptDate/Time, …). On
+    `success="false"` we raise `FiscalItError` with the mapped code/message; on
+    success we return {success, code, status, fields, raw_xml}.
     """
     try:
         root = ET.fromstring(xml_text)
@@ -396,16 +425,19 @@ def parse_response(xml_text: str) -> dict:
             raw={"raw_xml": xml_text},
         )
 
+    # Epson's own parser accepts "true" or "1" for success.
     success_attr = (resp.get("success") or "").strip().lower()
     success = success_attr in {"true", "1"}
     code = (resp.get("code") or "").strip()
     status = (resp.get("status") or "").strip()
 
     # Flatten addInfo (and any other child element carrying text) into `fields`.
+    # `elementList` is a CSV of which children are present — skip it as a value
+    # but let the real fields through.
     fields: dict = {}
     for child in resp.iter():
         name = _localname(child.tag)
-        if name in {"response", "addInfo"}:
+        if name in {"response", "addInfo", "elementList"}:
             continue
         text = (child.text or "").strip()
         if text:
@@ -414,11 +446,7 @@ def parse_response(xml_text: str) -> dict:
     raw = {"success": success, "code": code, "status": status, "fields": fields, "raw_xml": xml_text}
 
     if not success:
-        # Prefer the explicit code, but also sniff the status text for a bare
-        # "17" so a printer that reports the error in prose still gets mapped.
         mapped = KNOWN_ERRORS.get(code)
-        if mapped is None and (code == "17" or "PRINTER ERROR 17" in status.upper()):
-            mapped = KNOWN_ERRORS.get("17")
         message = mapped or (
             f"RT printer rejected the operation (code={code or '?'}, status={status or '?'})"
         )
@@ -438,7 +466,6 @@ def _extract_receipt_ids(fields: dict) -> tuple[str, str]:
     receiptNumber is the printer's fiscal receipt counter; receiptId is a
     best-effort unique key combining the Z-report number and the receipt
     number (RT receipts are uniquely identified by the pair).
-    TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
     """
     receipt_number = (
         fields.get("fiscalReceiptNumber")
@@ -464,6 +491,7 @@ def print_commercial_document(
         document.payment,
         payment_type_map=document.payment_type_map,
         is_refund=document.is_refund,
+        refund_reference=document.refund_reference,
     )
     resp_text = post_to_printer(host, _soap_wrap(inner), port=port, timeout=timeout)
     parsed = parse_response(resp_text)
@@ -472,7 +500,6 @@ def print_commercial_document(
 
 
 def _extract_report_number(fields: dict) -> str:
-    # TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
     return (
         fields.get("zRepNumber")
         or fields.get("reportNumber")
@@ -500,11 +527,22 @@ def _parse_last_z(fields: dict) -> Optional[datetime]:
 
     RT printers report this as separate date+time fields (DD/MM/YYYY, HH:MM)
     or a combined ISO string depending on model/firmware.
-    TODO(confirm): Epson ePOS-Print XML — verify against Epson FP docs
     """
-    combined = fields.get("lastZReportDate") or fields.get("lastZDate")
-    date_part = fields.get("dailyClosureDate") or fields.get("lastClosureDate")
-    time_part = fields.get("dailyClosureTime") or fields.get("lastClosureTime")
+    combined = (
+        fields.get("receiptISODateTime")
+        or fields.get("lastZReportDate")
+        or fields.get("lastZDate")
+    )
+    date_part = (
+        fields.get("fiscalReceiptDate")
+        or fields.get("dailyClosureDate")
+        or fields.get("lastClosureDate")
+    )
+    time_part = (
+        fields.get("fiscalReceiptTime")
+        or fields.get("dailyClosureTime")
+        or fields.get("lastClosureTime")
+    )
 
     candidates: list[str] = []
     if combined:
@@ -513,7 +551,14 @@ def _parse_last_z(fields: dict) -> Optional[datetime]:
         candidates.append(f"{date_part} {time_part}".strip() if time_part else date_part)
 
     for raw in candidates:
-        for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M", "%d/%m/%Y %H:%M:%S", "%d%m%Y %H%M"):
+        for fmt in (
+            "%Y%m%dT%H%M%S",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%d/%m/%Y %H:%M",
+            "%d/%m/%Y %H:%M:%S",
+            "%d/%m/%Y",
+        ):
             try:
                 return datetime.strptime(raw, fmt).replace(tzinfo=timezone.utc)
             except ValueError:

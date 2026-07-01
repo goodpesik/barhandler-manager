@@ -75,6 +75,20 @@ def test_refund_uses_printRecRefund() -> None:
     root = _doc_xml(is_refund=True)
     assert root.find("printRecRefund") is not None
     assert root.find("printRecItem") is None
+    # A reso is prefixed with a messageType="4" "RESO MERCE" header.
+    msg = root.find("printRecMessage")
+    assert msg is not None and msg.get("messageType") == "4"
+
+
+def test_refund_reference_is_printed() -> None:
+    item = fiscal_it.ItItem(name="Beer", quantity=1, unit_price=5.0, total_price=5.0, iva_rate=22.0)
+    root = ET.fromstring(
+        fiscal_it.build_commercial_document_xml(
+            [item], fiscal_it.ItPayment(type="cash", amount=5.0),
+            is_refund=True, refund_reference="RESO MERCE N.0007-0042 del 01/07/2026",
+        )
+    )
+    assert root.find("printRecMessage").get("message") == "RESO MERCE N.0007-0042 del 01/07/2026"
 
 
 def test_round_to_5_cents_edges() -> None:
@@ -121,7 +135,9 @@ def test_parse_error_code_17_is_mapped() -> None:
     with pytest.raises(fiscal_it.FiscalItError) as ei:
         fiscal_it.parse_response(xml)
     assert ei.value.code == "rt_17"
-    assert "PRINTER ERROR 17" in str(ei.value)
+    # Error 17 = "IMPOSSIBILE ORA" (generic state error); the message names the
+    # common first-Z cause without hard-asserting it.
+    assert "IMPOSSIBILE ORA" in str(ei.value)
     assert "first daily closure" in str(ei.value).lower()
 
 
