@@ -45,6 +45,9 @@ except Exception:  # pragma: no cover
 logger = logging.getLogger("emulator.fiscal_epos")
 
 FPMATE_PATH = "/cgi-bin/fpmate.cgi"
+# Manager's default dev API key (src/constants.py DEFAULT_API_KEY) — for the
+# copy-paste register curl in the banner.
+API_KEY = "bf11b47b-e139-4f03-8e02-9c2e692f91b8"
 
 
 def _localname(tag: str) -> str:
@@ -358,17 +361,30 @@ def start_server(state: FiscalState, host: str, port: int) -> ThreadingHTTPServe
 # ---------------------------------------------------------------------------
 
 
-def _banner(host: str, port: int) -> None:
+def _banner(host: str, port: int, manager_port: int) -> None:
     url = f"http://{host}:{port}{FPMATE_PATH}"
+    # Register this emulator in the manager as a fiscal_it printer by IP:port —
+    # discovery can't find an HTTP fpmate device, so it must be added manually.
+    register = (
+        f"curl -X POST http://127.0.0.1:{manager_port}/devices/register-manual "
+        f"-H 'X-Api-Key: {API_KEY}' -H 'Content-Type: application/json' "
+        f"-d '{{\"host\":\"{host}\",\"port\":{port},\"kind\":\"fiscal_it\","
+        f"\"nickname\":\"RT emulator\"}}'"
+    )
     if _console is None:
-        print(f"Fiscal ePOS emulator on {url}")
+        print(f"Fiscal ePOS emulator on {url}\nRegister in manager:\n{register}")
         return
     body = Text()
     body.append("🏦 BARHANDLER — FISCAL ePOS-PRINT EMULATOR\n", style="bold")
     body.append("device side of an Italian Epson RT printer\n\n", style="dim")
     body.append("FPMate endpoint: ", style="")
-    body.append(f"{url}\n", style="bold green")
-    body.append("point the manager at it (host+port above)\n", style="dim")
+    body.append(f"{url}\n\n", style="bold green")
+    body.append("Register in the manager (discovery can't find it):\n", style="dim")
+    body.append(f"{register}\n", style="yellow")
+    body.append(
+        "\nthen bind this printer to the Italy fiscal card in Settings.\n",
+        style="dim",
+    )
     body.append("\nЧекаю фіскальні документи…", style="")
     _console.print(Panel(body, border_style="green"))
 
@@ -377,6 +393,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Epson Fiscal ePOS-Print emulator")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8095, help="FPMate HTTP port")
+    parser.add_argument("--manager-port", type=int, default=9999)
     parser.add_argument(
         "--require-first-z",
         action="store_true",
@@ -393,7 +410,7 @@ def main() -> None:
     state = FiscalState(require_first_z=args.require_first_z)
     state.on_notify = lambda label: (_console.print(f"🧾 {label}") if _console else print(label))
     start_server(state, args.host, args.port)
-    _banner(args.host, args.port)
+    _banner(args.host, args.port, args.manager_port)
     try:
         while True:
             time.sleep(3600)
