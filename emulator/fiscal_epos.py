@@ -315,30 +315,88 @@ def handle_request(state: FiscalState, body: str) -> str:
 _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <title>Fiscal ePOS emulator</title>
 <style>
- body{background:#111;color:#ddd;font-family:ui-monospace,Menlo,monospace;margin:0;padding:16px}
- h1{font-size:15px;color:#8fd08f;margin:0 0 12px}
- .doc{background:#1c1c1c;border:1px solid #333;border-radius:8px;padding:12px;margin:0 0 12px;max-width:420px}
- .doc.reso{border-color:#a6772e}.doc.rej{border-color:#b23}.doc.z{border-color:#3a7}
- .k{color:#8fd08f;font-weight:700}.muted{color:#888}
- table{width:100%;border-collapse:collapse;margin:6px 0}
- td{padding:1px 0;font-size:13px}.r{text-align:right}
- .tot{border-top:1px dashed #444;margin-top:6px;padding-top:6px;font-weight:700}
+ body{background:#0d0f12;color:#cfd3d8;font-family:ui-monospace,Menlo,monospace;margin:0;padding:20px}
+ h1{font-size:14px;color:#8fd08f;margin:0 0 4px;font-family:system-ui,sans-serif}
+ .hint{color:#6b7280;font-size:12px;margin:0 0 16px;font-family:system-ui,sans-serif}
+ #roll{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
+ /* thermal paper */
+ .r{background:#fbfbf7;color:#111;width:320px;padding:14px 16px;border-radius:3px;
+    box-shadow:0 2px 8px rgba(0,0,0,.5);font-size:12.5px;line-height:1.45}
+ .r.reso{outline:2px solid #a6772e}.r.copia{outline:2px dashed #888}.r.rej{outline:2px solid #c0392b}
+ .c{text-align:center}.b{font-weight:700}.mut{color:#666}.rr{text-align:right}
+ .biz{font-size:12px}.title{margin:8px 0 2px;font-weight:700;letter-spacing:.5px}
+ .sub{font-weight:400;font-size:11px}
+ .sep{border-top:1px dashed #999;margin:8px 0}
+ table{width:100%;border-collapse:collapse}
+ td{padding:1px 0;vertical-align:top}
+ .row{display:flex;justify-content:space-between}
+ .big{font-size:15px;font-weight:700}
+ .foot{font-size:11px}
+ .info{background:#1c1c1c;color:#cfd3d8;border-radius:6px;padding:10px 12px;width:320px;font-size:12px}
+ .info.z{border-left:3px solid #3a7}.info.x{border-left:3px solid #58f}
 </style></head><body>
-<h1>🧾 Epson Fiscal ePOS-Print emulator — Documento Commerciale journal</h1>
+<h1>🧾 Epson Fiscal ePOS-Print emulator</h1>
+<p class="hint">Documento Commerciale journal — live. Reparto→IVA: 1=22% 3=10% 5=5% 7=4% 9=0%.</p>
 <div id="roll"></div>
 <script>
+var IVA={1:22,3:10,5:5,7:4,9:0};
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function num(x){return parseFloat(String(x==null?0:x).replace(',','.'))||0;}
+function eur(n){return (Math.round(n*100)/100).toFixed(2).replace('.',',');}
+function qty(q){return (q%1)?q.toFixed(3):String(q);}
+function fmtTs(ts){if(!ts)return '';var d=new Date(ts);if(isNaN(d.getTime()))return ts;
+ function p(n){return String(n).padStart(2,'0');}
+ return p(d.getDate())+'-'+p(d.getMonth()+1)+'-'+d.getFullYear()+'  '+p(d.getHours())+':'+p(d.getMinutes());}
+function docNo(d){var az=(d.z!=null?d.z+1:1),pr=(d.number||0);
+ return String(az).padStart(4,'0')+'-'+String(pr).padStart(4,'0');}
+function receipt(d){
+ var reso=d.kind==='RESO',copia=d.kind==='COPIA';
+ var items=d.items||[],sum=0,ivaTot=0;
+ var rows=items.map(function(it){
+  var q=num(it.quantity)||1,lt=num(it.unitPrice)*q,pct=IVA[parseInt(it.department,10)]||0;
+  sum+=lt;ivaTot+=lt*pct/(100+pct);
+  return '<tr><td>'+esc(it.description)+' <span class="mut">×'+qty(q)+'</span></td>'+
+         '<td class="rr mut">'+pct+'%</td><td class="rr">'+eur(lt)+'</td></tr>';
+ }).join('');
+ var total=(d.total!=null&&d.total!=='')?num(d.total):sum;
+ var pay=(String(d.payment_type)==='0')?'Pagamento contante':
+         (String(d.payment_type)==='2')?'Pagamento elettronico':'Pagamento';
+ var cls='r'+(reso?' reso':'')+(copia?' copia':'');
+ var title=reso?'DOCUMENTO COMMERCIALE<br><span class="sub">emesso per RESO MERCE</span>'
+                :'DOCUMENTO COMMERCIALE<br><span class="sub">di vendita o prestazione</span>';
+ return '<div class="'+cls+'">'+
+  '<div class="c biz b">EMULATORE RT · PETSHANDLER</div>'+
+  '<div class="c biz mut">Via di Prova 1 — 00100 Roma (RM)</div>'+
+  '<div class="c biz mut">P.IVA 00000000000</div>'+
+  (copia?'<div class="c b" style="margin-top:6px">— COPIA —</div>':'')+
+  '<div class="c title">'+title+'</div>'+
+  '<div class="sep"></div>'+
+  '<table>'+rows+'</table>'+
+  '<div class="sep"></div>'+
+  '<div class="row big"><span>TOTALE COMPLESSIVO</span><span>'+eur(total)+'</span></div>'+
+  '<div class="row mut"><span>di cui IVA</span><span>'+eur(ivaTot)+'</span></div>'+
+  '<div class="sep"></div>'+
+  '<div class="row"><span>'+pay+'</span><span>'+eur(reso?-total:total)+'</span></div>'+
+  '<div class="row mut"><span>Non riscosso</span><span>0,00</span></div>'+
+  '<div class="sep"></div>'+
+  '<div class="c foot b">DOCUMENTO N. '+docNo(d)+'</div>'+
+  '<div class="c foot mut">'+fmtTs(d.ts)+'</div>'+
+  '<div class="c foot mut">RT 2CMZP999891 (EMULATORE)</div>'+
+  '</div>';
+}
+function info(d){
+ var cls=d.kind.indexOf('CHIUSURA')>=0?'info z':(d.kind.indexOf('LETTURA')>=0?'info x':'info');
+ if(d.kind==='REJECTED')cls='r rej';
+ var body=d.kind==='REJECTED'
+   ? '<div class="c b">SCONTRINO NON EMESSO</div><div class="c mut">'+esc(d.reason||'')+'</div>'
+   : '<div class="b">'+esc(d.kind)+' n. '+String(d.number||'').padStart(4,'0')+'</div>'+
+     '<div class="mut">'+fmtTs(d.ts)+'</div>';
+ return '<div class="'+cls+'">'+body+'</div>';
+}
 async function poll(){
- try{const r=await fetch('state');const docs=await r.json();
+ try{var r=await fetch('state');var docs=await r.json();
   document.getElementById('roll').innerHTML=docs.map(function(d){
-   var cls=d.kind==='RESO'?'reso':(d.kind==='REJECTED'?'rej':(d.kind.indexOf('CHIUSURA')>=0?'z':''));
-   var rows=(d.items||[]).map(function(it){return '<tr><td>'+it.description+' ×'+it.quantity+
-     ' <span class="muted">rep '+it.department+'</span></td><td class="r">'+it.unitPrice+'</td></tr>';}).join('');
-   var head='<div><span class="k">'+d.kind+'</span> '+(d.number?('#'+d.number):'')+
-     ' <span class="muted">'+(d.ts||'')+'</span></div>';
-   var tot=d.total?('<div class="tot">TOTALE <span class="r" style="float:right">'+d.total+
-     (d.payment_type!=null?(' <span class="muted">pt'+d.payment_type+'</span>'):'')+'</span></div>'):'';
-   var rej=d.reason?('<div class="muted">'+d.reason+'</div>'):'';
-   return '<div class="doc '+cls+'">'+head+(rows?('<table>'+rows+'</table>'):'')+tot+rej+'</div>';
+   return (d.kind==='DOCUMENTO COMMERCIALE'||d.kind==='RESO'||d.kind==='COPIA')?receipt(d):info(d);
   }).join('');
  }catch(e){}
  setTimeout(poll,1000);
