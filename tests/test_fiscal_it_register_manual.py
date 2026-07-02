@@ -82,3 +82,35 @@ def test_fiscal_it_document_without_registered_printer_is_503(client, auth_heade
     }
     r = client.post("/fiscal/it/document", headers=auth_headers, json=doc)
     assert r.status_code == 503
+
+
+def test_reprint_prints_a_duplicate(client, auth_headers):
+    from emulator import fiscal_epos
+
+    state = fiscal_epos.FiscalState()
+    port = _free_port()
+    server = fiscal_epos.start_server(state, "127.0.0.1", port)
+    try:
+        client.post(
+            "/devices/register-manual",
+            headers=auth_headers,
+            json={"host": "127.0.0.1", "port": port, "kind": "fiscal_it"},
+        )
+        doc = {
+            "items": [{"name": "Caffè", "quantity": 1, "unit_price": 2.2,
+                       "total_price": 2.2, "iva_rate": 22, "department": 1}],
+            "payment": {"type": "cash", "amount": 2.2},
+        }
+        r = client.post("/fiscal/it/document", headers=auth_headers, json=doc)
+        assert r.status_code == 200, r.text
+        num = r.json()["receiptNumber"]
+        # reprint the same receipt → the emulator records a COPIA, no new sale
+        rr = client.post(
+            "/fiscal/it/reprint", headers=auth_headers,
+            json={"receipt_number": num},
+        )
+        assert rr.status_code == 200, rr.text
+        assert state.snapshot()[0]["kind"] == "COPIA"
+        assert state.receipt_number == 1  # reprint did NOT issue a new receipt
+    finally:
+        server.shutdown()
