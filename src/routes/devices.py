@@ -17,6 +17,8 @@ Workflow (frontend-driven):
 """
 
 from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel, Field
+from typing import Optional
 
 from src.devices.registry import UnknownPrinter
 from src.models.printer import (
@@ -26,6 +28,22 @@ from src.models.printer import (
     PrinterRegistration,
     RegistrationRequest,
 )
+
+
+class ManualRegistrationRequest(BaseModel):
+    """Body for POST /devices/register-manual.
+
+    Register a NETWORK printer by IP:port that discovery can't find — e.g. an
+    Epson RT fiscal printer on its EpsonFPMate HTTP port (80), or the
+    `emulator.fiscal_epos` emulator (default 8095). `kind=fiscal_it` for RT.
+    """
+
+    host: str = Field(min_length=1)
+    port: int = Field(default=80, ge=1, le=65535)
+    kind: PrinterKind = PrinterKind.fiscal_it
+    nickname: Optional[str] = None
+    label: Optional[str] = None
+    paper_width: int = 80
 from src.services.bitmap_render import dots_for, render_paragraph
 from src.services.tspl_render import image_to_tspl_bitmap
 
@@ -152,6 +170,27 @@ async def register(payload: RegistrationRequest, request: Request) -> dict:
         reg = _registry(request).register(payload)
     except UnknownPrinter as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    return {"printer": reg.model_dump()}
+
+
+@router.post("/register-manual")
+async def register_manual(payload: ManualRegistrationRequest, request: Request) -> dict:
+    """Register a network printer by IP:port (discovery can't reach fpmate
+    HTTP devices). Mirrors POST /terminal/register-manual."""
+    registry = _registry(request)
+    descriptor = registry.add_manual_descriptor(
+        host=payload.host,
+        port=payload.port,
+        label=payload.label,
+    )
+    reg = registry.register(
+        RegistrationRequest(
+            id=descriptor.id,
+            kind=payload.kind,
+            nickname=payload.nickname,
+            paper_width=payload.paper_width,
+        )
+    )
     return {"printer": reg.model_dump()}
 
 

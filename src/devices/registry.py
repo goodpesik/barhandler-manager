@@ -16,12 +16,14 @@ from typing import Dict, Optional
 from src.devices.printer import PrinterDevice
 from src.devices.scan import discover_all
 from src.models.printer import (
+    NetworkAddress,
     PrintProtocol,
     PrinterDescriptor,
     PrinterKind,
     PrinterRegistration,
     PrinterTransport,
     RegistrationRequest,
+    make_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -147,6 +149,26 @@ class PrinterRegistry:
         self._registrations[descriptor.id] = reg
         self.save()
         return reg
+
+    def add_manual_descriptor(
+        self,
+        *,
+        host: str,
+        port: int,
+        label: Optional[str] = None,
+    ) -> PrinterDescriptor:
+        """Register-by-IP for a NETWORK printer that discovery can't find
+        (e.g. an Epson RT fiscal printer on the EpsonFPMate HTTP port, or the
+        fiscal_epos emulator). Builds a stable network descriptor and caches it
+        so `register()` can bind it — mirrors TerminalRegistry.add_manual_descriptor."""
+        descriptor = PrinterDescriptor(
+            id=make_id(PrinterTransport.network, host, str(port)),
+            transport=PrinterTransport.network,
+            label=label or f"{host}:{port}",
+            network=NetworkAddress(host=host, port=port),
+        )
+        self._last_discovery[descriptor.id] = descriptor
+        return descriptor
 
     def unregister(self, printer_id: str) -> None:
         if printer_id not in self._registrations:

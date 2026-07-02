@@ -66,17 +66,23 @@ class ItDocumentPayload(BaseModel):
 def _resolve_rt_host(request: Request, printer_id: Optional[str]) -> tuple[str, str, int]:
     """Resolve `printer_id` → (printer_id, host, http_port) for the RT printer.
 
-    Falls back to the first registered `receipt`-kind printer when no id is
-    given, mirroring `print_routes._resolve_printer`. Raises the same HTTP
-    error shapes (503 unregistered / 404 unknown / 422 not-a-network-printer).
+    Falls back to the first registered `fiscal_it`-kind printer when no id is
+    given. The port comes from the registration's network address (the RT
+    printer is registered by IP:port via POST /devices/register-manual — 80 on
+    real hardware, e.g. 8095 for the emulator), NOT the ESC/POS default. Raises
+    the same HTTP error shapes (503 unregistered / 404 unknown / 422 not-a-
+    network-printer).
     """
     registry = request.app.state.registry
     if printer_id is None:
-        reg = registry.for_kind(PrinterKind.receipt)
+        reg = registry.for_kind(PrinterKind.fiscal_it)
         if reg is None:
             raise HTTPException(
                 status_code=503,
-                detail="no 'receipt' printer registered — POST /devices/register first",
+                detail=(
+                    "no 'fiscal_it' printer registered — POST /devices/register-manual "
+                    "with the RT printer's IP:port first"
+                ),
             )
     else:
         try:
@@ -90,7 +96,10 @@ def _resolve_rt_host(request: Request, printer_id: Optional[str]) -> tuple[str, 
             status_code=422,
             detail="RT fiscal printing requires a network printer (no network address on this registration)",
         )
-    return reg.descriptor.id, net.host, fiscal_it.DEFAULT_HTTP_PORT
+    # A manually-registered RT printer carries the fpmate HTTP port; only fall
+    # back to 80 if it somehow still holds the ESC/POS default (9100).
+    port = net.port if net.port and net.port != 9100 else fiscal_it.DEFAULT_HTTP_PORT
+    return reg.descriptor.id, net.host, port
 
 
 def _raise_from_fiscal_error(exc: fiscal_it.FiscalItError):

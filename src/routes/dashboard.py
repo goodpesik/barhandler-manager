@@ -54,6 +54,15 @@ _HTML_TEMPLATE = r"""<!doctype html>
   .dot.err { background: var(--red); }
   .meta { color: var(--muted); font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap; align-items: center; }
   .meta code { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .lang-toggle { display: inline-flex; align-items: center; gap: 4px; }
+  .lang-btn {
+    background: none; border: none; color: var(--muted); cursor: pointer;
+    font-size: 12px; font-weight: 600; padding: 2px 4px; font-family: inherit;
+    text-transform: uppercase; letter-spacing: 0.04em;
+  }
+  .lang-btn:hover { color: var(--text); }
+  .lang-btn.active { color: var(--blue); text-decoration: underline; }
+  .lang-sep { color: var(--border); }
   .controls {
     display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px;
     padding: 12px 16px;
@@ -166,99 +175,133 @@ _HTML_TEMPLATE = r"""<!doctype html>
   <header>
     <h1><span id="status-dot" class="dot"></span> barhandler-manager</h1>
     <div class="meta">
-      <span>версія <code id="version">—</code></span>
-      <span>оновлено <code id="updated">—</code></span>
+      <span><span data-i18n="version_label">версія</span> <code id="version">—</code></span>
+      <span><span data-i18n="updated_label">оновлено</span> <code id="updated">—</code></span>
+      <span class="lang-toggle">
+        <button id="lang-uk" class="lang-btn" type="button" onclick="setLang('uk')">UK</button>
+        <span class="lang-sep">|</span>
+        <button id="lang-en" class="lang-btn" type="button" onclick="setLang('en')">EN</button>
+      </span>
     </div>
   </header>
 
   <div id="update-strip" class="update-strip">
     <span id="update-msg"></span>
-    <button id="btn-update" class="btn btn-update" onclick="doUpdate()">⬆ Оновити</button>
+    <button id="btn-update" class="btn btn-update" data-i18n="btn_update" onclick="doUpdate()">⬆ Оновити</button>
   </div>
 
   <div id="error-banner" class="error-banner"></div>
 
   <div class="controls">
-    <span class="controls-label">Дії</span>
-    <button class="btn btn-default" onclick="refreshStatus(this)">↻ Оновити статус</button>
-    <button class="btn btn-default" onclick="scanPrinters(this)">🔍 Сканувати принтери</button>
-    <button class="btn btn-default" onclick="scanTerminals(this)">🔍 Сканувати термінали</button>
-    <button class="btn btn-default" onclick="openManualTerminalModal()">➕ Додати термінал вручну</button>
-    <button class="btn btn-default" onclick="openLogs()">📋 Логи</button>
-    <button class="btn btn-default" onclick="runUsbProbe()">🔌 USB діагностика</button>
-    <button id="btn-uplink" class="btn btn-default" onclick="openUplinkModal()">📡 Віддалена діагностика<span id="uplink-badge" class="badge" style="display:none;">● підключено</span></button>
+    <span class="controls-label" data-i18n="controls_actions">Дії</span>
+    <button class="btn btn-default" data-i18n="btn_refresh_status" onclick="refreshStatus(this)">↻ Оновити статус</button>
+    <button class="btn btn-default" data-i18n="btn_scan_printers" onclick="scanPrinters(this)">🔍 Сканувати принтери</button>
+    <button class="btn btn-default" data-i18n="btn_scan_terminals" onclick="scanTerminals(this)">🔍 Сканувати термінали</button>
+    <button class="btn btn-default" data-i18n="btn_add_manual" onclick="openManualTerminalModal()">➕ Додати термінал вручну</button>
+    <button class="btn btn-default" data-i18n="btn_add_printer_manual" onclick="openManualPrinterModal()">➕ Додати фіскальний принтер</button>
+    <button class="btn btn-default" data-i18n="btn_logs" onclick="openLogs()">📋 Логи</button>
+    <button class="btn btn-default" data-i18n="btn_usb" onclick="runUsbProbe()">🔌 USB діагностика</button>
+    <button id="btn-uplink" class="btn btn-default" onclick="openUplinkModal()"><span data-i18n="btn_uplink">📡 Віддалена діагностика</span><span id="uplink-badge" class="badge" data-i18n="uplink_badge_connected" style="display:none;">● підключено</span></button>
   </div>
 
   <div id="manual-terminal-modal" class="modal-backdrop" style="display:none;">
     <div class="modal">
-      <h2>Додати термінал вручну</h2>
-      <p class="modal-desc">
+      <h2 data-i18n="mt_title">Додати термінал вручну</h2>
+      <p class="modal-desc" data-i18n="mt_desc">
         Резерв на випадок коли скан не побачив (CGNAT мобільного
         оператора, hotspot планшета з нестандартним subnet, окрема
         VLAN). IP терміналу дивись у його admin меню.
       </p>
       <label class="modal-row">
-        <span>IP / Host</span>
-        <input id="mt-host" type="text" placeholder="10.245.122.201" />
+        <span data-i18n="mt_host_label">IP / Host</span>
+        <input id="mt-host" type="text" data-i18n-ph="mt_host_ph" placeholder="10.245.122.201" />
       </label>
       <label class="modal-row">
-        <span>Port</span>
+        <span data-i18n="mt_port_label">Port</span>
         <input id="mt-port" type="number" value="3000" />
       </label>
       <label class="modal-row">
-        <span>Банк</span>
+        <span data-i18n="mt_bank_label">Банк</span>
         <select id="mt-kind">
-          <option value="mono_pos">Monobank (SSI)</option>
-          <option value="privat_pos">ПриватБанк (PB)</option>
-          <option value="raif_pos">Райффайзен (SSI)</option>
-          <option value="pivdenny_pos">Південний (SSI)</option>
-          <option value="generic_ssi">Інший SSI</option>
+          <option value="mono_pos" data-i18n="mt_opt_mono">Monobank (SSI)</option>
+          <option value="privat_pos" data-i18n="mt_opt_privat">ПриватБанк (PB)</option>
+          <option value="raif_pos" data-i18n="mt_opt_raif">Райффайзен (SSI)</option>
+          <option value="pivdenny_pos" data-i18n="mt_opt_pivdenny">Південний (SSI)</option>
+          <option value="generic_ssi" data-i18n="mt_opt_generic">Інший SSI</option>
         </select>
       </label>
       <label class="modal-row">
-        <span>Псевдонім (опційно)</span>
-        <input id="mt-nickname" type="text" placeholder="Бар / Каса 1" />
+        <span data-i18n="mt_nickname_label">Псевдонім (опційно)</span>
+        <input id="mt-nickname" type="text" data-i18n-ph="mt_nickname_ph" placeholder="Бар / Каса 1" />
       </label>
       <div class="modal-actions">
-        <button class="btn btn-default" onclick="closeManualTerminalModal()">Скасувати</button>
-        <button id="mt-save" class="btn btn-update" onclick="saveManualTerminal()">Додати</button>
+        <button class="btn btn-default" data-i18n="btn_cancel" onclick="closeManualTerminalModal()">Скасувати</button>
+        <button id="mt-save" class="btn btn-update" data-i18n="btn_mt_save" onclick="saveManualTerminal()">Додати</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="manual-printer-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal">
+      <h2 data-i18n="mp_title">Додати фіскальний принтер вручну</h2>
+      <p class="modal-desc" data-i18n="mp_desc">
+        Італійський Epson RT-принтер (Fiscal ePOS-Print через HTTP) не
+        знаходиться автопошуком. Додайте його за IP та портом fpmate
+        (зазвичай 80; емулятор — 8095).
+      </p>
+      <label class="modal-row">
+        <span data-i18n="mp_host_label">IP / Host</span>
+        <input id="mp-host" type="text" data-i18n-ph="mp_host_ph" placeholder="192.168.1.120" />
+      </label>
+      <label class="modal-row">
+        <span data-i18n="mp_port_label">Port</span>
+        <input id="mp-port" type="number" value="80" />
+      </label>
+      <label class="modal-row">
+        <span data-i18n="mp_nickname_label">Псевдонім (опційно)</span>
+        <input id="mp-nickname" type="text" data-i18n-ph="mp_nickname_ph" placeholder="RT принтер" />
+      </label>
+      <div class="modal-actions">
+        <button class="btn btn-default" data-i18n="btn_cancel" onclick="closeManualPrinterModal()">Скасувати</button>
+        <button id="mp-save" class="btn btn-update" data-i18n="btn_mp_save" onclick="saveManualPrinter()">Додати</button>
       </div>
     </div>
   </div>
 
   <div id="uplink-modal" class="modal-backdrop" style="display:none;">
     <div class="modal">
-      <h2>Віддалена діагностика</h2>
+      <h2 data-i18n="uplink_title">Віддалена діагностика</h2>
       <p class="modal-desc">
-        Стрімить логи менеджера на <code>manager.barhandler.com</code>
-        і дозволяє підтримці запускати безпечні діагностичні команди
+        <span data-i18n="uplink_desc1">Стрімить логи менеджера на</span>
+        <code>manager.barhandler.com</code>
+        <span data-i18n="uplink_desc2">і дозволяє підтримці запускати безпечні діагностичні команди
         (USB-сканування, перевірка мережі, перевірка терміналу,
-        тест підключення). Без чутливих даних — api-key редактиться.
+        тест підключення). Без чутливих даних — api-key редактиться.</span>
       </p>
       <label class="modal-row">
-        <span>Статус підключення</span>
+        <span data-i18n="uplink_status_label">Статус підключення</span>
         <span id="uplink-status" class="muted">—</span>
       </label>
       <label class="modal-row" id="uplink-detected-row">
-        <span>Виявлений клієнт</span>
+        <span data-i18n="uplink_detected_label">Виявлений клієнт</span>
         <span id="uplink-detected" class="muted">—</span>
       </label>
-      <p id="uplink-hint" class="modal-desc" style="margin-top:8px;">
+      <p id="uplink-hint" class="modal-desc" data-i18n="uplink_hint" style="margin-top:8px;">
         Щоб активувати з'єднання, відкрий свій POS-додаток
         (BarHandler / FitStudio / PetsHandler) у браузері — менеджер
         автоматично визначить tenant з домену клієнта.
       </p>
       <div class="modal-actions">
-        <button class="btn btn-default" onclick="closeUplinkModal()">Закрити</button>
-        <button id="uplink-disable" class="btn btn-default" onclick="saveUplink(false)" style="display:none;">Вимкнути</button>
-        <button id="uplink-enable" class="btn btn-update" onclick="saveUplink(true)">Підключити</button>
+        <button class="btn btn-default" data-i18n="btn_close" onclick="closeUplinkModal()">Закрити</button>
+        <button id="uplink-disable" class="btn btn-default" data-i18n="uplink_disable" onclick="saveUplink(false)" style="display:none;">Вимкнути</button>
+        <button id="uplink-enable" class="btn btn-update" data-i18n="uplink_enable" onclick="saveUplink(true)">Підключити</button>
       </div>
     </div>
   </div>
 
   <section id="logs-panel" style="display:none;">
     <h2>
-      Логи
+      <span data-i18n="logs_title">Логи</span>
       <span style="font-weight:normal; font-size:0.9rem; margin-left:1rem;">
         <button class="btn btn-default" data-log="bhm" onclick="loadLog('bhm', this)">bhm.log</button>
         <button class="btn btn-default" data-log="boot" onclick="loadLog('boot', this)">bhm.boot.log</button>
@@ -273,27 +316,27 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
   <section>
     <h2>
-      Принтери / Printers
+      <span data-i18n="printers_title">Принтери</span>
     </h2>
     <table>
       <thead>
-        <tr><th>ID</th><th>Назва</th><th>Роль</th><th>Transport</th><th>Стан</th><th>Дії</th></tr>
+        <tr><th data-i18n="th_id">ID</th><th data-i18n="th_name">Назва</th><th data-i18n="th_role">Роль</th><th data-i18n="th_transport">Transport</th><th data-i18n="th_state">Стан</th><th data-i18n="th_actions">Дії</th></tr>
       </thead>
-      <tbody id="printers"><tr><td class="empty" colspan="6">завантаження…</td></tr></tbody>
+      <tbody id="printers"><tr><td class="empty" colspan="6" data-i18n="loading">завантаження…</td></tr></tbody>
     </table>
   </section>
 
   <section>
-    <h2>POS-термінали / POS terminals</h2>
+    <h2><span data-i18n="terminals_title">POS-термінали</span></h2>
     <table>
       <thead>
-        <tr><th>ID</th><th>Назва</th><th>Банк</th><th>Адреса</th><th>Default merchant</th><th>Дії</th></tr>
+        <tr><th data-i18n="th_id">ID</th><th data-i18n="th_name">Назва</th><th data-i18n="th_bank">Банк</th><th data-i18n="th_address">Адреса</th><th data-i18n="th_default_merchant">Default merchant</th><th data-i18n="th_actions">Дії</th></tr>
       </thead>
-      <tbody id="terminals"><tr><td class="empty" colspan="6">завантаження…</td></tr></tbody>
+      <tbody id="terminals"><tr><td class="empty" colspan="6" data-i18n="loading">завантаження…</td></tr></tbody>
     </table>
   </section>
 
-  <footer>Polling /health, /devices, /terminal — кожні 2 секунди.</footer>
+  <footer data-i18n="footer">Polling /health, /devices, /terminal — кожні 2 секунди.</footer>
 </div>
 
 <div id="toast" class="toast"></div>
@@ -306,6 +349,250 @@ _HTML_TEMPLATE = r"""<!doctype html>
   const $ = (id) => document.getElementById(id);
   let currentVersion = null;
   let versionCheckTimer = null;
+
+  // ---- i18n ----------------------------------------------------------------
+
+  const I18N = {
+    uk: {
+      version_label: "версія",
+      updated_label: "оновлено",
+      btn_update: "⬆ Оновити",
+      controls_actions: "Дії",
+      btn_refresh_status: "↻ Оновити статус",
+      btn_scan_printers: "🔍 Сканувати принтери",
+      btn_scan_terminals: "🔍 Сканувати термінали",
+      btn_add_manual: "➕ Додати термінал вручну",
+      btn_logs: "📋 Логи",
+      btn_usb: "🔌 USB діагностика",
+      btn_uplink: "📡 Віддалена діагностика",
+      uplink_badge_connected: "● підключено",
+      mt_title: "Додати термінал вручну",
+      mt_desc: "Резерв на випадок коли скан не побачив (CGNAT мобільного оператора, hotspot планшета з нестандартним subnet, окрема VLAN). IP терміналу дивись у його admin меню.",
+      mt_host_label: "IP / Host",
+      mt_host_ph: "10.245.122.201",
+      mt_port_label: "Port",
+      mt_bank_label: "Банк",
+      mt_opt_mono: "Monobank (SSI)",
+      mt_opt_privat: "ПриватБанк (PB)",
+      mt_opt_raif: "Райффайзен (SSI)",
+      mt_opt_pivdenny: "Південний (SSI)",
+      mt_opt_generic: "Інший SSI",
+      mt_nickname_label: "Псевдонім (опційно)",
+      mt_nickname_ph: "Бар / Каса 1",
+      btn_cancel: "Скасувати",
+      btn_mt_save: "Додати",
+      btn_add_printer_manual: "➕ Додати фіскальний принтер",
+      mp_title: "Додати фіскальний принтер вручну",
+      mp_desc: "Італійський Epson RT-принтер (Fiscal ePOS-Print через HTTP) не знаходиться автопошуком. Додайте його за IP та портом fpmate (зазвичай 80; емулятор — 8095).",
+      mp_host_label: "IP / Host",
+      mp_host_ph: "192.168.1.120",
+      mp_port_label: "Port",
+      mp_nickname_label: "Псевдонім (опційно)",
+      mp_nickname_ph: "RT принтер",
+      btn_mp_save: "Додати",
+      toast_printer_added: "Принтер додано",
+      uplink_title: "Віддалена діагностика",
+      uplink_desc1: "Стрімить логи менеджера на",
+      uplink_desc2: "і дозволяє підтримці запускати безпечні діагностичні команди (USB-сканування, перевірка мережі, перевірка терміналу, тест підключення). Без чутливих даних — api-key редактиться.",
+      uplink_status_label: "Статус підключення",
+      uplink_detected_label: "Виявлений клієнт",
+      uplink_hint: "Щоб активувати з'єднання, відкрий свій POS-додаток (BarHandler / FitStudio / PetsHandler) у браузері — менеджер автоматично визначить tenant з домену клієнта.",
+      btn_close: "Закрити",
+      uplink_disable: "Вимкнути",
+      uplink_enable: "Підключити",
+      logs_title: "Логи",
+      printers_title: "Принтери",
+      terminals_title: "POS-термінали",
+      th_id: "ID",
+      th_name: "Назва",
+      th_role: "Роль",
+      th_transport: "Transport",
+      th_state: "Стан",
+      th_actions: "Дії",
+      th_bank: "Банк",
+      th_address: "Адреса",
+      th_default_merchant: "Default merchant",
+      loading: "завантаження…",
+      footer: "Polling /health, /devices, /terminal — кожні 2 секунди.",
+      btn_remove: "🗑 Видалити",
+      not_registered: "— не зареєстровано —",
+      confirm_remove_printer: "Видалити цей принтер із зареєстрованих?",
+      confirm_remove_terminal: "Видалити цей термінал із зареєстрованих?",
+      toast_printer_removed: "Принтер видалено",
+      toast_terminal_removed: "Термінал видалено",
+      toast_remove_failed: "Не вдалося видалити: {err}",
+      toast_status_refreshed: "Статус оновлено",
+      update_available: "Доступна нова версія v{latest} (зараз v{current})",
+      toast_found_printers: "Знайдено принтерів: {n}",
+      toast_found_terminals: "Знайдено терміналів: {n}",
+      toast_scan_error: "Помилка сканування: {err}",
+      log_loading: "Завантаження…",
+      log_not_exists: "({path} ще не існує)",
+      log_empty: "(порожньо)",
+      error_prefix: "Помилка: {err}",
+      usb_probe_start: "Запуск USB діагностики…",
+      toast_enter_host: "Введи IP/host",
+      btn_adding: "Додаємо…",
+      toast_terminal_added: "Термінал додано",
+      btn_starting: "Запускаємо…",
+      update_started: "Оновлення запущено!",
+      btn_restarting: "Перезапуск…",
+      update_error: "Помилка оновлення: {err}",
+      update_no_recover: "Менеджер не піднявся після оновлення. Останній лог:",
+      update_success: "Оновлено до v{cur} ✓",
+      update_not_applied: "Оновлення не застосувалось — версія не змінилась (v{cur}). Лог:",
+      update_still_going: "Оновлення ще йде, останні рядки логу:",
+      update_timeout: "Оновлення не завершилось за {s}с. Лог:",
+      uplink_connected: "підключено",
+      uplink_disabled_socket: "вимкнено сокетом",
+      uplink_disabled: "вимкнено",
+      uplink_not_detected: "не виявлено",
+      toast_saved: "Збережено",
+      uplink_no_client: "Не виявлено клієнта — спочатку відкрий POS-додаток",
+      uplink_error: "помилка: {err}",
+      manager_unavailable: "Менеджер недоступний: {err}",
+    },
+    en: {
+      version_label: "version",
+      updated_label: "updated",
+      btn_update: "⬆ Update",
+      controls_actions: "Actions",
+      btn_refresh_status: "↻ Refresh status",
+      btn_scan_printers: "🔍 Scan printers",
+      btn_scan_terminals: "🔍 Scan terminals",
+      btn_add_manual: "➕ Add terminal manually",
+      btn_logs: "📋 Logs",
+      btn_usb: "🔌 USB diagnostics",
+      btn_uplink: "📡 Remote diagnostics",
+      uplink_badge_connected: "● connected",
+      mt_title: "Add terminal manually",
+      mt_desc: "A fallback for when the scan didn't find it (mobile operator CGNAT, a tablet hotspot on a non-standard subnet, a separate VLAN). Find the terminal's IP in its admin menu.",
+      mt_host_label: "IP / Host",
+      mt_host_ph: "10.245.122.201",
+      mt_port_label: "Port",
+      mt_bank_label: "Bank",
+      mt_opt_mono: "Monobank (SSI)",
+      mt_opt_privat: "PrivatBank (PB)",
+      mt_opt_raif: "Raiffeisen (SSI)",
+      mt_opt_pivdenny: "Pivdenny (SSI)",
+      mt_opt_generic: "Other SSI",
+      mt_nickname_label: "Nickname (optional)",
+      mt_nickname_ph: "Bar / Register 1",
+      btn_cancel: "Cancel",
+      btn_mt_save: "Add",
+      btn_add_printer_manual: "➕ Add fiscal printer",
+      mp_title: "Add a fiscal printer manually",
+      mp_desc: "An Italian Epson RT printer (Fiscal ePOS-Print over HTTP) isn't found by discovery. Add it by IP and fpmate port (usually 80; emulator — 8095).",
+      mp_host_label: "IP / Host",
+      mp_host_ph: "192.168.1.120",
+      mp_port_label: "Port",
+      mp_nickname_label: "Nickname (optional)",
+      mp_nickname_ph: "RT printer",
+      btn_mp_save: "Add",
+      toast_printer_added: "Printer added",
+      uplink_title: "Remote diagnostics",
+      uplink_desc1: "Streams the manager's logs to",
+      uplink_desc2: "and lets support run safe diagnostic commands (USB scan, network check, terminal check, connection test). No sensitive data — the api-key is redacted.",
+      uplink_status_label: "Connection status",
+      uplink_detected_label: "Detected client",
+      uplink_hint: "To activate the connection, open your POS app (BarHandler / FitStudio / PetsHandler) in a browser — the manager will detect the tenant from the client domain automatically.",
+      btn_close: "Close",
+      uplink_disable: "Disable",
+      uplink_enable: "Connect",
+      logs_title: "Logs",
+      printers_title: "Printers",
+      terminals_title: "POS terminals",
+      th_id: "ID",
+      th_name: "Name",
+      th_role: "Role",
+      th_transport: "Transport",
+      th_state: "State",
+      th_actions: "Actions",
+      th_bank: "Bank",
+      th_address: "Address",
+      th_default_merchant: "Default merchant",
+      loading: "loading…",
+      footer: "Polling /health, /devices, /terminal — every 2 seconds.",
+      btn_remove: "🗑 Remove",
+      not_registered: "— none registered —",
+      confirm_remove_printer: "Remove this printer from the registered ones?",
+      confirm_remove_terminal: "Remove this terminal from the registered ones?",
+      toast_printer_removed: "Printer removed",
+      toast_terminal_removed: "Terminal removed",
+      toast_remove_failed: "Failed to remove: {err}",
+      toast_status_refreshed: "Status refreshed",
+      update_available: "A new version v{latest} is available (currently v{current})",
+      toast_found_printers: "Printers found: {n}",
+      toast_found_terminals: "Terminals found: {n}",
+      toast_scan_error: "Scan error: {err}",
+      log_loading: "Loading…",
+      log_not_exists: "({path} does not exist yet)",
+      log_empty: "(empty)",
+      error_prefix: "Error: {err}",
+      usb_probe_start: "Running USB diagnostics…",
+      toast_enter_host: "Enter IP/host",
+      btn_adding: "Adding…",
+      toast_terminal_added: "Terminal added",
+      btn_starting: "Starting…",
+      update_started: "Update started!",
+      btn_restarting: "Restarting…",
+      update_error: "Update error: {err}",
+      update_no_recover: "The manager didn't come back up after the update. Last log:",
+      update_success: "Updated to v{cur} ✓",
+      update_not_applied: "The update wasn't applied — the version didn't change (v{cur}). Log:",
+      update_still_going: "Update still in progress, last log lines:",
+      update_timeout: "The update didn't finish within {s}s. Log:",
+      uplink_connected: "connected",
+      uplink_disabled_socket: "disabled by socket",
+      uplink_disabled: "disabled",
+      uplink_not_detected: "not detected",
+      toast_saved: "Saved",
+      uplink_no_client: "No client detected — open the POS app first",
+      uplink_error: "error: {err}",
+      manager_unavailable: "Manager unavailable: {err}",
+    },
+  };
+
+  let LANG = localStorage.getItem("bhm:lang") || "uk";
+  if (LANG !== "uk" && LANG !== "en") LANG = "uk";
+
+  function t(key, vars) {
+    const dict = I18N[LANG] || I18N.uk;
+    let s = dict[key] !== undefined
+      ? dict[key]
+      : (I18N.uk[key] !== undefined ? I18N.uk[key] : key);
+    if (vars) {
+      for (const k in vars) {
+        s = s.split("{" + k + "}").join(String(vars[k]));
+      }
+    }
+    return s;
+  }
+
+  function localeTag() {
+    return LANG === "en" ? "en-GB" : "uk-UA";
+  }
+
+  function applyI18n() {
+    document.documentElement.lang = LANG;
+    document.querySelectorAll("[data-i18n]").forEach((el) => {
+      el.textContent = t(el.getAttribute("data-i18n"));
+    });
+    document.querySelectorAll("[data-i18n-ph]").forEach((el) => {
+      el.setAttribute("placeholder", t(el.getAttribute("data-i18n-ph")));
+    });
+    $("lang-uk").classList.toggle("active", LANG === "uk");
+    $("lang-en").classList.toggle("active", LANG === "en");
+  }
+
+  function setLang(lang) {
+    if (lang !== "uk" && lang !== "en") lang = "uk";
+    LANG = lang;
+    localStorage.setItem("bhm:lang", lang);
+    applyI18n();
+    // Re-render dynamic sections that build their text via t().
+    refresh();
+  }
 
   // ---- fetch helpers -------------------------------------------------------
 
@@ -357,12 +644,12 @@ _HTML_TEMPLATE = r"""<!doctype html>
         + "<td>" + escHtml(reg.kind || "") + "</td>"
         + "<td>" + escHtml(d.transport || "") + "</td>"
         + "<td>" + badge(status, kind) + "</td>"
-        + "<td><button class='btn btn-danger' onclick=\"removePrinter('" + escHtml(d.id) + "')\">🗑 Видалити</button></td>"
+        + "<td><button class='btn btn-danger' onclick=\"removePrinter('" + escHtml(d.id) + "')\">" + escHtml(t("btn_remove")) + "</button></td>"
         + "</tr>";
     });
     $("printers").innerHTML = rows.length
       ? rows.join("")
-      : '<tr><td class="empty" colspan="6">— не зареєстровано —</td></tr>';
+      : '<tr><td class="empty" colspan="6">' + escHtml(t("not_registered")) + '</td></tr>';
   }
 
   function renderTerminals(terminals) {
@@ -376,35 +663,35 @@ _HTML_TEMPLATE = r"""<!doctype html>
         + "<td>" + escHtml(reg.kind || "") + "</td>"
         + "<td class='id'>" + addr + "</td>"
         + "<td>" + escHtml(reg.default_merchant_id || "—") + "</td>"
-        + "<td><button class='btn btn-danger' onclick=\"removeTerminal('" + escHtml(d.id) + "')\">🗑 Видалити</button></td>"
+        + "<td><button class='btn btn-danger' onclick=\"removeTerminal('" + escHtml(d.id) + "')\">" + escHtml(t("btn_remove")) + "</button></td>"
         + "</tr>";
     });
     $("terminals").innerHTML = rows.length
       ? rows.join("")
-      : '<tr><td class="empty" colspan="6">— не зареєстровано —</td></tr>';
+      : '<tr><td class="empty" colspan="6">' + escHtml(t("not_registered")) + '</td></tr>';
   }
 
   // ---- unregister + manual refresh ----------------------------------------
 
   async function removePrinter(id) {
-    if (!id || !confirm("Видалити цей принтер із зареєстрованих?")) return;
+    if (!id || !confirm(t("confirm_remove_printer"))) return;
     try {
       await api("DELETE", "/devices/" + encodeURIComponent(id), true);
-      showToast("Принтер видалено", "ok");
+      showToast(t("toast_printer_removed"), "ok");
       refresh();
     } catch (e) {
-      showToast("Не вдалося видалити: " + e.message, "err");
+      showToast(t("toast_remove_failed", { err: e.message }), "err");
     }
   }
 
   async function removeTerminal(id) {
-    if (!id || !confirm("Видалити цей термінал із зареєстрованих?")) return;
+    if (!id || !confirm(t("confirm_remove_terminal"))) return;
     try {
       await api("DELETE", "/terminal/" + encodeURIComponent(id), true);
-      showToast("Термінал видалено", "ok");
+      showToast(t("toast_terminal_removed"), "ok");
       refresh();
     } catch (e) {
-      showToast("Не вдалося видалити: " + e.message, "err");
+      showToast(t("toast_remove_failed", { err: e.message }), "err");
     }
   }
 
@@ -412,7 +699,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
     if (btn) { btn.disabled = true; }
     try {
       await refresh();
-      showToast("Статус оновлено", "ok", 1500);
+      showToast(t("toast_status_refreshed"), "ok", 1500);
     } finally {
       if (btn) { btn.disabled = false; }
     }
@@ -440,7 +727,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       const latest = (data.tag_name || "").replace(/^v/, "");
       if (latest && semverGt(latest, currentVersion)) {
         $("update-msg").textContent =
-          "Доступна нова версія v" + latest + " (зараз v" + currentVersion + ")";
+          t("update_available", { latest: latest, current: currentVersion });
         $("update-strip").className = "update-strip show";
       } else {
         $("update-strip").className = "update-strip";
@@ -456,13 +743,13 @@ _HTML_TEMPLATE = r"""<!doctype html>
     try {
       const res = await api("POST", "/devices/discover", true);
       const n = (res.printers || []).length;
-      showToast("Знайдено принтерів: " + n, "ok");
+      showToast(t("toast_found_printers", { n: n }), "ok");
       await refresh();
     } catch (e) {
-      showToast("Помилка сканування: " + e.message, "err");
+      showToast(t("toast_scan_error", { err: e.message }), "err");
     } finally {
       btn.disabled = false;
-      btn.textContent = "🔍 Сканувати принтери";
+      btn.textContent = t("btn_scan_printers");
     }
   }
 
@@ -481,21 +768,21 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
   async function loadLog(source, btn) {
     currentLog = source;
-    $("log-content").textContent = "Завантаження…";
+    $("log-content").textContent = t("log_loading");
     try {
       const res = await api("GET", "/system/logs?source=" + source + "&tail=500", true);
       if (!res.exists) {
-        $("log-content").textContent = `(${res.path} ще не існує)`;
+        $("log-content").textContent = t("log_not_exists", { path: res.path });
         return;
       }
       const lines = res.lines || [];
       $("log-content").textContent = lines.length
         ? lines.join("\n")
-        : "(порожньо)";
+        : t("log_empty");
       const el = $("log-content");
       el.scrollTop = el.scrollHeight;
     } catch (e) {
-      $("log-content").textContent = "Помилка: " + (e.message || e);
+      $("log-content").textContent = t("error_prefix", { err: e.message || e });
     }
   }
 
@@ -505,7 +792,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
   async function runUsbProbe() {
     $("logs-panel").style.display = "block";
-    $("log-content").textContent = "Запуск USB діагностики…";
+    $("log-content").textContent = t("usb_probe_start");
     try {
       const res = await api("POST", "/system/usb-probe", true);
       const out = res.stdout || "";
@@ -513,7 +800,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       $("log-content").textContent =
         out + (err ? "\n--- stderr ---\n" + err : "");
     } catch (e) {
-      $("log-content").textContent = "Помилка: " + (e.message || e);
+      $("log-content").textContent = t("error_prefix", { err: e.message || e });
     }
   }
 
@@ -523,13 +810,13 @@ _HTML_TEMPLATE = r"""<!doctype html>
     try {
       const res = await api("POST", "/terminal/discover", true);
       const n = (res.terminals || []).length;
-      showToast("Знайдено терміналів: " + n, "ok");
+      showToast(t("toast_found_terminals", { n: n }), "ok");
       await refresh();
     } catch (e) {
-      showToast("Помилка сканування: " + e.message, "err");
+      showToast(t("toast_scan_error", { err: e.message }), "err");
     } finally {
       btn.disabled = false;
-      btn.textContent = "🔍 Сканувати термінали";
+      btn.textContent = t("btn_scan_terminals");
     }
   }
 
@@ -553,24 +840,63 @@ _HTML_TEMPLATE = r"""<!doctype html>
     const kind = $("mt-kind").value;
     const nickname = $("mt-nickname").value.trim() || null;
     if (!host) {
-      showToast("Введи IP/host", "err");
+      showToast(t("toast_enter_host"), "err");
       return;
     }
     const btn = $("mt-save");
     btn.disabled = true;
-    btn.textContent = "Додаємо…";
+    btn.textContent = t("btn_adding");
     try {
       await api("POST", "/terminal/register-manual", true, {
         host, port, kind, nickname,
       });
-      showToast("Термінал додано", "ok");
+      showToast(t("toast_terminal_added"), "ok");
       closeManualTerminalModal();
       await refresh();
     } catch (e) {
-      showToast("Помилка: " + (e.message || e), "err");
+      showToast(t("error_prefix", { err: e.message || e }), "err");
     } finally {
       btn.disabled = false;
-      btn.textContent = "Додати";
+      btn.textContent = t("btn_mt_save");
+    }
+  }
+
+  // ---- manual fiscal printer (Italy RT / fpmate) ---------------------------
+
+  function openManualPrinterModal() {
+    $("manual-printer-modal").style.display = "flex";
+    $("mp-host").value = "";
+    $("mp-port").value = "80";
+    $("mp-nickname").value = "";
+  }
+
+  function closeManualPrinterModal() {
+    $("manual-printer-modal").style.display = "none";
+  }
+
+  async function saveManualPrinter() {
+    const host = $("mp-host").value.trim();
+    const port = Number($("mp-port").value) || 80;
+    const nickname = $("mp-nickname").value.trim() || null;
+    if (!host) {
+      showToast(t("toast_enter_host"), "err");
+      return;
+    }
+    const btn = $("mp-save");
+    btn.disabled = true;
+    btn.textContent = t("btn_adding");
+    try {
+      await api("POST", "/devices/register-manual", true, {
+        host, port, kind: "fiscal_it", nickname, paper_width: 80,
+      });
+      showToast(t("toast_printer_added"), "ok");
+      closeManualPrinterModal();
+      await refresh();
+    } catch (e) {
+      showToast(t("error_prefix", { err: e.message || e }), "err");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = t("btn_mp_save");
     }
   }
 
@@ -579,7 +905,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
   async function doUpdate() {
     const btn = $("btn-update");
     btn.disabled = true;
-    btn.textContent = "Запускаємо…";
+    btn.textContent = t("btn_starting");
     // Remember what we're updating FROM so we can tell a real update
     // (version changed) from a silent no-op (came back on the same
     // version — failed download, port conflict, never restarted).
@@ -590,13 +916,13 @@ _HTML_TEMPLATE = r"""<!doctype html>
     } catch (_) {}
     try {
       const res = await api("POST", "/system/update", true);
-      showToast(res.message || "Оновлення запущено!", "ok", 10000);
-      btn.textContent = "Перезапуск…";
+      showToast(res.message || t("update_started"), "ok", 10000);
+      btn.textContent = t("btn_restarting");
       watchUpdate(beforeVer);
     } catch (e) {
-      showToast("Помилка оновлення: " + e.message, "err");
+      showToast(t("update_error", { err: e.message }), "err");
       btn.disabled = false;
-      btn.textContent = "⬆ Оновити";
+      btn.textContent = t("btn_update");
     }
   }
 
@@ -623,7 +949,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       showToast(headline + (last ? "\n\n" + last : ""), "err", 20000);
       const btn = $("btn-update");
       btn.disabled = false;
-      btn.textContent = "⬆ Оновити";
+      btn.textContent = t("btn_update");
     };
 
     const tick = async () => {
@@ -637,32 +963,32 @@ _HTML_TEMPLATE = r"""<!doctype html>
         // expected mid-update dip, not a failure.
         sawDown = true;
         if (elapsed < DEADLINE_MS) return setTimeout(tick, POLL_MS);
-        return finishFail("Менеджер не піднявся після оновлення. Останній лог:");
+        return finishFail(t("update_no_recover"));
       }
       // Reachable again.
       if (cur && beforeVer && cur !== beforeVer) {
-        showToast("Оновлено до v" + cur + " ✓", "ok", 8000);
+        showToast(t("update_success", { cur: cur }), "ok", 8000);
         const btn = $("btn-update");
         btn.disabled = false;
-        btn.textContent = "⬆ Оновити";
+        btn.textContent = t("btn_update");
         return;
       }
       // Still on the old version. If it already bounced and came back
       // unchanged, the update didn't take — report now. Otherwise keep
       // waiting (the restart may not have happened yet).
       if (sawDown && cur && beforeVer && cur === beforeVer) {
-        return finishFail("Оновлення не застосувалось — версія не змінилась (v" + cur + "). Лог:");
+        return finishFail(t("update_not_applied", { cur: cur }));
       }
       if (elapsed > 60000 && !progressShown) {
         progressShown = true;
         try {
           const log = await api("GET", "/system/update-log?tail=30", true);
           const last = (log.lines || []).slice(-6).join("\n");
-          showToast("Оновлення ще йде, останні рядки логу:\n" + last, "ok", 15000);
+          showToast(t("update_still_going") + "\n" + last, "ok", 15000);
         } catch (_) {}
       }
       if (elapsed < DEADLINE_MS) return setTimeout(tick, POLL_MS);
-      return finishFail("Оновлення не завершилось за " + Math.round(DEADLINE_MS / 1000) + "с. Лог:");
+      return finishFail(t("update_timeout", { s: Math.round(DEADLINE_MS / 1000) }));
     };
     setTimeout(tick, POLL_MS);
   }
@@ -675,33 +1001,33 @@ _HTML_TEMPLATE = r"""<!doctype html>
       const cur = await api("GET", "/system/uplink", true);
       if (cur.connected) {
         // Connected mode — minimal: status + tenant + one button to disconnect.
-        $("uplink-status").innerHTML = "<span class='ok-text'>підключено</span>";
-        $("uplink-detected").innerHTML = "<span class='ok-text'>" + (cur.tenant || "—") + "</span>";
+        $("uplink-status").innerHTML = "<span class='ok-text'>" + escHtml(t("uplink_connected")) + "</span>";
+        $("uplink-detected").innerHTML = "<span class='ok-text'>" + escHtml(cur.tenant || "—") + "</span>";
         $("uplink-hint").style.display = "none";
         $("uplink-enable").style.display = "none";
         $("uplink-disable").style.display = "";
-        $("uplink-disable").textContent = "Вимкнути";
+        $("uplink-disable").textContent = t("uplink_disable");
       } else {
-        // Disconnected mode — allow Підключити if tenant detected.
+        // Disconnected mode — allow connect if tenant detected.
         $("uplink-status").innerHTML = cur.enabled
-          ? "<span class='err-text'>вимкнено сокетом</span>"
-          : "<span class='muted'>вимкнено</span>";
+          ? "<span class='err-text'>" + escHtml(t("uplink_disabled_socket")) + "</span>"
+          : "<span class='muted'>" + escHtml(t("uplink_disabled")) + "</span>";
         const tenantToShow = cur.tenant || cur.detected_tenant;
         if (tenantToShow) {
-          $("uplink-detected").innerHTML = "<span class='ok-text'>" + tenantToShow + "</span>";
+          $("uplink-detected").innerHTML = "<span class='ok-text'>" + escHtml(tenantToShow) + "</span>";
           $("uplink-hint").style.display = "none";
           $("uplink-enable").disabled = false;
         } else {
-          $("uplink-detected").innerHTML = "<span class='err-text'>не виявлено</span>";
+          $("uplink-detected").innerHTML = "<span class='err-text'>" + escHtml(t("uplink_not_detected")) + "</span>";
           $("uplink-hint").style.display = "";
           $("uplink-enable").disabled = true;
         }
         $("uplink-enable").style.display = "";
-        $("uplink-enable").textContent = "Підключити";
+        $("uplink-enable").textContent = t("uplink_enable");
         $("uplink-disable").style.display = "none";
       }
     } catch (e) {
-      $("uplink-status").innerHTML = "<span class='err-text'>помилка: " + e.message + "</span>";
+      $("uplink-status").innerHTML = "<span class='err-text'>" + escHtml(t("uplink_error", { err: e.message })) + "</span>";
     }
   }
 
@@ -714,7 +1040,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
     $("uplink-disable").disabled = true;
     try {
       const res = await api("POST", "/system/uplink", true, { enabled });
-      showToast(res.message || "Збережено", "ok", 6000);
+      showToast(res.message || t("toast_saved"), "ok", 6000);
       closeUplinkModal();
       // Manager is about to SIGTERM itself; the next /health poll will
       // fail, the error banner will appear, then once the service
@@ -726,9 +1052,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
       let msg = e.message || String(e);
       try {
         const m = msg.match(/→ (\d+)/);
-        if (m && m[1] === "400") msg = "Не виявлено клієнта — спочатку відкрий POS-додаток";
+        if (m && m[1] === "400") msg = t("uplink_no_client");
       } catch (_) {}
-      showToast("Помилка: " + msg, "err");
+      showToast(t("error_prefix", { err: msg }), "err");
     } finally {
       $("uplink-enable").disabled = false;
       $("uplink-disable").disabled = false;
@@ -753,16 +1079,17 @@ _HTML_TEMPLATE = r"""<!doctype html>
       renderPrinters(devices, health);
       renderTerminals(terminals);
       $("uplink-badge").style.display = (uplink && uplink.connected) ? "" : "none";
-      $("updated").textContent = new Date().toLocaleTimeString("uk-UA");
+      $("updated").textContent = new Date().toLocaleTimeString(localeTag());
       $("status-dot").className = "dot ok";
       $("error-banner").className = "error-banner";
     } catch (e) {
       $("status-dot").className = "dot err";
       $("error-banner").className = "error-banner show";
-      $("error-banner").textContent = "Менеджер недоступний: " + (e.message || e);
+      $("error-banner").textContent = t("manager_unavailable", { err: e.message || e });
     }
   }
 
+  applyI18n();
   refresh();
   setInterval(refresh, 2000);
   // Version check every 5 minutes after the first (triggered inside refresh on ver change).

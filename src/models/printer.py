@@ -24,6 +24,9 @@ class PrinterKind(str, Enum):
     receipt = "receipt"
     kitchen = "kitchen"
     label = "label"
+    # PET-237 — Italian Epson RT fiscal printer (Fiscal ePOS-Print over HTTP,
+    # NOT ESC/POS). Registered manually by IP:port; driven by fiscal_it/routes.
+    fiscal_it = "fiscal_it"
 
 
 class PrinterTransport(str, Enum):
