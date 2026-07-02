@@ -340,6 +340,26 @@ def build_status_xml() -> str:
     return ET.tostring(root, encoding="unicode")
 
 
+def build_reprint_xml(receipt_number: str) -> str:
+    """Reprint (duplicate/copia) of an already-issued fiscal document. The RT
+    printer finds the document in its own memory by number and prints a COPY —
+    we do NOT re-send the cart.
+
+    NOTE: the exact Epson element for a document copy is model/firmware
+    dependent (some use a <printerCommand> with a duplicate-print verb, others
+    reprint the last document only). Kept behind TODO(confirm) against Epson FP
+    docs; the local emulator accepts this shape.
+    """
+    # TODO(confirm): Epson duplicate/reprint element + attributes.
+    root = ET.Element("printerCommand")
+    ET.SubElement(
+        root,
+        "printDuplicateReceipt",
+        {"operator": DEFAULT_OPERATOR, "receiptNumber": str(receipt_number)},
+    )
+    return ET.tostring(root, encoding="unicode")
+
+
 def _soap_wrap(inner_xml: str) -> str:
     """Wrap a fiscal ePOS-Print body in the SOAP envelope EpsonFPMate expects."""
     return (
@@ -541,6 +561,27 @@ def run_x_report(host: str, *, port: int = DEFAULT_HTTP_PORT, timeout: float = D
     resp_text = post_to_printer(host, _soap_wrap(build_x_report_xml()), port=port, timeout=timeout)
     parsed = parse_response(resp_text)
     return {"reportNumber": _extract_report_number(parsed["fields"]), "raw": parsed}
+
+
+def run_reprint(
+    host: str,
+    receipt_number: str,
+    *,
+    port: int = DEFAULT_HTTP_PORT,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> dict:
+    """Reprint a duplicate of an existing fiscal document by number.
+    Returns {receiptId, receiptNumber, raw}."""
+    resp_text = post_to_printer(
+        host, _soap_wrap(build_reprint_xml(receipt_number)), port=port, timeout=timeout
+    )
+    parsed = parse_response(resp_text)
+    rid, rnum = _extract_receipt_ids(parsed["fields"])
+    return {
+        "receiptId": rid,
+        "receiptNumber": rnum or str(receipt_number),
+        "raw": parsed,
+    }
 
 
 def _parse_last_z(fields: dict) -> Optional[datetime]:

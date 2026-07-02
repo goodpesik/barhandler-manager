@@ -74,6 +74,7 @@ class FiscalState:
         self.first_z_done = not require_first_z
         self.receipt_number = 0  # daily fiscal receipt counter
         self.z_number = 0  # Z-report (chiusura) counter
+        self.x_number = 0  # X-report (lettura) counter
         self.last_z_at: datetime | None = None
         self.docs: list[dict] = []  # rendered documents, newest last
         self._id = 0
@@ -148,8 +149,37 @@ class FiscalState:
 
     def run_x(self) -> dict:
         with self._lock:
-            self._record_doc({"kind": "LETTURA (X)", "number": self.z_number})
-            return {"zRepNumber": f"{self.z_number:04d}"}
+            self.x_number += 1
+            self._record_doc({"kind": "LETTURA (X)", "number": self.x_number})
+            return {"reportNumber": f"{self.x_number:04d}"}
+
+    def reprint(self, receipt_number: str) -> dict:
+        """Reprint a duplicate of an existing document by number — the printer
+        finds it in its own journal and prints a COPIA (no re-formed receipt)."""
+        with self._lock:
+            orig = next(
+                (
+                    d
+                    for d in reversed(self.docs)
+                    if str(d.get("number")) == str(receipt_number)
+                    and d.get("kind") in ("DOCUMENTO COMMERCIALE", "RESO")
+                ),
+                None,
+            )
+            now = self._now()
+            self._record_doc({
+                "kind": "COPIA",
+                "number": receipt_number,
+                "items": (orig or {}).get("items", []),
+                "total": (orig or {}).get("total"),
+                "reason": f"duplicato del n. {receipt_number}",
+            })
+            return {
+                "fiscalReceiptNumber": str(receipt_number),
+                "fiscalReceiptDate": now.strftime("%d/%m/%Y"),
+                "fiscalReceiptTime": now.strftime("%H:%M"),
+                "zRepNumber": f"{self.z_number:04d}",
+            }
 
     def status(self) -> dict:
         with self._lock:
@@ -195,6 +225,9 @@ def parse_fiscal_request(body: str) -> dict:
         return {"command": "x"}
     if by_name.get("queryPrinterStatus"):
         return {"command": "status"}
+    if by_name.get("printDuplicateReceipt"):
+        el = by_name["printDuplicateReceipt"][0]
+        return {"command": "reprint", "receipt_number": el.get("receiptNumber", "")}
     if by_name.get("printerFiscalReceipt"):
         is_refund = bool(by_name.get("printRecRefund")) or any(
             m.get("messageType") == "4" for m in by_name.get("printRecMessage", [])
@@ -257,6 +290,8 @@ def handle_request(state: FiscalState, body: str) -> str:
         return build_response(state.run_z())
     if kind == "x":
         return build_response(state.run_x())
+    if kind == "reprint":
+        return build_response(state.reprint(cmd.get("receipt_number", "")))
     if kind == "status":
         return build_response(state.status())
     if kind == "sale":

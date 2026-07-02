@@ -58,6 +58,10 @@ class ItDocumentPayload(BaseModel):
     is_refund: bool = False
 
 
+class ReprintPayload(BaseModel):
+    receipt_number: str = Field(min_length=1)
+
+
 # ---------------------------------------------------------------------------
 # Printer resolution
 # ---------------------------------------------------------------------------
@@ -172,6 +176,23 @@ async def fiscal_it_x(
     pid, host, port = _resolve_rt_host(request, printer_id)
     try:
         return await asyncio.to_thread(fiscal_it.run_x_report, host, port=port)
+    except fiscal_it.FiscalItError as exc:
+        _raise_from_fiscal_error(exc)
+
+
+@router.post("/reprint")
+async def fiscal_it_reprint(
+    request: Request,
+    payload: ReprintPayload,
+    printer_id: Optional[str] = Query(default=None),
+):
+    """Reprint a duplicate (copia) of an existing fiscal document by number —
+    the RT printer reprints from its own memory (no re-formed receipt)."""
+    pid, host, port = _resolve_rt_host(request, printer_id)
+    try:
+        return await asyncio.to_thread(
+            fiscal_it.run_reprint, host, payload.receipt_number, port=port
+        )
     except fiscal_it.FiscalItError as exc:
         _raise_from_fiscal_error(exc)
 
