@@ -18,7 +18,7 @@ before the day's first Z is rejected with **error 17 (IMPOSSIBILE ORA)** — the
 real printer's behaviour — so the error path can be exercised end-to-end.
 
 Run:
-    python -m emulator.fiscal_epos                       # http://127.0.0.1:8095, viewer :8096
+    python -m emulator.fiscal_epos                       # :8095 — fpmate POST + web viewer at http://127.0.0.1:8095/
     python -m emulator.fiscal_epos --port 8095 --require-first-z
 """
 
