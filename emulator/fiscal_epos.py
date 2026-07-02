@@ -182,8 +182,19 @@ class FiscalState:
             }
 
     def status(self) -> dict:
+        """The addInfo fields a real Epson RT returns to queryPrinterStatus —
+        verified against the MS D365 EpsonFP90III connector + a real captured
+        response. NO fabricated "day open" field (the RT exposes none); the POS
+        derives state from these facts (last Z, receipt counter, last-Z date).
+        `printerStatus` is a real 5-digit opaque code — "20010" is the observed
+        ready value; its per-digit bitmap is undocumented, so we don't decode it.
+        """
         with self._lock:
-            fields: dict = {"zRepNumber": f"{self.z_number:04d}"}
+            fields: dict = {
+                "printerStatus": "20010",
+                "fiscalReceiptNumber": str(self.receipt_number),
+                "zRepNumber": f"{self.z_number:04d}",
+            }
             if self.last_z_at is not None:
                 fields["fiscalReceiptDate"] = self.last_z_at.strftime("%d/%m/%Y")
                 fields["fiscalReceiptTime"] = self.last_z_at.strftime("%H:%M")
@@ -317,7 +328,9 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <style>
  body{background:#0d0f12;color:#cfd3d8;font-family:ui-monospace,Menlo,monospace;margin:0;padding:20px}
  h1{font-size:14px;color:#8fd08f;margin:0 0 4px;font-family:system-ui,sans-serif}
- .hint{color:#6b7280;font-size:12px;margin:0 0 16px;font-family:system-ui,sans-serif}
+ .hint{color:#6b7280;font-size:12px;margin:0 0 10px;font-family:system-ui,sans-serif}
+ .status{font-family:system-ui,sans-serif;font-size:13px;margin:0 0 16px;padding:8px 12px;border-radius:8px;background:#1c1c1c;border:1px solid #333;display:inline-block;color:#cfd3d8}
+ .status b{color:#eee}.st-warn{color:#e0574a;font-weight:700}
  #roll{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
  /* thermal paper */
  .r{background:#fbfbf7;color:#111;width:320px;padding:14px 16px;border-radius:3px;
@@ -337,6 +350,7 @@ _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 </style></head><body>
 <h1>🧾 Epson Fiscal ePOS-Print emulator</h1>
 <p class="hint">Documento Commerciale journal — live. Reparto→IVA: 1=22% 3=10% 5=5% 7=4% 9=0%.</p>
+<div id="status" class="status">…</div>
 <div id="roll"></div>
 <script>
 var IVA={1:22,3:10,5:5,7:4,9:0};
@@ -401,7 +415,21 @@ async function poll(){
  }catch(e){}
  setTimeout(poll,1000);
 }
-poll();
+// Status banner — only what the RT really reports (queryPrinterStatus addInfo):
+// documents since the last Z, last Z number/date. No fabricated day flag.
+async function pollStatus(){
+ try{var s=await (await fetch('status')).json();
+  var rc=s.fiscalReceiptNumber||'0';
+  var z=s.zRepNumber&&s.zRepNumber!=='0000';
+  var lastZ=z?('#'+s.zRepNumber+(s.fiscalReceiptDate?(' \\u00b7 '+s.fiscalReceiptDate+' '+(s.fiscalReceiptTime||'')):'')):'nessuna';
+  var blocked='';
+  if(s.fiscalReceiptDate){var p=s.fiscalReceiptDate.split('/');var d=new Date(p[2],p[1]-1,p[0],(s.fiscalReceiptTime||'0:0').split(':')[0],(s.fiscalReceiptTime||'0:0').split(':')[1]||0);
+    if(!isNaN(d)&&(Date.now()-d)>48*3600*1000)blocked=' <span class="st-warn">\\u26a0 Z scaduto (&gt;48h) \\u2014 vendite bloccate</span>';}
+  document.getElementById('status').innerHTML='<b>printerStatus:</b> '+(s.printerStatus||'?')+' \\u00b7 <b>Documenti dall\\u2019ultima chiusura:</b> '+rc+' \\u00b7 <b>Ultima chiusura Z:</b> '+lastZ+blocked;
+ }catch(e){}
+ setTimeout(pollStatus,2000);
+}
+poll();pollStatus();
 </script></body></html>"""
 
 
@@ -422,6 +450,9 @@ def _make_handler(state: FiscalState):
                 self._send(200, "text/html; charset=utf-8", _PAGE.encode("utf-8"))
             elif self.path.startswith("/state"):
                 body = json.dumps(state.snapshot()).encode("utf-8")
+                self._send(200, "application/json", body)
+            elif self.path.startswith("/status"):
+                body = json.dumps(state.status()).encode("utf-8")
                 self._send(200, "application/json", body)
             else:
                 self._send(404, "text/plain", b"not found")

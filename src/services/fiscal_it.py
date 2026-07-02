@@ -636,7 +636,8 @@ def query_status(host: str, *, port: int = DEFAULT_HTTP_PORT, timeout: float = D
     before they even try to sell."""
     resp_text = post_to_printer(host, _soap_wrap(build_status_xml()), port=port, timeout=timeout)
     parsed = parse_response(resp_text)
-    last_z = _parse_last_z(parsed["fields"])
+    fields = parsed["fields"]
+    last_z = _parse_last_z(fields)
     if last_z is None:
         # Unknown last-Z → we can't prove it's safe; report not-blocked but let
         # the raw payload carry the truth for the caller to inspect.
@@ -645,4 +646,13 @@ def query_status(host: str, *, port: int = DEFAULT_HTTP_PORT, timeout: float = D
     else:
         blocked = (datetime.now(timezone.utc) - last_z) > BLOCKED_AFTER
         last_z_iso = last_z.isoformat()
-    return {"lastZAt": last_z_iso, "blocked": blocked, "raw": parsed}
+    # Only fields the RT really reports — the caller derives state from them.
+    # The RT has NO "fiscal day open" flag; we don't fabricate one.
+    return {
+        "lastZAt": last_z_iso,
+        "blocked": blocked,
+        "zNumber": fields.get("zRepNumber") or None,
+        "receiptNumber": fields.get("fiscalReceiptNumber") or None,
+        "printerStatus": fields.get("printerStatus") or None,
+        "raw": parsed,
+    }
