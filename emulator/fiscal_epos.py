@@ -18,7 +18,7 @@ before the day's first Z is rejected with **error 17 (IMPOSSIBILE ORA)** — the
 real printer's behaviour — so the error path can be exercised end-to-end.
 
 Run:
-    python -m emulator.fiscal_epos                       # http://127.0.0.1:8095, viewer :8096
+    python -m emulator.fiscal_epos                       # :8095 — fpmate POST + web viewer at http://127.0.0.1:8095/
     python -m emulator.fiscal_epos --port 8095 --require-first-z
 """
 
@@ -182,8 +182,19 @@ class FiscalState:
             }
 
     def status(self) -> dict:
+        """The addInfo fields a real Epson RT returns to queryPrinterStatus —
+        verified against the MS D365 EpsonFP90III connector + a real captured
+        response. NO fabricated "day open" field (the RT exposes none); the POS
+        derives state from these facts (last Z, receipt counter, last-Z date).
+        `printerStatus` is a real 5-digit opaque code — "20010" is the observed
+        ready value; its per-digit bitmap is undocumented, so we don't decode it.
+        """
         with self._lock:
-            fields: dict = {"zRepNumber": f"{self.z_number:04d}"}
+            fields: dict = {
+                "printerStatus": "20010",
+                "fiscalReceiptNumber": str(self.receipt_number),
+                "zRepNumber": f"{self.z_number:04d}",
+            }
             if self.last_z_at is not None:
                 fields["fiscalReceiptDate"] = self.last_z_at.strftime("%d/%m/%Y")
                 fields["fiscalReceiptTime"] = self.last_z_at.strftime("%H:%M")
@@ -315,35 +326,110 @@ def handle_request(state: FiscalState, body: str) -> str:
 _PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <title>Fiscal ePOS emulator</title>
 <style>
- body{background:#111;color:#ddd;font-family:ui-monospace,Menlo,monospace;margin:0;padding:16px}
- h1{font-size:15px;color:#8fd08f;margin:0 0 12px}
- .doc{background:#1c1c1c;border:1px solid #333;border-radius:8px;padding:12px;margin:0 0 12px;max-width:420px}
- .doc.reso{border-color:#a6772e}.doc.rej{border-color:#b23}.doc.z{border-color:#3a7}
- .k{color:#8fd08f;font-weight:700}.muted{color:#888}
- table{width:100%;border-collapse:collapse;margin:6px 0}
- td{padding:1px 0;font-size:13px}.r{text-align:right}
- .tot{border-top:1px dashed #444;margin-top:6px;padding-top:6px;font-weight:700}
+ body{background:#0d0f12;color:#cfd3d8;font-family:ui-monospace,Menlo,monospace;margin:0;padding:20px}
+ h1{font-size:14px;color:#8fd08f;margin:0 0 4px;font-family:system-ui,sans-serif}
+ .hint{color:#6b7280;font-size:12px;margin:0 0 10px;font-family:system-ui,sans-serif}
+ .status{font-family:system-ui,sans-serif;font-size:13px;margin:0 0 16px;padding:8px 12px;border-radius:8px;background:#1c1c1c;border:1px solid #333;display:inline-block;color:#cfd3d8}
+ .status b{color:#eee}.st-warn{color:#e0574a;font-weight:700}
+ #roll{display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start}
+ /* thermal paper */
+ .r{background:#fbfbf7;color:#111;width:320px;padding:14px 16px;border-radius:3px;
+    box-shadow:0 2px 8px rgba(0,0,0,.5);font-size:12.5px;line-height:1.45}
+ .r.reso{outline:2px solid #a6772e}.r.copia{outline:2px dashed #888}.r.rej{outline:2px solid #c0392b}
+ .c{text-align:center}.b{font-weight:700}.mut{color:#666}.rr{text-align:right}
+ .biz{font-size:12px}.title{margin:8px 0 2px;font-weight:700;letter-spacing:.5px}
+ .sub{font-weight:400;font-size:11px}
+ .sep{border-top:1px dashed #999;margin:8px 0}
+ table{width:100%;border-collapse:collapse}
+ td{padding:1px 0;vertical-align:top}
+ .row{display:flex;justify-content:space-between}
+ .big{font-size:15px;font-weight:700}
+ .foot{font-size:11px}
+ .info{background:#1c1c1c;color:#cfd3d8;border-radius:6px;padding:10px 12px;width:320px;font-size:12px}
+ .info.z{border-left:3px solid #3a7}.info.x{border-left:3px solid #58f}
 </style></head><body>
-<h1>🧾 Epson Fiscal ePOS-Print emulator — Documento Commerciale journal</h1>
+<h1>🧾 Epson Fiscal ePOS-Print emulator</h1>
+<p class="hint">Documento Commerciale journal — live. Reparto→IVA: 1=22% 3=10% 5=5% 7=4% 9=0%.</p>
+<div id="status" class="status">…</div>
 <div id="roll"></div>
 <script>
+var IVA={1:22,3:10,5:5,7:4,9:0};
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function num(x){return parseFloat(String(x==null?0:x).replace(',','.'))||0;}
+function eur(n){return (Math.round(n*100)/100).toFixed(2).replace('.',',');}
+function qty(q){return (q%1)?q.toFixed(3):String(q);}
+function fmtTs(ts){if(!ts)return '';var d=new Date(ts);if(isNaN(d.getTime()))return ts;
+ function p(n){return String(n).padStart(2,'0');}
+ return p(d.getDate())+'-'+p(d.getMonth()+1)+'-'+d.getFullYear()+'  '+p(d.getHours())+':'+p(d.getMinutes());}
+function docNo(d){var az=(d.z!=null?d.z+1:1),pr=(d.number||0);
+ return String(az).padStart(4,'0')+'-'+String(pr).padStart(4,'0');}
+function receipt(d){
+ var reso=d.kind==='RESO',copia=d.kind==='COPIA';
+ var items=d.items||[],sum=0,ivaTot=0;
+ var rows=items.map(function(it){
+  var q=num(it.quantity)||1,lt=num(it.unitPrice)*q,pct=IVA[parseInt(it.department,10)]||0;
+  sum+=lt;ivaTot+=lt*pct/(100+pct);
+  return '<tr><td>'+esc(it.description)+' <span class="mut">×'+qty(q)+'</span></td>'+
+         '<td class="rr mut">'+pct+'%</td><td class="rr">'+eur(lt)+'</td></tr>';
+ }).join('');
+ var total=(d.total!=null&&d.total!=='')?num(d.total):sum;
+ var pay=(String(d.payment_type)==='0')?'Pagamento contante':
+         (String(d.payment_type)==='2')?'Pagamento elettronico':'Pagamento';
+ var cls='r'+(reso?' reso':'')+(copia?' copia':'');
+ var title=reso?'DOCUMENTO COMMERCIALE<br><span class="sub">emesso per RESO MERCE</span>'
+                :'DOCUMENTO COMMERCIALE<br><span class="sub">di vendita o prestazione</span>';
+ return '<div class="'+cls+'">'+
+  '<div class="c biz b">EMULATORE RT · PETSHANDLER</div>'+
+  '<div class="c biz mut">Via di Prova 1 — 00100 Roma (RM)</div>'+
+  '<div class="c biz mut">P.IVA 00000000000</div>'+
+  (copia?'<div class="c b" style="margin-top:6px">— COPIA —</div>':'')+
+  '<div class="c title">'+title+'</div>'+
+  '<div class="sep"></div>'+
+  '<table>'+rows+'</table>'+
+  '<div class="sep"></div>'+
+  '<div class="row big"><span>TOTALE COMPLESSIVO</span><span>'+eur(total)+'</span></div>'+
+  '<div class="row mut"><span>di cui IVA</span><span>'+eur(ivaTot)+'</span></div>'+
+  '<div class="sep"></div>'+
+  '<div class="row"><span>'+pay+'</span><span>'+eur(reso?-total:total)+'</span></div>'+
+  '<div class="row mut"><span>Non riscosso</span><span>0,00</span></div>'+
+  '<div class="sep"></div>'+
+  '<div class="c foot b">DOCUMENTO N. '+docNo(d)+'</div>'+
+  '<div class="c foot mut">'+fmtTs(d.ts)+'</div>'+
+  '<div class="c foot mut">RT 2CMZP999891 (EMULATORE)</div>'+
+  '</div>';
+}
+function info(d){
+ var cls=d.kind.indexOf('CHIUSURA')>=0?'info z':(d.kind.indexOf('LETTURA')>=0?'info x':'info');
+ if(d.kind==='REJECTED')cls='r rej';
+ var body=d.kind==='REJECTED'
+   ? '<div class="c b">SCONTRINO NON EMESSO</div><div class="c mut">'+esc(d.reason||'')+'</div>'
+   : '<div class="b">'+esc(d.kind)+' n. '+String(d.number||'').padStart(4,'0')+'</div>'+
+     '<div class="mut">'+fmtTs(d.ts)+'</div>';
+ return '<div class="'+cls+'">'+body+'</div>';
+}
 async function poll(){
- try{const r=await fetch('state');const docs=await r.json();
+ try{var r=await fetch('state');var docs=await r.json();
   document.getElementById('roll').innerHTML=docs.map(function(d){
-   var cls=d.kind==='RESO'?'reso':(d.kind==='REJECTED'?'rej':(d.kind.indexOf('CHIUSURA')>=0?'z':''));
-   var rows=(d.items||[]).map(function(it){return '<tr><td>'+it.description+' ×'+it.quantity+
-     ' <span class="muted">rep '+it.department+'</span></td><td class="r">'+it.unitPrice+'</td></tr>';}).join('');
-   var head='<div><span class="k">'+d.kind+'</span> '+(d.number?('#'+d.number):'')+
-     ' <span class="muted">'+(d.ts||'')+'</span></div>';
-   var tot=d.total?('<div class="tot">TOTALE <span class="r" style="float:right">'+d.total+
-     (d.payment_type!=null?(' <span class="muted">pt'+d.payment_type+'</span>'):'')+'</span></div>'):'';
-   var rej=d.reason?('<div class="muted">'+d.reason+'</div>'):'';
-   return '<div class="doc '+cls+'">'+head+(rows?('<table>'+rows+'</table>'):'')+tot+rej+'</div>';
+   return (d.kind==='DOCUMENTO COMMERCIALE'||d.kind==='RESO'||d.kind==='COPIA')?receipt(d):info(d);
   }).join('');
  }catch(e){}
  setTimeout(poll,1000);
 }
-poll();
+// Status banner — only what the RT really reports (queryPrinterStatus addInfo):
+// documents since the last Z, last Z number/date. No fabricated day flag.
+async function pollStatus(){
+ try{var s=await (await fetch('status')).json();
+  var rc=s.fiscalReceiptNumber||'0';
+  var z=s.zRepNumber&&s.zRepNumber!=='0000';
+  var lastZ=z?('#'+s.zRepNumber+(s.fiscalReceiptDate?(' \\u00b7 '+s.fiscalReceiptDate+' '+(s.fiscalReceiptTime||'')):'')):'nessuna';
+  var blocked='';
+  if(s.fiscalReceiptDate){var p=s.fiscalReceiptDate.split('/');var d=new Date(p[2],p[1]-1,p[0],(s.fiscalReceiptTime||'0:0').split(':')[0],(s.fiscalReceiptTime||'0:0').split(':')[1]||0);
+    if(!isNaN(d)&&(Date.now()-d)>48*3600*1000)blocked=' <span class="st-warn">\\u26a0 Z scaduto (&gt;48h) \\u2014 vendite bloccate</span>';}
+  document.getElementById('status').innerHTML='<b>printerStatus:</b> '+(s.printerStatus||'?')+' \\u00b7 <b>Documenti dall\\u2019ultima chiusura:</b> '+rc+' \\u00b7 <b>Ultima chiusura Z:</b> '+lastZ+blocked;
+ }catch(e){}
+ setTimeout(pollStatus,2000);
+}
+poll();pollStatus();
 </script></body></html>"""
 
 
@@ -364,6 +450,9 @@ def _make_handler(state: FiscalState):
                 self._send(200, "text/html; charset=utf-8", _PAGE.encode("utf-8"))
             elif self.path.startswith("/state"):
                 body = json.dumps(state.snapshot()).encode("utf-8")
+                self._send(200, "application/json", body)
+            elif self.path.startswith("/status"):
+                body = json.dumps(state.status()).encode("utf-8")
                 self._send(200, "application/json", body)
             else:
                 self._send(404, "text/plain", b"not found")
@@ -398,8 +487,10 @@ def start_server(state: FiscalState, host: str, port: int) -> ThreadingHTTPServe
 
 def _banner(host: str, port: int, manager_port: int) -> None:
     url = f"http://{host}:{port}{FPMATE_PATH}"
-    # Register this emulator in the manager as a fiscal_it printer by IP:port —
-    # discovery can't find an HTTP fpmate device, so it must be added manually.
+    viewer = f"http://{host}:{port}/"
+    dashboard = f"http://127.0.0.1:{manager_port}/"
+    # Preferred: register from the manager dashboard → "Add fiscal printer"
+    # (host + port below). The curl is only for headless/no-browser setups.
     register = (
         f"curl -X POST http://127.0.0.1:{manager_port}/devices/register-manual "
         f"-H 'X-Api-Key: {API_KEY}' -H 'Content-Type: application/json' "
@@ -407,19 +498,27 @@ def _banner(host: str, port: int, manager_port: int) -> None:
         f"\"nickname\":\"RT emulator\"}}'"
     )
     if _console is None:
-        print(f"Fiscal ePOS emulator on {url}\nRegister in manager:\n{register}")
+        print(
+            f"Fiscal ePOS emulator — FPMate {url} · viewer {viewer}\n"
+            f"Register in the manager dashboard ({dashboard}) → Add fiscal printer "
+            f"(host {host}, port {port}).\nHeadless fallback:\n{register}"
+        )
         return
     body = Text()
     body.append("🏦 BARHANDLER — FISCAL ePOS-PRINT EMULATOR\n", style="bold")
     body.append("device side of an Italian Epson RT printer\n\n", style="dim")
     body.append("FPMate endpoint: ", style="")
-    body.append(f"{url}\n\n", style="bold green")
-    body.append("Register in the manager (discovery can't find it):\n", style="dim")
+    body.append(f"{url}\n", style="bold green")
+    body.append("Web viewer:      ", style="")
+    body.append(f"{viewer}\n\n", style="bold green")
+    body.append("Register in the manager dashboard:\n", style="dim")
+    body.append(f"  {dashboard}", style="bold cyan")
+    body.append("  →  ", style="dim")
+    body.append("Add fiscal printer", style="bold")
+    body.append(f"  (host {host}, port {port})\n", style="dim")
+    body.append("then bind it to the Italy fiscal card in Settings.\n", style="dim")
+    body.append("\nHeadless / no browser? register via curl:\n", style="dim")
     body.append(f"{register}\n", style="yellow")
-    body.append(
-        "\nthen bind this printer to the Italy fiscal card in Settings.\n",
-        style="dim",
-    )
     body.append("\nЧекаю фіскальні документи…", style="")
     _console.print(Panel(body, border_style="green"))
 
