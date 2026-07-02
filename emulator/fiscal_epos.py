@@ -398,8 +398,10 @@ def start_server(state: FiscalState, host: str, port: int) -> ThreadingHTTPServe
 
 def _banner(host: str, port: int, manager_port: int) -> None:
     url = f"http://{host}:{port}{FPMATE_PATH}"
-    # Register this emulator in the manager as a fiscal_it printer by IP:port —
-    # discovery can't find an HTTP fpmate device, so it must be added manually.
+    viewer = f"http://{host}:{port}/"
+    dashboard = f"http://127.0.0.1:{manager_port}/"
+    # Preferred: register from the manager dashboard → "Add fiscal printer"
+    # (host + port below). The curl is only for headless/no-browser setups.
     register = (
         f"curl -X POST http://127.0.0.1:{manager_port}/devices/register-manual "
         f"-H 'X-Api-Key: {API_KEY}' -H 'Content-Type: application/json' "
@@ -407,19 +409,27 @@ def _banner(host: str, port: int, manager_port: int) -> None:
         f"\"nickname\":\"RT emulator\"}}'"
     )
     if _console is None:
-        print(f"Fiscal ePOS emulator on {url}\nRegister in manager:\n{register}")
+        print(
+            f"Fiscal ePOS emulator — FPMate {url} · viewer {viewer}\n"
+            f"Register in the manager dashboard ({dashboard}) → Add fiscal printer "
+            f"(host {host}, port {port}).\nHeadless fallback:\n{register}"
+        )
         return
     body = Text()
     body.append("🏦 BARHANDLER — FISCAL ePOS-PRINT EMULATOR\n", style="bold")
     body.append("device side of an Italian Epson RT printer\n\n", style="dim")
     body.append("FPMate endpoint: ", style="")
-    body.append(f"{url}\n\n", style="bold green")
-    body.append("Register in the manager (discovery can't find it):\n", style="dim")
+    body.append(f"{url}\n", style="bold green")
+    body.append("Web viewer:      ", style="")
+    body.append(f"{viewer}\n\n", style="bold green")
+    body.append("Register in the manager dashboard:\n", style="dim")
+    body.append(f"  {dashboard}", style="bold cyan")
+    body.append("  →  ", style="dim")
+    body.append("Add fiscal printer", style="bold")
+    body.append(f"  (host {host}, port {port})\n", style="dim")
+    body.append("then bind it to the Italy fiscal card in Settings.\n", style="dim")
+    body.append("\nHeadless / no browser? register via curl:\n", style="dim")
     body.append(f"{register}\n", style="yellow")
-    body.append(
-        "\nthen bind this printer to the Italy fiscal card in Settings.\n",
-        style="dim",
-    )
     body.append("\nЧекаю фіскальні документи…", style="")
     _console.print(Panel(body, border_style="green"))
 
