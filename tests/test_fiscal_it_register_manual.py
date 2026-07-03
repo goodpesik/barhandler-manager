@@ -114,3 +114,18 @@ def test_reprint_prints_a_duplicate(client, auth_headers):
         assert state.receipt_number == 1  # reprint did NOT issue a new receipt
     finally:
         server.shutdown()
+
+
+def test_status_after_register(client, auth_headers):
+    from emulator import fiscal_epos
+    state = fiscal_epos.FiscalState()
+    port = _free_port()
+    server = fiscal_epos.start_server(state, "127.0.0.1", port)
+    try:
+        reg = client.post("/devices/register-manual", headers=auth_headers,
+                          json={"host": "127.0.0.1", "port": port, "kind": "fiscal_it"})
+        pid = reg.json()["printer"]["descriptor"]["id"]
+        rs = client.get(f"/fiscal/it/status?printer_id={pid}", headers=auth_headers)
+        assert rs.status_code == 200
+    finally:
+        server.shutdown()
