@@ -129,3 +129,20 @@ def test_status_after_register(client, auth_headers):
         assert rs.status_code == 200
     finally:
         server.shutdown()
+
+
+def test_endpoint_url_normalizes_scheme_host():
+    """A printer registered with the URL as host (http://127.0.0.1) must not
+    double-prefix to http://http://... — that produced 503 printer_unreachable."""
+    from src.services import fiscal_it
+    assert fiscal_it._endpoint_url("http://127.0.0.1", 8095).startswith(
+        "http://127.0.0.1:8095/"
+    )
+    assert fiscal_it._endpoint_url("127.0.0.1", 8095).startswith(
+        "http://127.0.0.1:8095/"
+    )
+    # embedded port in host is dropped (port passed separately)
+    assert fiscal_it._endpoint_url("http://127.0.0.1:8095", 8095).startswith(
+        "http://127.0.0.1:8095/"
+    )
+    assert "http://http" not in fiscal_it._endpoint_url("http://127.0.0.1", 8095)

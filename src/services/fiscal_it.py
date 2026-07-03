@@ -377,8 +377,30 @@ def _soap_wrap(inner_xml: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_host(host: str) -> str:
+    """Strip anything but the bare host from a registered address.
+
+    A fiscal_it printer can be registered with the full URL as its host
+    (e.g. `http://127.0.0.1`, the label the dashboard shows), which then
+    double-prefixes to `http://http://127.0.0.1:PORT` and fails as
+    `printer_unreachable` (503). Normalize defensively so an existing
+    scheme/path/embedded-port registration still resolves without re-adding
+    the printer: drop the scheme, any path, and a trailing `:port` (the port
+    is passed separately)."""
+    h = host.strip()
+    if "://" in h:
+        h = h.split("://", 1)[1]
+    h = h.split("/", 1)[0]
+    # Trailing :<digits> is an embedded port — the caller passes port itself.
+    # (IPv4/hostnames only here; RT printers aren't addressed via IPv6.)
+    if ":" in h and h.rsplit(":", 1)[1].isdigit():
+        h = h.rsplit(":", 1)[0]
+    return h
+
+
 def _endpoint_url(host: str, port: int = DEFAULT_HTTP_PORT) -> str:
-    base = f"http://{host}" if port == 80 else f"http://{host}:{port}"
+    h = _normalize_host(host)
+    base = f"http://{h}" if port == 80 else f"http://{h}:{port}"
     return f"{base}{FPMATE_PATH}?{FPMATE_QUERY}"
 
 
