@@ -22,6 +22,7 @@ class FiscalReceiptItem(BaseModel):
     quantity: float = Field(gt=0)
     price: float = Field(ge=0)        # за одиницю
     sum: float = Field(ge=0)          # підсумок (quantity * price з заокругленням операторa)
+    discount: Optional[float] = None  # знижка на позицію (грн) — друкується під ціною
     tax_symbol: Optional[str] = None  # "Ж", "А", "Б"... — друкується праворуч
     uktzed: Optional[str] = None      # код УКТЗЕД
     barcode: Optional[str] = None

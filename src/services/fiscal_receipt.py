@@ -98,6 +98,21 @@ def _render_item(printer, item: FiscalReceiptItem, width: int) -> None:
         right = f"{right} {item.tax_symbol}"
     printer.text(_two_col(item.name, right, width) + "\n")
 
+    # Per-line discount, like the fiscal receipt: the discount and the
+    # discounted line total below the full price. Indented under the item.
+    if item.discount and item.discount > 0:
+        printer.text(
+            _two_col("  Знижка", f"-{_format_money(item.discount)}", width) + "\n"
+        )
+        printer.text(
+            _two_col(
+                "  Сума зі знижкою",
+                _format_money(item.sum - item.discount),
+                width,
+            )
+            + "\n"
+        )
+
 
 def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: int) -> None:
     """Drive `printer` (python-escpos instance) to print `receipt`."""
