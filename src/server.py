@@ -199,10 +199,28 @@ def create_app(config: dict) -> FastAPI:
     # ignored because they're the operator's own browser hitting the
     # dashboard, not a tenant PWA.
     app.state.last_tenant_origin = ""
+    # Who is logged in on this machine, straight from the PWA. `appid` is
+    # the stable tenant key; the name is a display label. These replace
+    # the old subdomain-derived identity now that every tenant is served
+    # from the apex domain (so Origin no longer distinguishes tenants).
+    app.state.last_tenant_id = ""
+    app.state.last_tenant_name = ""
     _LOCALHOST_ORIGIN_RE = _re.compile(
         r"^(https?://(localhost|127\.0\.0\.1|0\.0\.0\.0)(:\d+)?|capacitor://.*)$",
         _re.IGNORECASE,
     )
+
+    def _decode_tenant_name(raw: str) -> str:
+        """PWA base64-encodes the name so Cyrillic survives HTTP headers.
+        Fall back to the raw value for plain-ASCII names sent verbatim."""
+        raw = (raw or "").strip()
+        if not raw:
+            return ""
+        try:
+            import base64 as _b64
+            return _b64.b64decode(raw).decode("utf-8")
+        except Exception:
+            return raw
 
     @app.middleware("http")
     async def _request_uplink(request, call_next):
@@ -220,11 +238,19 @@ def create_app(config: dict) -> FastAPI:
         origin = request.headers.get("origin", "")
         if origin and not _LOCALHOST_ORIGIN_RE.match(origin):
             app.state.last_tenant_origin = origin
+        # Preferred identity — explicit tenant headers from the PWA.
+        tenant_id = (request.headers.get("x-tenant-id") or "").strip()
+        if tenant_id:
+            app.state.last_tenant_id = tenant_id
+            app.state.last_tenant_name = _decode_tenant_name(
+                request.headers.get("x-tenant-name", ""),
+            )
         try:
             from src.services.log_uplink import emit_event
             emit_event(
                 "request_seen",
                 origin=origin,
+                tenant_id=tenant_id or None,
                 method=request.method,
                 path=request.url.path,
                 status=response.status_code,

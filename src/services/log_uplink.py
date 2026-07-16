@@ -172,9 +172,17 @@ class LogUplinkClient:
 
     async def _on_connect(self) -> None:
         self._log.info(f"uplink connected to {self._cfg['url']}")
+        tenant_id = self._cfg.get("tenant_id", "")
+        tenant_name = self._cfg.get("tenant_name", "")
         await self._sio.emit("handshake", {
-            "tenant": self._cfg["tenant"],
+            # install_id is the stable per-install key the logs server
+            # groups everything by. tenant_id (appid) + tenant_name say
+            # WHO is logged in here; `tenant` is the legacy subdomain
+            # field, kept so older logs-server builds still show a label.
             "install_id": self._install_id,
+            "tenant_id": tenant_id,
+            "tenant_name": tenant_name,
+            "tenant": self._cfg.get("tenant", "") or tenant_name,
             "version": self._version,
             "platform": _platform.platform(),
             "started_at": datetime.now(timezone.utc).isoformat(),
