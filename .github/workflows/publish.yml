@@ -96,7 +96,8 @@ jobs:
         run: |
           cp installers/install.sh         dist/install.sh
           cp installers/install-android.sh dist/install-android.sh
-          cp installers/install.ps1        dist/install.ps1
+          # strip any leading UTF-8 BOM so `irm ... | iex` parses on Windows PowerShell 5.1
+          python3 -c "import sys; d=open('installers/install.ps1','rb').read(); open('dist/install.ps1','wb').write(d[3:] if d[:3]==b'\xef\xbb\xbf' else d)"
           chmod +x dist/install.sh dist/install-android.sh
 
       - name: Generate release notes
