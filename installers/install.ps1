@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     barhandler-manager installer for Windows.
 
