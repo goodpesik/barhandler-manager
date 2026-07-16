@@ -296,22 +296,42 @@ _UPLINK_BLOCK_RE = re.compile(
 )
 
 
-def _render_uplink_block(enabled: bool, tenant: str, url: str = _DEFAULT_UPLINK_URL) -> str:
+def _render_uplink_block(
+    enabled: bool,
+    tenant: str,
+    tenant_id: str = "",
+    tenant_name: str = "",
+    url: str = _DEFAULT_UPLINK_URL,
+) -> str:
+    # tenant_name may contain quotes/Cyrillic — YAML double-quoted scalar
+    # only needs backslash + double-quote escaped.
+    safe_name = tenant_name.replace("\\", "\\\\").replace('"', '\\"')
     return (
         "# Remote log uplink — managed by the dashboard. Toggle via\n"
         "# POST /system/uplink. Editing this block by hand is fine, but the\n"
         "# UI overwrites the entire block on each save, so any comments you\n"
         "# add INSIDE the block will be lost on the next toggle.\n"
+        "# Identity: install_id.txt is the stable key; tenant_id (appid) and\n"
+        "# tenant_name are the auto-detected label of whoever is logged in.\n"
         "uplink:\n"
         f"  enabled: {'true' if enabled else 'false'}\n"
         f"  url: \"{url}\"\n"
         f"  tenant: \"{tenant}\"\n"
+        f"  tenant_id: \"{tenant_id}\"\n"
+        f"  tenant_name: \"{safe_name}\"\n"
         "  reconnect_delay: 2\n"
     )
 
 
-def _replace_uplink_in_config(text: str, enabled: bool, tenant: str, url: str = _DEFAULT_UPLINK_URL) -> str:
-    new_block = _render_uplink_block(enabled, tenant, url)
+def _replace_uplink_in_config(
+    text: str,
+    enabled: bool,
+    tenant: str,
+    tenant_id: str = "",
+    tenant_name: str = "",
+    url: str = _DEFAULT_UPLINK_URL,
+) -> str:
+    new_block = _render_uplink_block(enabled, tenant, tenant_id, tenant_name, url)
     m = _UPLINK_BLOCK_RE.search(text)
     if m:
         # Preserve a blank line before the new block if there was one.
@@ -337,8 +357,14 @@ async def get_uplink(request: Request) -> dict:
         "enabled": bool(uplink_cfg.get("enabled", False)),
         "url": uplink_cfg.get("url", ""),
         "tenant": uplink_cfg.get("tenant", ""),
+        "tenant_id": uplink_cfg.get("tenant_id", ""),
+        "tenant_name": uplink_cfg.get("tenant_name", ""),
         "connected": bool(client and client.connected),
         "detected_tenant": detected_tenant,
+        # Live identity from the most recent PWA ping — lets the dashboard
+        # show who it will register as before the operator hits enable.
+        "detected_tenant_id": getattr(state, "last_tenant_id", "") or None,
+        "detected_tenant_name": getattr(state, "last_tenant_name", "") or None,
     }
 
 
@@ -360,31 +386,32 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
     """
     state = request.app.state
     cfg = getattr(state, "config", {})
+    saved = cfg.get("uplink", {})
 
     if payload.enabled:
+        # Preferred identity: explicit tenant headers captured from the
+        # PWA (appid + display name). Fall back to a previously-saved
+        # label, then to the legacy origin-derived subdomain. install_id
+        # is the real key, so we never hard-fail on a missing label — it
+        # fills in as soon as the app pings the manager once.
+        tenant_id = getattr(state, "last_tenant_id", "") or saved.get("tenant_id", "")
+        tenant_name = getattr(state, "last_tenant_name", "") or saved.get("tenant_name", "")
         last_origin = getattr(state, "last_tenant_origin", "")
-        tenant = _extract_tenant_from_origin(last_origin) if last_origin else None
-        # If we already have a saved tenant in config (e.g. operator
-        # clicked enable earlier), reuse it — origin tracking might be
-        # stale right after a restart before the PWA pings the manager.
-        if not tenant:
-            tenant = cfg.get("uplink", {}).get("tenant") or None
-        if not tenant:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "no tenant detected — open your POS app at its "
-                    "subdomain (e.g. biergarten-lviv.barhandler.com) "
-                    "and let it ping the manager once, then try again"
-                ),
-            )
+        tenant = (
+            (_extract_tenant_from_origin(last_origin) or "") if last_origin else ""
+        ) or saved.get("tenant", "")
     else:
-        tenant = cfg.get("uplink", {}).get("tenant", "")
+        tenant_id = saved.get("tenant_id", "")
+        tenant_name = saved.get("tenant_name", "")
+        tenant = saved.get("tenant", "")
 
     # Persist to config.yaml so the next boot reflects this state.
     try:
         text = _CONFIG_PATH.read_text(encoding="utf-8")
-        new_text = _replace_uplink_in_config(text, payload.enabled, tenant)
+        new_text = _replace_uplink_in_config(
+            text, payload.enabled, tenant,
+            tenant_id=tenant_id, tenant_name=tenant_name,
+        )
         _CONFIG_PATH.write_text(new_text, encoding="utf-8")
     except OSError as exc:
         raise HTTPException(
@@ -396,6 +423,8 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
     cfg.setdefault("uplink", {})
     cfg["uplink"]["enabled"] = payload.enabled
     cfg["uplink"]["tenant"] = tenant
+    cfg["uplink"]["tenant_id"] = tenant_id
+    cfg["uplink"]["tenant_name"] = tenant_name
     cfg["uplink"]["url"] = _DEFAULT_UPLINK_URL
 
     # Runtime toggle — start or stop the LogUplinkClient in place.
@@ -420,6 +449,8 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
         client = LogUplinkClient({
             "url": _DEFAULT_UPLINK_URL,
             "tenant": tenant,
+            "tenant_id": tenant_id,
+            "tenant_name": tenant_name,
             "reconnect_delay": 2,
         })
         client.attach_handler_to_root()
@@ -442,6 +473,8 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
         "uplink": {
             "enabled": payload.enabled,
             "tenant": tenant,
+            "tenant_id": tenant_id,
+            "tenant_name": tenant_name,
             "url": _DEFAULT_UPLINK_URL,
         },
     }

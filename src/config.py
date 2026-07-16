@@ -20,18 +20,25 @@ def load_config(path: str = "config.yaml") -> dict:
 
     # Uplink (remote log + diagnostics server) — config block is ALWAYS
     # populated with sane defaults so the dashboard can toggle the
-    # connection at runtime without rewriting the file. Tenant is set
-    # the first time operator clicks "Підключити" in the dashboard
-    # (auto-detected from the most recent PWA Origin header).
+    # connection at runtime without rewriting the file.
+    #
+    # Install identity on the logs server is keyed by the stable local
+    # `install_id` UUID. The tenant fields below are the human-readable
+    # label of WHO is logged in on this machine, auto-detected from the
+    # PWA's X-Tenant-Id (appid) / X-Tenant-Name headers when the operator
+    # clicks "Підключити". `tenant` is the legacy subdomain field, kept
+    # for backward compatibility with older logs-server builds.
     uplink_cfg = (cfg.get("uplink") or {})
     cfg["uplink"] = {
         "enabled": bool(uplink_cfg.get("enabled", False)),
         "url": str(uplink_cfg.get("url") or "https://manager.barhandler.com"),
         "tenant": str(uplink_cfg.get("tenant", "")),
+        "tenant_id": str(uplink_cfg.get("tenant_id", "")),
+        "tenant_name": str(uplink_cfg.get("tenant_name", "")),
         "reconnect_delay": int(uplink_cfg.get("reconnect_delay", 2)),
     }
-    if cfg["uplink"]["enabled"] and not cfg["uplink"]["tenant"]:
-        raise ValueError(
-            "uplink.enabled=true requires uplink.tenant to be set in config.yaml"
-        )
+    # install_id alone is enough to reach the install from the logs
+    # server, so an enabled uplink no longer HARD-requires a tenant label
+    # (it fills in as soon as the PWA pings the manager). We keep a soft
+    # invariant only for fully-legacy configs that still rely on `tenant`.
     return cfg
