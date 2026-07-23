@@ -154,3 +154,37 @@ def test_discover_warnings_empty_on_supported_linux(
         response = client.post("/devices/discover", headers=auth_headers)
     body = response.json()
     assert body.get("warnings", []) == []
+
+
+def test_register_usb_manual_without_discovery(
+    client: TestClient, auth_headers: dict, tmp_registry: Path,
+) -> None:
+    # A vendor-specific USB printer discovery can't see is registered by
+    # explicit VID/PID/endpoints — no prior /devices/discover call.
+    response = client.post(
+        "/devices/register-usb-manual",
+        headers=auth_headers,
+        json={
+            "vendor_id": "0483",   # hex string, as read off usb_probe.py
+            "product_id": "5011",
+            "in_ep": "0x81",
+            "out_ep": "0x03",
+            "kind": "receipt",
+            "nickname": "SP-POS58IV",
+            "paper_width": 58,
+        },
+    )
+    assert response.status_code == 200
+    printer = response.json()["printer"]
+    assert printer["descriptor"]["transport"] == "usb"
+    assert printer["descriptor"]["usb"]["vendor_id"] == 0x0483
+    assert printer["descriptor"]["usb"]["product_id"] == 0x5011
+    assert printer["descriptor"]["usb"]["in_ep"] == 0x81
+    assert printer["nickname"] == "SP-POS58IV"
+
+    # id is computed exactly like discover_usb() would, so it's stable and
+    # persisted for reuse on the next boot.
+    expected_id = make_id(PrinterTransport.usb, "0483", "5011", "")
+    assert printer["descriptor"]["id"] == expected_id
+    saved = json.loads(tmp_registry.read_text())
+    assert saved["printers"][0]["descriptor"]["id"] == expected_id

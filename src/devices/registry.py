@@ -23,6 +23,7 @@ from src.models.printer import (
     PrinterRegistration,
     PrinterTransport,
     RegistrationRequest,
+    UsbAddress,
     make_id,
 )
 
@@ -166,6 +167,42 @@ class PrinterRegistry:
             transport=PrinterTransport.network,
             label=label or f"{host}:{port}",
             network=NetworkAddress(host=host, port=port),
+        )
+        self._last_discovery[descriptor.id] = descriptor
+        return descriptor
+
+    def add_manual_descriptor_usb(
+        self,
+        *,
+        vendor_id: int,
+        product_id: int,
+        in_ep: int,
+        out_ep: int,
+        serial: Optional[str] = None,
+        label: Optional[str] = None,
+    ) -> PrinterDescriptor:
+        """Register-by-VID/PID for a USB printer that discovery can't see —
+        a vendor-specific-class unit the scan skips, or one CUPS is holding.
+        Read the values off `scripts/usb_probe.py`. The id is computed exactly
+        like discover_usb() would, so if a later scan does surface the printer
+        it reuses this same registration instead of creating a duplicate.
+        Mirrors add_manual_descriptor (which is network-only)."""
+        descriptor = PrinterDescriptor(
+            id=make_id(
+                PrinterTransport.usb,
+                f"{vendor_id:04x}",
+                f"{product_id:04x}",
+                serial or "",
+            ),
+            transport=PrinterTransport.usb,
+            label=label or f"USB printer {vendor_id:04x}:{product_id:04x}",
+            usb=UsbAddress(
+                vendor_id=vendor_id,
+                product_id=product_id,
+                in_ep=in_ep,
+                out_ep=out_ep,
+                serial=serial,
+            ),
         )
         self._last_discovery[descriptor.id] = descriptor
         return descriptor

@@ -29,8 +29,23 @@ from src.models.printer import (
 
 logger = logging.getLogger(__name__)
 
-USB_CLASS_PRINTER = 0x07
+USB_CLASS_PRINTER = 0x07          # standard USB Printer Class
+USB_CLASS_VENDOR_SPECIFIC = 0xff  # where cheap ESC/POS clones hide
+USB_CLASS_UNSPECIFIED = 0x00      # "see interface descriptors" — some too
 EP_TRANSFER_BULK = 0x02
+
+# USB vendor IDs of thermal-printer controllers that commonly enumerate as
+# vendor-specific (class 0xff) or a USB-serial bridge instead of the standard
+# Printer class (0x07) — so the strict class-0x07 filter would silently skip
+# them. A bulk in+out interface on any of these is treated as a printer even
+# when the class byte doesn't say so. Extend as new hardware is field-tested.
+KNOWN_PRINTER_VENDORS = {
+    0x0416,  # Winbond / Nuvoton — SP-POS58 family & generic 58mm POS clones
+    0x0483,  # STMicroelectronics — SPRT / STM32-based thermals (SP-POS58IV)
+    0x0fe6,  # ICS Advent / Zjiang — Rongta RP58 / RG-P58D & Zjiang clones
+    0x28e9,  # GigaDevice (GD32) — generic thermal clones
+    0x1a86,  # QinHeng CH340 — USB-serial bridge on serial-attached thermals
+}
 
 
 def _safe_string(dev, idx) -> Optional[str]:
@@ -61,6 +76,45 @@ def _is_termux() -> bool:
     return os.environ.get("PREFIX", "").startswith("/data/data/com.termux/")
 
 
+def _select_printer_interface(dev):
+    """Pick the first printer-ish interface on `dev`.
+
+    Returns `(in_ep, out_ep, match_kind)` or None. A standard USB
+    Printer-class interface always wins over a heuristic match on the same
+    device, so we scan every interface before settling on a fallback:
+
+      1. ``printer-class``   — bInterfaceClass 0x07. Unambiguous, taken
+         immediately.
+      2. ``vendor-specific`` — class 0xff / 0x00 with bulk in+out endpoints.
+         This is where cheap ESC/POS thermals (STMicro / Winbond / Rongta
+         clones) that skip the Printer class enumerate. Gated on bulk
+         endpoints so we don't list HID / storage / hub interfaces.
+      3. ``known-vendor``    — any bulk in+out interface whose device VID is
+         in ``KNOWN_PRINTER_VENDORS`` (covers CDC/serial-bridge units whose
+         class byte isn't 0xff).
+
+    Both a bulk-IN and a bulk-OUT endpoint are required because
+    ``escpos.printer.Usb`` (and status reads) need both — unidirectional
+    (bulk-OUT-only) printers still fall through to manual registration.
+    """
+    fallback = None
+    for cfg in dev:
+        for iface in cfg:
+            in_ep, out_ep = _bulk_endpoints(iface)
+            if in_ep is None or out_ep is None:
+                continue
+            cls = iface.bInterfaceClass
+            if cls == USB_CLASS_PRINTER:
+                return in_ep, out_ep, "printer-class"
+            if fallback is not None:
+                continue  # already have a fallback; keep looking for class 0x07
+            if cls in (USB_CLASS_VENDOR_SPECIFIC, USB_CLASS_UNSPECIFIED):
+                fallback = (in_ep, out_ep, "vendor-specific")
+            elif dev.idVendor in KNOWN_PRINTER_VENDORS:
+                fallback = (in_ep, out_ep, "known-vendor")
+    return fallback
+
+
 def discover_usb() -> list[PrinterDescriptor]:
     # On Termux/Android pyusb's libusb backend can't reach the system
     # USB stack without per-device termux-usb permissions, and even
@@ -72,40 +126,48 @@ def discover_usb() -> list[PrinterDescriptor]:
         return []
     found: list[PrinterDescriptor] = []
     for dev in usb.core.find(find_all=True):
-        for cfg in dev:
-            for iface in cfg:
-                if iface.bInterfaceClass != USB_CLASS_PRINTER:
-                    continue
-                in_ep, out_ep = _bulk_endpoints(iface)
-                if in_ep is None or out_ep is None:
-                    continue
-                manufacturer = _safe_string(dev, dev.iManufacturer)
-                product = _safe_string(dev, dev.iProduct)
-                serial = _safe_string(dev, dev.iSerialNumber)
-                label_parts = [p for p in (manufacturer, product) if p] or [
-                    f"USB printer {dev.idVendor:04x}:{dev.idProduct:04x}"
-                ]
-                descriptor = PrinterDescriptor(
-                    id=make_id(
-                        PrinterTransport.usb,
-                        f"{dev.idVendor:04x}",
-                        f"{dev.idProduct:04x}",
-                        serial or "",
-                    ),
-                    transport=PrinterTransport.usb,
-                    label=" ".join(label_parts),
-                    manufacturer=manufacturer,
-                    product=product,
-                    usb=UsbAddress(
-                        vendor_id=dev.idVendor,
-                        product_id=dev.idProduct,
-                        in_ep=in_ep,
-                        out_ep=out_ep,
-                        serial=serial,
-                    ),
-                )
-                found.append(descriptor)
-                break  # one printer-class interface per device is enough
+        try:
+            selection = _select_printer_interface(dev)
+        except Exception as exc:  # noqa: BLE001 — libusb can throw per-iface
+            logger.debug(
+                "USB scan: skipping %04x:%04x (descriptor read failed: %s)",
+                getattr(dev, "idVendor", 0), getattr(dev, "idProduct", 0), exc,
+            )
+            continue
+        if selection is None:
+            continue
+        in_ep, out_ep, match_kind = selection
+        manufacturer = _safe_string(dev, dev.iManufacturer)
+        product = _safe_string(dev, dev.iProduct)
+        serial = _safe_string(dev, dev.iSerialNumber)
+        label_parts = [p for p in (manufacturer, product) if p] or [
+            f"USB printer {dev.idVendor:04x}:{dev.idProduct:04x}"
+        ]
+        descriptor = PrinterDescriptor(
+            id=make_id(
+                PrinterTransport.usb,
+                f"{dev.idVendor:04x}",
+                f"{dev.idProduct:04x}",
+                serial or "",
+            ),
+            transport=PrinterTransport.usb,
+            label=" ".join(label_parts),
+            manufacturer=manufacturer,
+            product=product,
+            usb=UsbAddress(
+                vendor_id=dev.idVendor,
+                product_id=dev.idProduct,
+                in_ep=in_ep,
+                out_ep=out_ep,
+                serial=serial,
+            ),
+        )
+        if match_kind != "printer-class":
+            logger.info(
+                "USB scan: %04x:%04x matched via %s (non-standard class) — %s",
+                dev.idVendor, dev.idProduct, match_kind, descriptor.label,
+            )
+        found.append(descriptor)
     return found
 
 
