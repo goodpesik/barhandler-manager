@@ -662,20 +662,21 @@ class _suppress:  # tiny stand-in for contextlib.suppress in async land
 
 
 def _kind_from_package(package_name: str) -> Optional[TerminalKind]:
-    """Heuristic: which bank does the active payment app belong to.
+    """Heuristic label for a terminal discovered over the SSI probe.
 
-    Used during probe to label discovered terminals so the operator
-    doesn't have to guess. Falls through to `generic_ssi` for unknown
-    packages.
+    Anything that answered the SSI frame *speaks SSI* regardless of brand,
+    so only `mono_pos` (SSI is its native protocol) and `generic_ssi` are
+    valid here — returning e.g. `raif_pos` would mis-route to the Printec
+    PosAPI adapter. A Raiffeisen/PUMB unit that happens to run SSI firmware
+    is correctly registered as `generic_ssi`. Non-mono packages that we
+    still want to name land as generic_ssi.
     """
     if "monobank" in package_name:
         return TerminalKind.mono_pos
-    if "privat" in package_name:
-        return TerminalKind.privat_pos
-    if "raif" in package_name:
-        return TerminalKind.raif_pos
-    if "pivdenny" in package_name:
-        return TerminalKind.pivdenny_pos
+    # Recognised-but-SSI-speaking brands (raif / pumb / pivdenny / privat
+    # over SSI middleware) → generic_ssi so the SSI adapter drives them.
+    if any(b in package_name for b in ("raif", "pumb", "pivdenny", "privat")):
+        return TerminalKind.generic_ssi
     return None
 
 

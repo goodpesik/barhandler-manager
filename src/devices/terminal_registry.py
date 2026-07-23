@@ -25,6 +25,9 @@ from src.models.terminal import (
     make_terminal_id,
 )
 from src.services.terminals.base import TerminalAdapter
+from src.services.terminals.bpos import BposTerminalAdapter
+from src.services.terminals.oschad import OschadTerminalAdapter
+from src.services.terminals.posapi import PosApiTerminalAdapter
 from src.services.terminals.privatbank import PrivatBankTerminalAdapter
 from src.services.terminals.ssi import SSITerminalAdapter
 
@@ -38,22 +41,34 @@ class UnknownTerminal(Exception):
 
 
 # Adapter selection is per-bank because wire formats diverge:
-#   - SSI ECR JSON (TCP 3000, STX+LEN+LRC framing) — Mono, Raif,
-#     Pivdenny, generic_ssi. PrivatBank also licenses SSI's middleware
-#     on some legacy units, but PB merchants moving to JSON should use
-#     the privat_pos adapter below; "Privat over SSI" stays available
-#     via generic_ssi if anyone needs it.
-#   - PrivatBank ECR JSON (TCP 2000, 0x00-terminated framing) — modern
-#     Ingenico/PAX/NEWLAND with JSON firmware. Different wire format,
-#     own param vocabulary (decimal-comma amount, int step).
-# Adding a new vendor with a different wire format = new class + an
-# entry here; route layer is unaffected.
+#   - SSI ECR JSON (TCP 3000, STX+LEN+LRC) — Mono + any SSI-firmware unit
+#     (generic_ssi). PrivatBank licenses SSI middleware on some legacy
+#     units; those register as generic_ssi.
+#   - PrivatBank ECR JSON (TCP 2000, 0x00-terminated) — Ingenico/PAX/
+#     NEWLAND with Privat's JSON firmware.
+#   - Printec PosAPI (bridge, newline JSON) — Raiffeisen & PUMB Verifone
+#     terminals via the Printec service. Brands map here by default.
+#   - BPOS1 / BPOS Light (bridge, length-prefixed JSON) — Bank Pivdenny
+#     and Sense Bank (formerly Alfa) Ingenico terminals.
+#   - Oschadbank ECR (bridge, STX/ETX JSON).
+# Adding a vendor with a new wire format = new adapter class + one entry
+# here (+ a discovery probe/port in scan.py); the route layer is unaffected.
 _ADAPTER_FOR_KIND: Dict[TerminalKind, Type[TerminalAdapter]] = {
+    # SSI
     TerminalKind.mono_pos: SSITerminalAdapter,
-    TerminalKind.privat_pos: PrivatBankTerminalAdapter,
-    TerminalKind.raif_pos: SSITerminalAdapter,
-    TerminalKind.pivdenny_pos: SSITerminalAdapter,
     TerminalKind.generic_ssi: SSITerminalAdapter,
+    # PrivatBank
+    TerminalKind.privat_pos: PrivatBankTerminalAdapter,
+    # Printec PosAPI
+    TerminalKind.raif_pos: PosApiTerminalAdapter,
+    TerminalKind.pumb_pos: PosApiTerminalAdapter,
+    TerminalKind.generic_posapi: PosApiTerminalAdapter,
+    # BPOS
+    TerminalKind.pivdenny_pos: BposTerminalAdapter,
+    TerminalKind.sense_pos: BposTerminalAdapter,
+    TerminalKind.generic_bpos: BposTerminalAdapter,
+    # Oschadbank
+    TerminalKind.oschad_pos: OschadTerminalAdapter,
 }
 
 
