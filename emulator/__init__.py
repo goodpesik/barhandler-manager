@@ -1,10 +1,17 @@
-"""Local POS-terminal emulator for barhandler-manager.
+"""Local multi-bank POS-terminal emulator for barhandler-manager.
 
-Speaks the *terminal* side of the SSI ECR JSON protocol so the manager can
-discover, register and charge it exactly as it would a real Mono / Raif /
-Pivdenny / generic-SSI terminal — no hardware required. Every Purchase pops
-an arrow-key menu in the console where you choose approve / decline / cancel.
+Speaks the *terminal* side of every ECR protocol the manager supports, so it
+can discover, register and charge an emulated terminal exactly as it would
+real hardware — no device required:
 
-Run locally only (test tool). Not imported by the manager app and not wired
-into any route.
+  - SSI ECR JSON       Monobank / generic SSI            (ssi_terminal)
+  - PrivatBank JSON    PrivatBank                        (privat_terminal)
+  - Printec PosAPI     Raiffeisen / PUMB                 (posapi_terminal)
+  - BPOS1 / Light      Bank Pivdenny / Sense (Alfa)      (bpos_terminal)
+  - Oschad ECR         Oschadbank                        (oschad_terminal)
+
+`python -m emulator` lets you pick a bank at startup and switch banks while
+idle. Every Purchase pops an approve / decline / cancel menu.
+
+Run locally only (test tool). Not imported by the manager app.
 """

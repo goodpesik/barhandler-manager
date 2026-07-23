@@ -222,12 +222,27 @@ _HTML_TEMPLATE = r"""<!doctype html>
       </label>
       <label class="modal-row">
         <span data-i18n="mt_bank_label">Банк</span>
-        <select id="mt-kind">
-          <option value="mono_pos" data-i18n="mt_opt_mono">Monobank (SSI)</option>
-          <option value="privat_pos" data-i18n="mt_opt_privat">ПриватБанк (PB)</option>
-          <option value="raif_pos" data-i18n="mt_opt_raif">Райффайзен (SSI)</option>
-          <option value="pivdenny_pos" data-i18n="mt_opt_pivdenny">Південний (SSI)</option>
-          <option value="generic_ssi" data-i18n="mt_opt_generic">Інший SSI</option>
+        <select id="mt-kind" onchange="mtKindChanged()">
+          <optgroup label="SSI (Servus)">
+            <option value="mono_pos">Monobank — SSI</option>
+            <option value="generic_ssi">Інший SSI / Other SSI</option>
+          </optgroup>
+          <optgroup label="PrivatBank JSON">
+            <option value="privat_pos">ПриватБанк — JSON</option>
+          </optgroup>
+          <optgroup label="Printec PosAPI">
+            <option value="raif_pos">Райффайзен — PosAPI</option>
+            <option value="pumb_pos">ПУМБ — PosAPI</option>
+            <option value="generic_posapi">Інший PosAPI</option>
+          </optgroup>
+          <optgroup label="BPOS">
+            <option value="pivdenny_pos">Південний — BPOS1</option>
+            <option value="sense_pos">Sense / Альфа — BPOS</option>
+            <option value="generic_bpos">Інший BPOS</option>
+          </optgroup>
+          <optgroup label="Oschad ECR">
+            <option value="oschad_pos">Ощадбанк — ECR</option>
+          </optgroup>
         </select>
       </label>
       <label class="modal-row">
@@ -314,6 +329,32 @@ _HTML_TEMPLATE = r"""<!doctype html>
          style="background:#111;color:#ddd;padding:1rem;border-radius:6px;overflow:auto;max-height:60vh;font-size:0.8rem;line-height:1.3;white-space:pre-wrap;word-break:break-all;">—</pre>
   </section>
 
+  <section id="found-printers-panel" style="display:none; border-color: var(--blue);">
+    <h2>
+      <span data-i18n="found_printers_title">Знайдені принтери — оберіть і зареєструйте</span>
+      <button class="btn btn-default" onclick="hideFound('printers')">✕</button>
+    </h2>
+    <table>
+      <thead>
+        <tr><th data-i18n="th_name">Назва</th><th data-i18n="th_transport">Transport</th><th data-i18n="fp_role">Роль</th><th data-i18n="fp_paper">Папір</th><th data-i18n="th_actions">Дії</th></tr>
+      </thead>
+      <tbody id="found-printers"></tbody>
+    </table>
+  </section>
+
+  <section id="found-terminals-panel" style="display:none; border-color: var(--blue);">
+    <h2>
+      <span data-i18n="found_terminals_title">Знайдені термінали — оберіть і зареєструйте</span>
+      <button class="btn btn-default" onclick="hideFound('terminals')">✕</button>
+    </h2>
+    <table>
+      <thead>
+        <tr><th data-i18n="th_name">Назва</th><th data-i18n="th_address">Адреса</th><th data-i18n="th_bank">Банк</th><th data-i18n="ft_nickname">Псевдонім</th><th data-i18n="th_actions">Дії</th></tr>
+      </thead>
+      <tbody id="found-terminals"></tbody>
+    </table>
+  </section>
+
   <section>
     <h2>
       <span data-i18n="printers_title">Принтери</span>
@@ -349,6 +390,28 @@ _HTML_TEMPLATE = r"""<!doctype html>
   const $ = (id) => document.getElementById(id);
   let currentVersion = null;
   let versionCheckTimer = null;
+
+  // Bank kind → default port, and the kind list shown when registering a
+  // discovered terminal. Kept in sync with TerminalKind / _ADAPTER_FOR_KIND.
+  const KIND_PORT = {
+    mono_pos: 3000, generic_ssi: 3000, privat_pos: 2000,
+    raif_pos: 8080, pumb_pos: 8080, generic_posapi: 8080,
+    pivdenny_pos: 8888, sense_pos: 8888, generic_bpos: 8888,
+    oschad_pos: 7777,
+  };
+  const BANK_KINDS = [
+    ["mono_pos", "Monobank — SSI"], ["generic_ssi", "Інший SSI / Other SSI"],
+    ["privat_pos", "ПриватБанк — JSON"],
+    ["raif_pos", "Райффайзен — PosAPI"], ["pumb_pos", "ПУМБ — PosAPI"],
+    ["generic_posapi", "Інший PosAPI"],
+    ["pivdenny_pos", "Південний — BPOS1"], ["sense_pos", "Sense / Альфа — BPOS"],
+    ["generic_bpos", "Інший BPOS"],
+    ["oschad_pos", "Ощадбанк — ECR"],
+  ];
+  function mtKindChanged() {
+    const k = $("mt-kind").value;
+    if (KIND_PORT[k]) $("mt-port").value = KIND_PORT[k];
+  }
 
   // ---- i18n ----------------------------------------------------------------
 
@@ -426,6 +489,19 @@ _HTML_TEMPLATE = r"""<!doctype html>
       toast_found_printers: "Знайдено принтерів: {n}",
       toast_found_terminals: "Знайдено терміналів: {n}",
       toast_scan_error: "Помилка сканування: {err}",
+      found_printers_title: "Знайдені принтери — оберіть роль і зареєструйте",
+      found_terminals_title: "Знайдені термінали — оберіть банк і зареєструйте",
+      fp_role: "Роль",
+      fp_paper: "Папір",
+      ft_nickname: "Псевдонім",
+      btn_register: "✓ Зареєструвати",
+      btn_registering: "Реєструємо…",
+      role_receipt: "Чек",
+      role_kitchen: "Кухня",
+      role_label: "Етикетка",
+      toast_registered: "Зареєстровано ✓ — синхронізується з застосунком",
+      toast_register_failed: "Не вдалося зареєструвати: {err}",
+      found_nothing: "Нічого не знайдено",
       log_loading: "Завантаження…",
       log_not_exists: "({path} ще не існує)",
       log_empty: "(порожньо)",
@@ -525,6 +601,19 @@ _HTML_TEMPLATE = r"""<!doctype html>
       toast_found_printers: "Printers found: {n}",
       toast_found_terminals: "Terminals found: {n}",
       toast_scan_error: "Scan error: {err}",
+      found_printers_title: "Found printers — pick a role and register",
+      found_terminals_title: "Found terminals — pick a bank and register",
+      fp_role: "Role",
+      fp_paper: "Paper",
+      ft_nickname: "Nickname",
+      btn_register: "✓ Register",
+      btn_registering: "Registering…",
+      role_receipt: "Receipt",
+      role_kitchen: "Kitchen",
+      role_label: "Label",
+      toast_registered: "Registered ✓ — will sync to the app",
+      toast_register_failed: "Failed to register: {err}",
+      found_nothing: "Nothing found",
       log_loading: "Loading…",
       log_not_exists: "({path} does not exist yet)",
       log_empty: "(empty)",
@@ -742,14 +831,99 @@ _HTML_TEMPLATE = r"""<!doctype html>
     btn.textContent = "…";
     try {
       const res = await api("POST", "/devices/discover", true);
-      const n = (res.printers || []).length;
-      showToast(t("toast_found_printers", { n: n }), "ok");
+      const found = res.printers || [];
+      renderFoundPrinters(found);
+      showToast(t("toast_found_printers", { n: found.length }), found.length ? "ok" : "err");
       await refresh();
     } catch (e) {
       showToast(t("toast_scan_error", { err: e.message }), "err");
     } finally {
       btn.disabled = false;
       btn.textContent = t("btn_scan_printers");
+    }
+  }
+
+  // ---- discovery results (found, not yet registered) -----------------------
+
+  function hideFound(which) {
+    $("found-" + which + "-panel").style.display = "none";
+  }
+
+  function renderFoundPrinters(list) {
+    const tb = $("found-printers");
+    if (!list.length) { $("found-printers-panel").style.display = "none"; return; }
+    tb.innerHTML = list.map((d) => {
+      const id = escHtml(d.id);
+      const roleOpts = [["receipt", t("role_receipt")], ["kitchen", t("role_kitchen")], ["label", t("role_label")]]
+        .map(([v, l]) => "<option value='" + v + "'>" + escHtml(l) + "</option>").join("");
+      return "<tr data-id='" + id + "'>"
+        + "<td>" + escHtml(d.label || d.product || d.id) + "</td>"
+        + "<td>" + escHtml(d.transport || "") + "</td>"
+        + "<td><select class='fp-role'>" + roleOpts + "</select></td>"
+        + "<td><select class='fp-paper'><option value='58'>58</option><option value='80'>80</option></select></td>"
+        + "<td><button class='btn btn-update' onclick=\"registerFoundPrinter(this)\">" + escHtml(t("btn_register")) + "</button></td>"
+        + "</tr>";
+    }).join("");
+    $("found-printers-panel").style.display = "";
+  }
+
+  async function registerFoundPrinter(btn) {
+    const tr = btn.closest("tr");
+    const id = tr.getAttribute("data-id");
+    const kind = tr.querySelector(".fp-role").value;
+    const paper_width = Number(tr.querySelector(".fp-paper").value) || 58;
+    btn.disabled = true;
+    btn.textContent = t("btn_registering");
+    try {
+      await api("POST", "/devices/register", true, { id, kind, paper_width });
+      showToast(t("toast_registered"), "ok");
+      tr.remove();
+      if (!$("found-printers").children.length) $("found-printers-panel").style.display = "none";
+      await refresh();
+    } catch (e) {
+      showToast(t("toast_register_failed", { err: e.message }), "err");
+      btn.disabled = false;
+      btn.textContent = t("btn_register");
+    }
+  }
+
+  function renderFoundTerminals(list) {
+    const tb = $("found-terminals");
+    if (!list.length) { $("found-terminals-panel").style.display = "none"; return; }
+    tb.innerHTML = list.map((d) => {
+      const id = escHtml(d.id);
+      const net = d.network || {};
+      const addr = net.host ? escHtml(net.host) + ":" + escHtml(net.port ?? "?") : escHtml(d.transport || "");
+      const opts = BANK_KINDS.map(([v, l]) =>
+        "<option value='" + v + "'" + (v === d.kind ? " selected" : "") + ">" + escHtml(l) + "</option>").join("");
+      return "<tr data-id='" + id + "'>"
+        + "<td>" + escHtml(d.label || d.model || d.id) + "</td>"
+        + "<td class='id'>" + addr + "</td>"
+        + "<td><select class='ft-kind'>" + opts + "</select></td>"
+        + "<td><input class='ft-nick' type='text' placeholder='" + escHtml(t("ft_nickname")) + "' style='padding:4px 8px; border-radius:6px; border:1px solid var(--border); background:var(--bg); color:var(--text); width:120px;' /></td>"
+        + "<td><button class='btn btn-update' onclick=\"registerFoundTerminal(this)\">" + escHtml(t("btn_register")) + "</button></td>"
+        + "</tr>";
+    }).join("");
+    $("found-terminals-panel").style.display = "";
+  }
+
+  async function registerFoundTerminal(btn) {
+    const tr = btn.closest("tr");
+    const id = tr.getAttribute("data-id");
+    const kind = tr.querySelector(".ft-kind").value;
+    const nickname = tr.querySelector(".ft-nick").value.trim() || null;
+    btn.disabled = true;
+    btn.textContent = t("btn_registering");
+    try {
+      await api("POST", "/terminal/register", true, { id, kind, nickname });
+      showToast(t("toast_registered"), "ok");
+      tr.remove();
+      if (!$("found-terminals").children.length) $("found-terminals-panel").style.display = "none";
+      await refresh();
+    } catch (e) {
+      showToast(t("toast_register_failed", { err: e.message }), "err");
+      btn.disabled = false;
+      btn.textContent = t("btn_register");
     }
   }
 
@@ -809,8 +983,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
     btn.textContent = "…";
     try {
       const res = await api("POST", "/terminal/discover", true);
-      const n = (res.terminals || []).length;
-      showToast(t("toast_found_terminals", { n: n }), "ok");
+      const found = res.terminals || [];
+      renderFoundTerminals(found);
+      showToast(t("toast_found_terminals", { n: found.length }), found.length ? "ok" : "err");
       await refresh();
     } catch (e) {
       showToast(t("toast_scan_error", { err: e.message }), "err");

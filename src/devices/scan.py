@@ -452,24 +452,56 @@ def discover_network() -> list[PrinterDescriptor]:
     return unique
 
 
-SSI_TCP_PORT = 3000  # SSI ECR JSON framed-TCP transport (doc §1.1)
-PB_TCP_PORT = 2000   # PrivatBank ECR JSON direct-terminal port (spec §1)
+SSI_TCP_PORT = 3000     # SSI ECR JSON framed-TCP transport (doc §1.1)
+PB_TCP_PORT = 2000      # PrivatBank ECR JSON direct-terminal port (spec §1)
+POSAPI_TCP_PORT = 8080  # Printec PosAPI bridge (Raiffeisen / PUMB)
+BPOS_TCP_PORT = 8888    # BPOS1 / BPOS Light bridge (Pivdenny / Sense)
+OSCHAD_TCP_PORT = 7777  # Oschadbank ECR bridge
+
+
+def _terminal_port_adapters() -> dict[int, list]:
+    """Map scan port → adapter classes whose `probe()` to try on it.
+
+    The bank-JSON ports (2000/3000) are cross-probed with SSI *and* PB
+    because either protocol can end up on either port depending on the
+    unit; each bridge port maps to its one protocol. The handshake inside
+    `probe()` is what confirms a real terminal vs. "something listening".
+    Imported lazily to avoid a start-up import cycle (adapters import
+    models which import nothing from scan, but keep the original lazy
+    style for parity).
+    """
+    from src.services.terminals.bpos import BposTerminalAdapter
+    from src.services.terminals.oschad import OschadTerminalAdapter
+    from src.services.terminals.posapi import PosApiTerminalAdapter
+    from src.services.terminals.privatbank import PrivatBankTerminalAdapter
+    from src.services.terminals.ssi import SSITerminalAdapter
+
+    return {
+        SSI_TCP_PORT: [SSITerminalAdapter, PrivatBankTerminalAdapter],
+        PB_TCP_PORT: [PrivatBankTerminalAdapter, SSITerminalAdapter],
+        POSAPI_TCP_PORT: [PosApiTerminalAdapter],
+        BPOS_TCP_PORT: [BposTerminalAdapter],
+        OSCHAD_TCP_PORT: [OschadTerminalAdapter],
+    }
 
 
 def discover_network_terminals(
     timeout: float = 0.3,
     probe_timeout: float = 2.0,
 ) -> list:
-    """LAN scan for SSI- and PrivatBank-protocol POS terminals.
+    """LAN scan for every supported POS-terminal protocol.
 
-    Two-phase: fast TCP connect across the host's /24 on both ports,
-    then every open host:port is probed with BOTH SSI and PB protocols —
-    because Mono terminals can listen on 2000 and PB terminals on 3000.
-    The bank-specific handshake is what tells a real terminal apart from
-    "something listening on that port".
+    Two-phase: fast TCP connect across the host's /24 on every known
+    terminal/bridge port, then each open host:port is probed with the
+    adapters mapped to that port. The bank-specific handshake is what
+    tells a real terminal apart from "something listening on that port".
+
+    Covered: SSI ECR JSON (Mono, 3000), PrivatBank JSON (2000),
+    Printec PosAPI (Raif/PUMB bridge, 8080), BPOS1/Light (Pivdenny/Sense
+    bridge, 8888), Oschad ECR (bridge, 7777).
     """
-    from src.services.terminals.privatbank import PrivatBankTerminalAdapter
-    from src.services.terminals.ssi import SSITerminalAdapter
+    port_adapters = _terminal_port_adapters()
+    scan_ports = list(port_adapters.keys())
 
     subnets = _local_subnets()
     if not subnets:
@@ -483,17 +515,17 @@ def discover_network_terminals(
         hosts.extend(str(h) for h in sn.hosts())
     logger.info(
         "terminal discovery: scanning %d subnet(s) %s (%d hosts total) "
-        "ports SSI=%d PB=%d tcp_timeout=%.1fs",
+        "ports=%s tcp_timeout=%.1fs",
         len(subnets), [str(s) for s in subnets], len(hosts),
-        SSI_TCP_PORT, PB_TCP_PORT, timeout,
+        scan_ports, timeout,
     )
-    # Collect open host:port pairs — both protocols tried on each
+    # Collect open host:port pairs across every terminal port.
     open_pairs: list[tuple[str, int]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
         future_map: dict = {}
         for host in hosts:
-            future_map[pool.submit(_probe_tcp, host, SSI_TCP_PORT, timeout)] = (host, SSI_TCP_PORT)
-            future_map[pool.submit(_probe_tcp, host, PB_TCP_PORT, timeout)] = (host, PB_TCP_PORT)
+            for port in scan_ports:
+                future_map[pool.submit(_probe_tcp, host, port, timeout)] = (host, port)
         for future in concurrent.futures.as_completed(future_map):
             host, port = future_map[future]
             try:
@@ -503,46 +535,44 @@ def discover_network_terminals(
                 continue
             open_pairs.append((host, port))
 
-    open_on_ssi_port = [h for h, p in open_pairs if p == SSI_TCP_PORT]
-    open_on_pb_port  = [h for h, p in open_pairs if p == PB_TCP_PORT]
+    open_by_port = {
+        port: [h for h, p in open_pairs if p == port] for port in scan_ports
+    }
     logger.info(
-        "terminal discovery: TCP-open hosts port%d=%s port%d=%s",
-        SSI_TCP_PORT, open_on_ssi_port or "[]",
-        PB_TCP_PORT,  open_on_pb_port  or "[]",
+        "terminal discovery: TCP-open hosts %s",
+        {p: (v or "[]") for p, v in open_by_port.items()},
     )
     from src.services.log_uplink import emit_event
     emit_event(
         "discovery_run",
         subnets=[str(s) for s in subnets],
         hosts_scanned=len(hosts),
-        ssi_port_found=len(open_on_ssi_port),
-        pb_port_found=len(open_on_pb_port),
+        ssi_port_found=len(open_by_port.get(SSI_TCP_PORT, [])),
+        pb_port_found=len(open_by_port.get(PB_TCP_PORT, [])),
+        posapi_port_found=len(open_by_port.get(POSAPI_TCP_PORT, [])),
+        bpos_port_found=len(open_by_port.get(BPOS_TCP_PORT, [])),
+        oschad_port_found=len(open_by_port.get(OSCHAD_TCP_PORT, [])),
     )
     if not open_pairs:
         logger.warning(
-            "terminal discovery: nothing answered on port %d (SSI) or %d (PB) "
-            "across %s. Common causes: terminal on yet another subnet not "
-            "enumerated by our interface scan (rare — usually CGNAT carrier "
-            "isolating the terminal SIM from this device); guest-network "
-            "client isolation; manager host firewall; terminal offline. "
-            "If you know the terminal's IP, use 'Додати термінал вручну' "
-            "in the dashboard.",
-            SSI_TCP_PORT, PB_TCP_PORT, [str(s) for s in subnets],
+            "terminal discovery: nothing answered on ports %s across %s. "
+            "Common causes: terminal on another subnet our interface scan "
+            "didn't enumerate (CGNAT/guest isolation); the bank bridge "
+            "(Printec/BPOS/Oschad) not running next to the manager; host "
+            "firewall; terminal offline. If you know the IP, use "
+            "'Додати термінал вручну' in the dashboard.",
+            scan_ports, [str(s) for s in subnets],
         )
         return []
 
-    # Probe every open host:port with BOTH protocols — a Mono terminal
-    # may answer on port 2000, a PB terminal on port 3000.
-    # Dedup by (host, port, protocol) so we don't double-report.
+    # Probe every open host:port with the adapters mapped to that port.
+    # Dedup by (host, port, adapter) so we don't double-report.
     async def _probe_all() -> list:
         out: list = []
         seen: set[str] = set()
         for host, port in open_pairs:
-            for adapter, label in (
-                (SSITerminalAdapter, "ssi"),
-                (PrivatBankTerminalAdapter, "pb"),
-            ):
-                key = f"{host}:{port}:{label}"
+            for adapter in port_adapters.get(port, []):
+                key = f"{host}:{port}:{adapter.__name__}"
                 if key in seen:
                     continue
                 seen.add(key)

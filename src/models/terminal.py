@@ -20,19 +20,37 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 class TerminalKind(str, Enum):
-    """Bank brand using the SSI protocol on a given physical device.
+    """Bank brand / protocol family of a physical terminal.
 
-    `mono_pos` and `privat_pos` are the same wire format — the label
-    only affects which `merchantId` defaults and (eventually) which
-    error-code translations show up in the UI. Adding a new bank
-    later is one enum entry + (optional) tiny adapter subclass.
+    `kind` picks the wire adapter via `_ADAPTER_FOR_KIND` in the registry.
+    Bank brands map to their *dominant* ECR protocol; when a merchant's
+    terminal actually speaks a different one (e.g. an SSI-firmware
+    Raiffeisen unit instead of the usual Printec), register it under the
+    matching `generic_*` kind.
+
+    Protocol families:
+      - SSI ECR JSON (TCP 3000)       → mono_pos, generic_ssi
+      - PrivatBank ECR JSON (TCP 2000)→ privat_pos
+      - Printec PosAPI (bridge 8080)  → raif_pos, pumb_pos, generic_posapi
+      - BPOS1 / BPOS Light (bridge 8888) → pivdenny_pos, sense_pos, generic_bpos
+      - Oschad ECR (bridge 7777)      → oschad_pos
     """
 
+    # SSI ECR JSON
     mono_pos = "mono_pos"
+    generic_ssi = "generic_ssi"      # any other SSI-protocol terminal
+    # PrivatBank ECR JSON
     privat_pos = "privat_pos"
+    # Printec PosAPI (Raiffeisen / PUMB)
     raif_pos = "raif_pos"
+    pumb_pos = "pumb_pos"
+    generic_posapi = "generic_posapi"
+    # BPOS (Pivdenny BPOS1 / Sense BPOS Light)
     pivdenny_pos = "pivdenny_pos"
-    generic_ssi = "generic_ssi"  # any other SSI-protocol terminal
+    sense_pos = "sense_pos"          # Sense Bank (formerly Alfa-Bank Ukraine)
+    generic_bpos = "generic_bpos"
+    # Oschadbank ECR
+    oschad_pos = "oschad_pos"
 
 
 class TerminalTransport(str, Enum):
