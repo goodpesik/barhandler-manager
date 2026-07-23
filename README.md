@@ -25,10 +25,22 @@
 - `POST /devices/discover` — USB принтерного класу, mDNS (IPP / `_pdl-datastream`), port-scan /24 на raw-9100, Bluetooth best-effort на Linux
 - Принтери реєструються через UI (роль, псевдонім, ширина паперу), зберігаються у `printers.json`
 
-**POS-термінали**
-- Monobank SSI ECR JSON (порт 3000) та ПриватБанк PB ECR JSON (порт 2000)
-- Discover у LAN, реєстрація, мультимерчантні термінали з псевдонімами
+**POS-термінали (багатобанкова підтримка)**
+- Один уніфікований інтерфейс, свій адаптер на кожен ECR-протокол:
+
+  | Банк(и) | Протокол | Порт | `kind` |
+  |---|---|---|---|
+  | Monobank | SSI ECR JSON (Servus) | 3000 | `mono_pos` |
+  | будь-який SSI-термінал | SSI ECR JSON | 3000 | `generic_ssi` |
+  | ПриватБанк | PrivatBank ECR JSON | 2000 | `privat_pos` |
+  | Райффайзен / ПУМБ | Verifone Printec PosAPI | 8080¹ | `raif_pos` / `pumb_pos` |
+  | Банк Південний / Sense (Альфа) | BPOS1 / BPOS Light | 8888¹ | `pivdenny_pos` / `sense_pos` |
+  | Ощадбанк | Oschad ECR | 7777¹ | `oschad_pos` |
+
+  ¹ Printec/BPOS/Ощад інтегруються через локальний **міст** (Printec-сервіс / СОТА Агент / банківський ECR-драйвер) поруч із менеджером — адаптер вказує на `host:port` мосту.
+- Discover у LAN по всіх портах, реєстрація прямо з дашборду, мультимерчантні термінали з псевдонімами
 - Проведення оплат, скасування, парсинг фіскального ID для ПриватБанку з активованою "Касою"
+- **Увага:** «бренд банку ≠ один протокол». Райф/ПУМБ переважно Printec PosAPI, але частина Android-юнітів говорить SSI — такий реєструйте як `generic_ssi`. Wire-формати Printec/BPOS/Ощад — партнерські (не публічні); наші адаптери — узгоджена модель, перевірена локальним емулятором (`python -m emulator`), місця під реальні доки позначені `# SPEC:`.
 
 **Веб-дашборд**
 - `http://localhost:9999/` — live статус принтерів і терміналів, без авторизації
@@ -39,7 +51,7 @@
 |---|---|---|
 | Чекові принтери | ESC/POS | 58 мм, 80 мм |
 | Лейбл принтери | ESC/POS | 48 мм, 58 мм |
-| POS-термінали | SSI ECR / PB ECR | — |
+| POS-термінали | SSI ECR / PrivatBank JSON / Printec PosAPI / BPOS / Oschad ECR | — |
 
 Протестовано на: STMicro-class 58 мм USB, Epson TM-i (мережа), Xprinter XP-246B (48 мм USB лейбл). ZPL/TSPL принтери (Zebra, TSC) не підтримуються.
 
@@ -64,6 +76,34 @@ curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/downl
 ```
 
 Всі три інсталери: ставлять Python 3.11+, розпаковують менеджер у `~/.barhandler-manager/`, створюють virtualenv, ставлять залежності та реєструють службу автозапуску (launchd на macOS, systemd на Linux, termux-services на Android, Scheduled Task на Windows).
+
+---
+
+#### 🍏 Докладно, крок за кроком — macOS
+
+1. **Відкрий Термінал.** Натисни `Cmd` + `Пробіл` (відкриється пошук Spotlight), набери `Terminal` або `Термінал`, натисни `Enter`. *(Альтернатива: Finder → Програми → Утиліти → Термінал.)* Відкриється чорне/біле вікно з текстовим рядком.
+2. **Встав команду встановлення.** Скопіюй рядок нижче повністю, встав у Термінал (`Cmd` + `V`) і натисни `Enter`:
+   ```bash
+   curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash
+   ```
+3. **Що відбувається далі:** скрипт завантажує менеджер у теку `~/.barhandler-manager/`, за потреби ставить Python, створює службу автозапуску. У Терміналі побігтимуть рядки логу — це нормально, чекай.
+4. **Якщо спитає пароль** (`Password:`) — це пароль твого користувача Mac (той, яким входиш у систему). Введи його й натисни `Enter`. **Символи не показуються під час набору — це нормально**, просто друкуй наосліп.
+5. **Дозволи мережі.** macOS може показати вікно *«…хоче приймати вхідні з'єднання»* — натисни **Дозволити / Allow**. Воно з'явиться поверх екрана (може також блимнути іконкою в доку).
+6. **Готово.** Відкрий браузер і зайди на **http://localhost:9999/** — має відкритися дашборд менеджера. Термінал можна закривати, менеджер працює у фоні й сам стартує після перезавантаження.
+
+#### 🪟 Докладно, крок за кроком — Windows
+
+1. **Відкрий PowerShell від імені адміністратора.** Натисни клавішу `Win` (Пуск), набери `PowerShell`. У списку справа (або правою кнопкою по «Windows PowerShell») обери **«Запуск від імені адміністратора» / Run as administrator**.
+2. **Підтверди контроль облікових записів.** З'явиться темно-синє вікно *«Дозволити цьому застосунку вносити зміни?»* (UAC) — натисни **Так**.
+3. **Встав команду встановлення.** Скопіюй рядок нижче, встав у синє вікно PowerShell (правою кнопкою миші = вставити) і натисни `Enter`:
+   ```powershell
+   irm https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.ps1 | iex
+   ```
+4. **Що відбувається далі:** скрипт завантажує менеджер, за потреби ставить Python (може ненадовго відкритися окреме вікно інсталятора Python — дочекайся його завершення), і створює завдання автозапуску (Scheduled Task).
+5. **Дозвіл брандмауера.** Вискочить вікно *«Брандмауер Захисника Windows заблокував…»* — постав галочку **«Приватні мережі»** і натисни **«Дозволити доступ»**. Якщо вікно не поверх усього — воно **блимає внизу на панелі задач**, клікни по ньому щоб відкрити.
+6. **Готово.** Відкрий браузер → **http://localhost:9999/** — відкриється дашборд. Менеджер працює у фоні й стартує після входу в систему.
+
+> **Порада:** якщо `http://localhost:9999/` не відкривається одразу після встановлення — зачекай 10–20 секунд (перший старт довший) і онови сторінку. Якщо не допомогло — відкрий у менеджері **📋 Логи** пізніше, або перезавантаж компʼютер (менеджер підніметься сам).
 
 Після встановлення: `http://localhost:9999/` — дашборд, `http://localhost:9999/health` — liveness.
 
@@ -130,6 +170,7 @@ server:
 | `/devices/discover` | POST | Скан USB + LAN + Bluetooth. |
 | `/devices` | GET | Список зареєстрованих принтерів. |
 | `/devices/register` | POST | Зареєструвати принтер (роль / псевдонім / ширина паперу). |
+| `/devices/register-usb-manual` | POST | Зареєструвати USB-принтер за VID/PID/ендпоінтами (коли скан не бачить). |
 | `/devices/{id}` | DELETE | Видалити з реєстру. |
 | `/devices/{id}/test-print` | POST | Демо-чек. |
 | `/print/receipt` | POST | Нефіскальний чек. |
@@ -141,6 +182,7 @@ server:
 | `/drawer/open` | POST | Імпульс на грошову скриньку. |
 | `/terminal/discover` | POST | Скан LAN для POS-терміналів. |
 | `/terminal/register` | POST | Зареєструвати термінал. |
+| `/terminal/register-manual` | POST | Зареєструвати термінал за IP/портом/банком (коли скан не бачить). |
 | `/terminal` | GET | Список зареєстрованих терміналів. |
 | `/terminal/{id}/merchants` | GET / PUT | Мерчанти + псевдоніми. |
 | `/terminal/charge` | POST | Провести оплату. |
@@ -194,10 +236,22 @@ Local HTTP bridge between a browser-based POS app and hardware on the same machi
 - `POST /devices/discover` — USB printer-class, mDNS (IPP / `_pdl-datastream`), /24 port-scan on raw-9100, Bluetooth best-effort on Linux
 - Printers registered through the web UI (role, nickname, paper width), stored in `printers.json`
 
-**POS terminals**
-- Monobank SSI ECR JSON (port 3000) and PrivatBank PB ECR JSON (port 2000)
-- LAN discovery, registration, multi-merchant terminals with nicknames
+**POS terminals (multi-bank)**
+- One unified interface, a dedicated adapter per ECR protocol:
+
+  | Bank(s) | Protocol | Port | `kind` |
+  |---|---|---|---|
+  | Monobank | SSI ECR JSON (Servus) | 3000 | `mono_pos` |
+  | any SSI terminal | SSI ECR JSON | 3000 | `generic_ssi` |
+  | PrivatBank | PrivatBank ECR JSON | 2000 | `privat_pos` |
+  | Raiffeisen / PUMB | Verifone Printec PosAPI | 8080¹ | `raif_pos` / `pumb_pos` |
+  | Bank Pivdenny / Sense (Alfa) | BPOS1 / BPOS Light | 8888¹ | `pivdenny_pos` / `sense_pos` |
+  | Oschadbank | Oschad ECR | 7777¹ | `oschad_pos` |
+
+  ¹ Printec/BPOS/Oschad integrate through a local **bridge** (Printec service / СОТА Агент / bank ECR driver) next to the manager — the adapter points at the bridge's `host:port`.
+- LAN discovery across all ports, register straight from the dashboard, multi-merchant terminals with nicknames
 - Charges, cancellation, fiscal-ID parsing for PrivatBank merchants with "Каса" activated
+- **Note:** "bank brand ≠ one protocol". Raif/PUMB are mostly Printec PosAPI, but some Android units speak SSI — register those as `generic_ssi`. The Printec/BPOS/Oschad wire formats are partner-gated (not public); our adapters are a best-effort model validated by the bundled emulator (`python -m emulator`), with real-doc gaps marked `# SPEC:`.
 
 **Web dashboard**
 - `http://localhost:9999/` — live printer and terminal status, no auth required
@@ -208,7 +262,7 @@ Local HTTP bridge between a browser-based POS app and hardware on the same machi
 |---|---|---|
 | Receipt printers | ESC/POS | 58 mm, 80 mm |
 | Label printers | ESC/POS | 48 mm, 58 mm |
-| POS terminals | SSI ECR / PB ECR | — |
+| POS terminals | SSI ECR / PrivatBank JSON / Printec PosAPI / BPOS / Oschad ECR | — |
 
 Tested on: STMicro-class 58 mm USB, Epson TM-i (network), Xprinter XP-246B (48 mm USB label). ZPL/TSPL printers (Zebra, TSC) are not supported.
 
@@ -235,6 +289,34 @@ curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/downl
 All three installers: install Python 3.11+, unpack the manager to `~/.barhandler-manager/`, create a virtualenv, install dependencies, and register an auto-start service (launchd on macOS, systemd on Linux, termux-services on Android, Scheduled Task on Windows).
 
 After install: `http://localhost:9999/` for the dashboard, `http://localhost:9999/health` for liveness.
+
+---
+
+#### 🍏 Step by step — macOS
+
+1. **Open Terminal.** Press `Cmd` + `Space` (Spotlight), type `Terminal`, press `Enter`. *(Or Finder → Applications → Utilities → Terminal.)* A window with a text prompt opens.
+2. **Paste the install command.** Copy the line below in full, paste it into Terminal (`Cmd` + `V`), press `Enter`:
+   ```bash
+   curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash
+   ```
+3. **What happens next:** the script downloads the manager into `~/.barhandler-manager/`, installs Python if needed, and registers the auto-start service. Log lines scroll by — that's normal, wait for it.
+4. **If it asks for a password** (`Password:`) that's your Mac login password. Type it and press `Enter`. **The characters don't appear as you type — that's normal**, just type it blind.
+5. **Network permission.** macOS may show *"…wants to accept incoming connections"* — click **Allow**. It appears on top of the screen (may also bounce an icon in the Dock).
+6. **Done.** Open a browser at **http://localhost:9999/** — the dashboard should load. You can close Terminal; the manager runs in the background and starts itself after a reboot.
+
+#### 🪟 Step by step — Windows
+
+1. **Open PowerShell as administrator.** Press `Win` (Start), type `PowerShell`. On the right (or right-click "Windows PowerShell") choose **Run as administrator**.
+2. **Confirm the UAC prompt.** A dark-blue *"Do you want to allow this app to make changes?"* window appears — click **Yes**.
+3. **Paste the install command.** Copy the line below, paste into the blue PowerShell window (right-click = paste), press `Enter`:
+   ```powershell
+   irm https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.ps1 | iex
+   ```
+4. **What happens next:** the script downloads the manager, installs Python if needed (a separate Python installer window may briefly open — let it finish), and creates the auto-start Scheduled Task.
+5. **Firewall permission.** A *"Windows Defender Firewall has blocked…"* window pops up — tick **Private networks** and click **Allow access**. If it isn't on top, it **blinks in the taskbar at the bottom** — click it to bring it up.
+6. **Done.** Open a browser → **http://localhost:9999/** — the dashboard loads. The manager runs in the background and starts after you log in.
+
+> **Tip:** if `http://localhost:9999/` doesn't open right after install, wait 10–20 seconds (first start is slower) and refresh. Still nothing? Open **📋 Logs** in the dashboard later, or reboot (the manager comes back on its own).
 
 ### Auto-start after reboot
 
@@ -299,6 +381,7 @@ Paper width, drawer pin, code page — configured through the web app UI and sto
 | `/devices/discover` | POST | Scan USB + LAN + Bluetooth. |
 | `/devices` | GET | List registered printers. |
 | `/devices/register` | POST | Register a printer (role / nickname / paper width). |
+| `/devices/register-usb-manual` | POST | Register a USB printer by VID/PID/endpoints (when the scan can't see it). |
 | `/devices/{id}` | DELETE | Unregister a printer. |
 | `/devices/{id}/test-print` | POST | Demo receipt. |
 | `/print/receipt` | POST | Non-fiscal receipt. |
@@ -310,6 +393,7 @@ Paper width, drawer pin, code page — configured through the web app UI and sto
 | `/drawer/open` | POST | Pulse the cash drawer. |
 | `/terminal/discover` | POST | LAN scan for POS terminals. |
 | `/terminal/register` | POST | Register a terminal. |
+| `/terminal/register-manual` | POST | Register a terminal by IP/port/bank (when the scan can't see it). |
 | `/terminal` | GET | List registered terminals. |
 | `/terminal/{id}/merchants` | GET / PUT | Merchant list + nickname update. |
 | `/terminal/charge` | POST | Run a charge. |
