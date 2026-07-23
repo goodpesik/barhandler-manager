@@ -14,6 +14,8 @@ block in the same PR that bumps `VERSION`.
 ## [Unreleased]
 
 ### Added
+- USB discovery now finds cheap 58 mm thermal clones (SP-POS58IV, Rongta RG-P58D and other STMicro / Winbond / Zjiang units) that enumerate as vendor-specific class `0xff` — the scan accepts class `0xff`/`0x00` interfaces with bulk in+out endpoints, plus any known thermal-printer VID, on top of the standard Printer class `0x07`.
+- `POST /devices/register-usb-manual` — register a USB printer by explicit VID/PID/endpoints (read off `scripts/usb_probe.py`) when even the relaxed scan can't see it or CUPS is holding the device. Mirrors the network-only `/devices/register-manual`.
 - Public install pipeline: one-line installers for macOS / Linux / Raspberry Pi (`install.sh`), Windows (`install.ps1`), Android Termux (`install-android.sh`). Each script is idempotent — re-running upgrades to the latest release without touching `config.yaml` / `printers.json`, and drops `start` / `stop` / `status` helpers next to the install.
 - LAN printer discovery (mDNS browse + `/24` raw-9100 port scan) and best-effort Bluetooth discovery on Linux.
 - `/print/lines` endpoint for structured per-line formatted output (bold / centred / double-height) — bill and non-fiscal receipts render the same headlines on paper as the operator sees on screen.

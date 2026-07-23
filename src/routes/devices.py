@@ -17,7 +17,7 @@ Workflow (frontend-driven):
 """
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 
 from src.devices.registry import UnknownPrinter
@@ -44,6 +44,43 @@ class ManualRegistrationRequest(BaseModel):
     nickname: Optional[str] = None
     label: Optional[str] = None
     paper_width: int = 80
+
+
+class ManualUsbRegistrationRequest(BaseModel):
+    """Body for POST /devices/register-usb-manual.
+
+    Register a USB printer by explicit VID/PID/endpoints when discovery can't
+    see it — a vendor-specific-class thermal the scan skips, or a unit CUPS is
+    holding. Read the four hex values off `scripts/usb_probe.py` output
+    (e.g. line `0483:5011  ... eps=2` with endpoints `0x81` in / `0x03` out).
+
+    String values are parsed as HEX (with or without a `0x` prefix), matching
+    how VID/PID/endpoints are printed everywhere in this domain; integers pass
+    through unchanged.
+    """
+
+    vendor_id: int = Field(ge=0, le=0xFFFF)
+    product_id: int = Field(ge=0, le=0xFFFF)
+    in_ep: int = Field(ge=0, le=0xFF)
+    out_ep: int = Field(ge=0, le=0xFF)
+    serial: Optional[str] = None
+    kind: PrinterKind = PrinterKind.receipt
+    nickname: Optional[str] = None
+    label: Optional[str] = None
+    paper_width: int = 58
+    render_mode: str = "bitmap"
+    code_page: Optional[str] = None
+    drawer_pin: Optional[int] = 0
+
+    @field_validator("vendor_id", "product_id", "in_ep", "out_ep", mode="before")
+    @classmethod
+    def _as_hex(cls, v):
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s.startswith("0x"):
+                s = s[2:]
+            return int(s, 16)
+        return v
 from src.services.bitmap_render import dots_for, render_paragraph
 from src.services.tspl_render import image_to_tspl_bitmap
 
@@ -189,6 +226,36 @@ async def register_manual(payload: ManualRegistrationRequest, request: Request) 
             kind=payload.kind,
             nickname=payload.nickname,
             paper_width=payload.paper_width,
+        )
+    )
+    return {"printer": reg.model_dump()}
+
+
+@router.post("/register-usb-manual")
+async def register_usb_manual(
+    payload: ManualUsbRegistrationRequest, request: Request
+) -> dict:
+    """Register a USB printer by explicit VID/PID/endpoints when discovery
+    can't see it (vendor-specific class the scan skips, or CUPS holding the
+    device). Mirrors POST /devices/register-manual, which is network-only."""
+    registry = _registry(request)
+    descriptor = registry.add_manual_descriptor_usb(
+        vendor_id=payload.vendor_id,
+        product_id=payload.product_id,
+        in_ep=payload.in_ep,
+        out_ep=payload.out_ep,
+        serial=payload.serial,
+        label=payload.label,
+    )
+    reg = registry.register(
+        RegistrationRequest(
+            id=descriptor.id,
+            kind=payload.kind,
+            nickname=payload.nickname,
+            paper_width=payload.paper_width,
+            render_mode=payload.render_mode,
+            code_page=payload.code_page,
+            drawer_pin=payload.drawer_pin,
         )
     )
     return {"printer": reg.model_dump()}
