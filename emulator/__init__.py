@@ -13,5 +13,10 @@ real hardware — no device required:
 `python -m emulator` lets you pick a bank at startup and switch banks while
 idle. Every Purchase pops an approve / decline / cancel menu.
 
+Printer-side emulators live alongside:
+  - `python -m emulator.printer`        ESC/POS receipt printer (RAW 9100)
+  - `python -m emulator.label_printer`  TSPL label printer (RAW 9100)
+  - `python -m emulator.fiscal_epos`    Epson RT fiscal printer (HTTP)
+
 Run locally only (test tool). Not imported by the manager app.
 """

@@ -7,6 +7,7 @@ manager flow with no hardware:
 |---|---|---|
 | `python3 -m emulator` | **POS terminal** — any supported bank (SSI / Privat / PosAPI / BPOS / Oschad) | pick a bank, approve / decline / cancel charges from a console menu |
 | `python3 -m emulator.printer` | **ESC/POS thermal printer** (RAW/9100) | watch receipts render live in your browser |
+| `python3 -m emulator.label_printer` | **TSPL label printer** (RAW/9100) | watch labels render live in your browser |
 | `python3 -m emulator.fiscal_epos` | **Epson RT fiscal printer** (Fiscal ePOS-Print / EpsonFPMate, HTTP) | watch Documenti Commerciali render live; test Z/X + error 17 |
 
 ---
@@ -85,6 +86,64 @@ that's the only image command on the wire. The emulator:
 
 Wire-level detail and unhandled-command logging go to
 `printer-emulator.log`.
+
+---
+
+# TSPL label printer emulator (local test tool)
+
+Same idea as the ESC/POS printer emulator above, but for **label**
+printers. Dedicated label printers (Xprinter XP-246B/235B/237B class,
+TSC, GoDEX) speak **TSPL**, not ESC/POS — the manager sends them a
+`SIZE / GAP / DIRECTION / CLS / BITMAP / PRINT` job (see
+`src/services/tspl_render.py`). This emulator listens on RAW/9100,
+reconstructs each `BITMAP` into a PNG, and shows it in a **live web
+viewer** — newest label first. In-memory only.
+
+Byte-for-byte consistent with the manager's TSPL encoder:
+`tests/test_label_emulator.py` feeds real `image_to_tspl_bitmap` output
+through the emulator's parser and asserts pixel-perfect reconstruction.
+
+> **Local only.** Not imported by the manager app, not wired into any
+> route, not for production.
+
+## Install & run
+
+```bash
+cd barhandler-manager
+pip install -r emulator/requirements.txt
+python -m emulator.label_printer      # RAW sink on 0.0.0.0:9100, viewer on :8090
+```
+
+Open the viewer it prints (default <http://127.0.0.1:8090>). Options:
+`--host`/`--port` (RAW sink, default `0.0.0.0:9100`),
+`--web-host`/`--web-port` (viewer, default `127.0.0.1:8090`),
+`--label-width` / `--label-height` / `--gap` (mm — used in the register
+hint; actual width auto-detected from the `BITMAP` header),
+`--manager-port`, `--register`.
+
+> Uses RAW port 9100 (what LAN discovery scans) — so run **either** the
+> receipt emulator **or** the label emulator on 9100 at a time, not both.
+
+## Point the manager at it
+
+Discovery finds it as a network printer; register it as a **label** with
+the TSPL protocol (the console prints the exact `curl`):
+
+```bash
+curl -X POST http://127.0.0.1:9999/devices/register \
+  -H "X-Api-Key: bf11b47b-e139-4f03-8e02-9c2e692f91b8" \
+  -H "Content-Type: application/json" \
+  -d '{"id":"<id>","kind":"label","protocol":"tspl","paper_width":40,"label_height":30,"label_gap":2}'
+```
+
+**Localhost, no LAN?** Seed it directly and restart the manager:
+
+```bash
+python -m emulator.label_printer --register printers.json    # 127.0.0.1:9100 label entry
+```
+
+Then print a label from the app (or `POST /devices/<id>/test-print`) and
+it appears in the viewer instantly. Wire detail → `label-emulator.log`.
 
 ---
 

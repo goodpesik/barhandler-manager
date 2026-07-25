@@ -118,12 +118,18 @@ def test_discover_finds_loopback_terminal(monkeypatch, loopback_terminal: int) -
     with model + serial + kind heuristic from packageName."""
     import src.devices.scan as scan
 
-    # Point the scan at our test port and at 127.0.0.1/32.
-    monkeypatch.setattr(scan, "SSI_TCP_PORT", loopback_terminal)
+    # Scan ONLY our loopback SSI server: pin the host list to 127.0.0.1 and
+    # the port→adapters map to just the SSI probe on our ephemeral port. This
+    # keeps the test off the host's real /24 AND off the fixed bridge ports
+    # (8080/8888/7777), which can otherwise collide with a locally running
+    # emulator and yield an extra descriptor.
+    import ipaddress
+    loop = ipaddress.ip_network("127.0.0.1/32", strict=False)
+    ssi_adapters = scan._terminal_port_adapters()[scan.SSI_TCP_PORT]
+    monkeypatch.setattr(scan, "_local_subnet", lambda: loop)
+    monkeypatch.setattr(scan, "_local_subnets", lambda: [loop])
     monkeypatch.setattr(
-        scan,
-        "_local_subnet",
-        lambda: __import__("ipaddress").ip_network("127.0.0.1/32", strict=False),
+        scan, "_terminal_port_adapters", lambda: {loopback_terminal: ssi_adapters},
     )
 
     descriptors = discover_network_terminals(timeout=1.0, probe_timeout=2.0)
@@ -260,11 +266,16 @@ def test_discover_finds_pb_terminal(monkeypatch, loopback_pb_terminal: int) -> N
     our test port) and decodes vendor/model/serial via identify."""
     import src.devices.scan as scan
 
-    monkeypatch.setattr(scan, "PB_TCP_PORT", loopback_pb_terminal)
+    # Scan ONLY our loopback PB server — see test_discover_finds_loopback_terminal
+    # for why we also pin _terminal_port_adapters (avoids colliding with a
+    # locally running emulator on 8080/8888/7777).
+    import ipaddress
+    loop = ipaddress.ip_network("127.0.0.1/32", strict=False)
+    pb_adapters = scan._terminal_port_adapters()[scan.PB_TCP_PORT]
+    monkeypatch.setattr(scan, "_local_subnet", lambda: loop)
+    monkeypatch.setattr(scan, "_local_subnets", lambda: [loop])
     monkeypatch.setattr(
-        scan,
-        "_local_subnet",
-        lambda: __import__("ipaddress").ip_network("127.0.0.1/32", strict=False),
+        scan, "_terminal_port_adapters", lambda: {loopback_pb_terminal: pb_adapters},
     )
 
     descriptors = discover_network_terminals(timeout=1.0, probe_timeout=2.0)
@@ -324,13 +335,17 @@ def test_discover_finds_both_ssi_and_pb_on_same_host(
     ssi_server.start()
     pb_server.start()
     try:
-        monkeypatch.setattr(scan, "SSI_TCP_PORT", ssi_port)
-        monkeypatch.setattr(scan, "PB_TCP_PORT", pb_port)
-        monkeypatch.setattr(
-            scan,
-            "_local_subnet",
-            lambda: __import__("ipaddress").ip_network("127.0.0.1/32", strict=False),
-        )
+        import ipaddress
+        loop = ipaddress.ip_network("127.0.0.1/32", strict=False)
+        default_map = scan._terminal_port_adapters()
+        monkeypatch.setattr(scan, "_local_subnet", lambda: loop)
+        monkeypatch.setattr(scan, "_local_subnets", lambda: [loop])
+        # Only our two ephemeral servers — not the real /24 or the fixed
+        # bridge ports (which can collide with a running emulator).
+        monkeypatch.setattr(scan, "_terminal_port_adapters", lambda: {
+            ssi_port: default_map[scan.SSI_TCP_PORT],
+            pb_port: default_map[scan.PB_TCP_PORT],
+        })
 
         descriptors = discover_network_terminals(timeout=1.0, probe_timeout=2.0)
     finally:
