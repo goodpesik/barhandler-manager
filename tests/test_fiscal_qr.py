@@ -33,35 +33,34 @@ def _modules(url: str) -> int:
     return qr.modules_count + qr.border * 2
 
 
-def test_qr_readable_fits_and_consistent_across_widths():
+def test_qr_fits_both_widths_and_58_gets_bigger_modules():
     for url in URLS:
         m = _modules(url)
         b58 = _qr_box_size(m, PAPER_58)
         b80 = _qr_box_size(m, PAPER_80)
         for paper, box in ((PAPER_58, b58), (PAPER_80, b80)):
             assert box * m <= paper, f"QR overflows {paper}px paper ({box}*{m})"
-            # Ink-spread floor: typical fiscal URLs (that fit ≥7 dots/module)
-            # must print big modules so the 1-dot erosion + thermal bleed still
-            # scans. Only a QR too dense to fit 7 dots may fall back lower.
-            if PAPER_58 // m >= 7:
-                assert box >= 7, (
-                    f"QR only {box} dots/module on {paper}px for {url!r} — "
-                    f"too small to survive ink-spread on a cheap thermal head"
-                )
-        # Same physical size on 58 & 80 mm — never full-width on 80 mm (the
-        # user's "80 на всю ширину — зашквар"): well under the 80 mm width.
-        assert b58 == b80, f"QR size differs across widths ({b58} vs {b80})"
+            assert box >= 4
+        # 58 mm gets the ink-spread treatment: bigger modules (floor 7) so the
+        # 1-dot erosion + thermal bleed still scans — when the QR fits ≥7 dots.
+        if PAPER_58 // m >= 7:
+            assert b58 >= 7, f"58mm QR only {b58} dots/module — too small for ink-spread"
+        # 58 mm modules are at least as big as 80 mm's (never smaller).
+        assert b58 >= b80
+        # 80 mm stays as it was — never full-width (the "80 на всю ширину — зашквар").
         assert b80 * m <= 0.75 * PAPER_80, f"QR too wide on 80mm: {b80 * m}px"
 
 
-def test_box_size_floor_and_guard():
-    # Bigger modules for ink-spread tolerance: a typical 41-module fiscal QR
-    # gets ~8 dots/module (≈4 cm), the same on 58 and 80 mm.
+def test_80mm_unchanged_58mm_boosted():
+    # 80 mm keeps the OLD behaviour (target ~3 cm, floor 4) — it already scans;
+    # a typical 41-module QR → 6 dots/module, exactly as before the 58 mm fix.
+    assert _qr_box_size(41, PAPER_80) == 6
+    # 58 mm boosts the same QR to bigger modules for the cheap over-inking head.
     assert _qr_box_size(41, PAPER_58) >= 7
-    assert _qr_box_size(41, PAPER_58) == _qr_box_size(41, PAPER_80)
+    assert _qr_box_size(41, PAPER_58) > _qr_box_size(41, PAPER_80)
     # Dense QR that can't fit the floor: capped by the paper, still fits.
     assert _qr_box_size(70, PAPER_58) * 70 <= PAPER_58
-    # A short QR stays a sensible size, not the full 80 mm width.
+    # A short QR stays a sensible size on 80 mm, not the full width.
     assert _qr_box_size(25, PAPER_80) * 25 <= 0.75 * PAPER_80
     # Divide-by-zero guard.
     assert _qr_box_size(0, PAPER_58) >= 1
