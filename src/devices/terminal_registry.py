@@ -168,6 +168,30 @@ class TerminalRegistry:
         self._last_discovery[terminal_id] = descriptor
         return descriptor
 
+    def add_manual_descriptor_serial(
+        self,
+        port: str,
+        baudrate: int = 115200,
+        kind: TerminalKind = TerminalKind.privat_pos,
+        label: Optional[str] = None,
+    ) -> TerminalDescriptor:
+        """Stage a serial/COM terminal (USB terminal on Windows = virtual COM
+        port). Same JSON protocol as TCP, driven over the port. Caches into
+        `_last_discovery` so the existing `register()` path binds it — mirrors
+        add_manual_descriptor for network."""
+        from src.models.terminal import TerminalSerialAddress
+
+        terminal_id = make_terminal_id(TerminalTransport.serial, port, "")
+        descriptor = TerminalDescriptor(
+            id=terminal_id,
+            transport=TerminalTransport.serial,
+            label=label or f"{kind.value} @ {port}",
+            kind=kind,
+            com=TerminalSerialAddress(port=port, baudrate=baudrate),
+        )
+        self._last_discovery[terminal_id] = descriptor
+        return descriptor
+
     def register(self, req: TerminalRegistrationRequest) -> TerminalRegistration:
         descriptor = self._last_discovery.get(req.id)
         existing = self._registrations.get(req.id)

@@ -44,6 +44,17 @@ class ManualTerminalRequest(BaseModel):
     nickname: Optional[str] = None
     label: Optional[str] = None
 
+
+class SerialTerminalRequest(BaseModel):
+    """Body for POST /terminal/register-serial — a USB terminal reached over a
+    virtual COM port (Windows). Same ECR JSON as TCP, driven over the port."""
+
+    port: str = Field(min_length=1)      # "COM4" / "/dev/ttyACM0"
+    baudrate: int = Field(default=115200)
+    kind: TerminalKind = TerminalKind.privat_pos
+    nickname: Optional[str] = None
+    label: Optional[str] = None
+
 router = APIRouter()
 
 
@@ -160,6 +171,39 @@ async def register_manual(payload: ManualTerminalRequest, request: Request) -> d
         nickname=payload.nickname,
     )
     reg = registry.register(reg_req)
+    return {"terminal": reg.model_dump()}
+
+
+@router.post("/serial-scan")
+async def serial_scan(request: Request) -> dict:
+    """List available serial/COM ports (USB terminals on Windows show up as a
+    virtual COM port). Used by the dashboard's "Add terminal → USB" tab so the
+    operator can pick the port. Does NOT touch the LAN scan. No-op off Windows
+    / without pyserial → empty list."""
+    import asyncio
+
+    from src.devices.scan import list_serial_ports
+
+    ports = await asyncio.to_thread(list_serial_ports)
+    return {"ports": [d.model_dump() for d in ports]}
+
+
+@router.post("/register-serial")
+async def register_serial(payload: SerialTerminalRequest, request: Request) -> dict:
+    """Register a USB terminal by its virtual COM port. Mirrors
+    register-manual, but serial instead of TCP."""
+    registry = _registry(request)
+    descriptor = registry.add_manual_descriptor_serial(
+        port=payload.port,
+        baudrate=payload.baudrate,
+        kind=payload.kind,
+        label=payload.label,
+    )
+    reg = registry.register(TerminalRegistrationRequest(
+        id=descriptor.id,
+        kind=payload.kind,
+        nickname=payload.nickname,
+    ))
     return {"terminal": reg.model_dump()}
 
 

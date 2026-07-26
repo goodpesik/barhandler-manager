@@ -54,6 +54,11 @@ hiddenimports += [
     "win32api",
     "win32con",
     "pywintypes",
+    # pyserial — serial/COM transport for USB terminals; list_ports has a
+    # per-OS backend PyInstaller doesn't auto-detect.
+    "serial",
+    "serial.tools.list_ports",
+    "serial.tools.list_ports_windows",
 ]
 
 a = Analysis(

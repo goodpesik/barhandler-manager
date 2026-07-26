@@ -56,12 +56,28 @@ class TerminalKind(str, Enum):
 class TerminalTransport(str, Enum):
     network = "network"  # TCP 3000 framed or HTTP 3001 plain
     usb = "usb"  # USB-C with vendor driver — out of scope for now
+    # Serial / virtual COM port. On Windows a USB-connected terminal
+    # (Ingenico / PAX / Verifone) enumerates as a virtual COM port; the SAME
+    # ECR JSON protocol is spoken over it, just serial instead of TCP. This is
+    # how Checkbox PayLink & co. drive PrivatBank terminals over USB.
+    serial = "serial"
 
 
 class TerminalNetworkAddress(BaseModel):
     host: str
     port: int = 3000  # TCP framed default; HTTP variant uses 3001
     use_http: bool = False
+
+
+class TerminalSerialAddress(BaseModel):
+    """A virtual COM port (USB-connected terminal on Windows: COM3, etc.)."""
+
+    port: str                 # "COM4" on Windows, "/dev/ttyACM0" on Linux
+    baudrate: int = 115200    # 115200 or 9600 for PrivatBank terminals
+    # 8N1 — standard; kept explicit so the adapter/emulator agree.  # SPEC:
+    bytesize: int = 8
+    parity: str = "N"
+    stopbits: int = 1
 
 
 class TerminalDescriptor(BaseModel):
@@ -77,8 +93,9 @@ class TerminalDescriptor(BaseModel):
     label: str  # human-readable, e.g. "Mono POS @ 192.168.0.42"
     kind: Optional[TerminalKind] = None  # may be unknown until first probe
     model: Optional[str] = None  # from GetTerminalInfo: "Verifone X990" etc.
-    serial: Optional[str] = None  # terminalSerialNumber / pos_sn
+    serial: Optional[str] = None  # terminalSerialNumber / pos_sn (NOT the port)
     network: Optional[TerminalNetworkAddress] = None
+    com: Optional[TerminalSerialAddress] = None  # virtual COM port (USB)
 
 
 class MerchantBinding(BaseModel):
