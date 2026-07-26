@@ -44,6 +44,16 @@ from src.models.fiscal_receipt import FiscalReceipt, FiscalReceiptItem
 from src.services.bitmap_render import dots_for, image_to_gs_v_0
 
 
+def _qr_box_size(modules_across: int, paper_w: int) -> int:
+    """Dots per QR module: the largest integer box that fits the paper width,
+    capped at 8 so a short URL doesn't print a giant QR. Filling the width
+    (vs. a fixed ~160-dot target) keeps modules big enough that cheap 58 mm
+    thermal heads print a scannable code. `box * modules_across <= paper_w`
+    by construction, so the caller never has to resize (which would misalign
+    modules and break scanning)."""
+    return min(8, max(1, paper_w // max(1, modules_across)))
+
+
 def _format_money(value: float) -> str:
     return f"{value:.2f}"
 
@@ -212,20 +222,21 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
         # native printer.qr() bypasses our bitmap patch and was always
         # left-justified on this hardware.
         paper_w = 576 if width >= 48 else 384
-        # Target ~2×2 cm: 20 mm × 8 dots/mm ≈ 160 dots. Pick an INTEGER
-        # box_size (dots per module) sized to that target instead of a
-        # fixed box_size=6 — the old fixed value made the QR grow to 2-3×
-        # this size as the encoded URL got longer. An integer box keeps
-        # the modules crisp on the thermal head (no fractional dots).
-        TARGET_DOTS = 160
+        # Size the QR to FILL the paper width with the LARGEST integer
+        # dots-per-module that still fits. The old ~160-dot target left only
+        # 2-3 dots per module once the fiscal URL got long — cheap 58 mm
+        # thermal heads smear modules that small into an unscannable blob
+        # (80 mm / better heads still just barely read it). Bigger modules
+        # scan reliably. box_size is an integer and box_size * modules_across
+        # <= paper_w by construction, so we never resize (resizing a 1-bit QR
+        # misaligns modules and is exactly what breaks scanning). The QR's
+        # `border` already carries the required quiet zone.
         qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=2)
         qr.add_data(receipt.qr_url)
         qr.make(fit=True)
         modules_across = qr.modules_count + qr.border * 2
-        qr.box_size = max(2, round(TARGET_DOTS / modules_across))
+        qr.box_size = _qr_box_size(modules_across, paper_w)
         qr_img = qr.make_image(fill_color="black", back_color="white").convert("1")
-        if qr_img.width > paper_w:                 # safety on very narrow paper
-            qr_img = qr_img.resize((paper_w, paper_w))
         # Centre on the paper. A small bottom gap is baked into the canvas
         # instead of a trailing LF: GS v 0 already feeds its own height, and
         # an extra "\n" would add a firmware-dependent feed (the same issue
