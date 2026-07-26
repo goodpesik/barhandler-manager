@@ -65,9 +65,22 @@ curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/downl
 
 #### Windows
 
+**Інсталятор `.exe`** (не потребує адміністратора, не потребує Python):
+
+1. Завантаж **[barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe)**.
+2. Запусти подвійним кліком → **Далі → Встановити**. Готово.
+
+Інсталятор сам **видаляє будь-яку попередню версію** (у т.ч. стару Python-версію та її завдання автозапуску) і ставиться начисто, додає автозапуск при вході та пункт видалення у «Програми та засоби». Друк по USB йде через **стандартний драйвер принтера Windows** (не блокує принтер для інших програм), USB-термінал ПриватБанку — через віртуальний COM-порт.
+
+<details><summary>Альтернатива — Python-версія через PowerShell</summary>
+
 ```powershell
 irm https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.ps1 | iex
 ```
+
+Ставить Python + менеджер у `~/.barhandler-manager/` як Scheduled Task. USB-друк і USB-термінал у цій версії обмежені — для них бери `.exe`-інсталятор.
+
+</details>
 
 #### Android (Termux)
 
@@ -75,7 +88,7 @@ irm https://github.com/goodpesik/barhandler-manager/releases/latest/download/ins
 curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install-android.sh | bash
 ```
 
-Всі три інсталери: ставлять Python 3.11+, розпаковують менеджер у `~/.barhandler-manager/`, створюють virtualenv, ставлять залежності та реєструють службу автозапуску (launchd на macOS, systemd на Linux, termux-services на Android, Scheduled Task на Windows).
+Скриптові інсталери (macOS / Linux / Android та Windows-PowerShell): ставлять Python 3.11+, розпаковують менеджер у `~/.barhandler-manager/`, створюють virtualenv, ставлять залежності та реєструють службу автозапуску (launchd на macOS, systemd на Linux, termux-services на Android, Scheduled Task на Windows). Windows-`.exe` — самодостатній, Python не потрібен.
 
 ---
 
@@ -93,17 +106,11 @@ curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/downl
 
 #### 🪟 Докладно, крок за кроком — Windows
 
-1. **Відкрий PowerShell від імені адміністратора.** Натисни клавішу `Win` (Пуск), набери `PowerShell`. У списку справа (або правою кнопкою по «Windows PowerShell») обери **«Запуск від імені адміністратора» / Run as administrator**.
-2. **Підтверди контроль облікових записів.** З'явиться темно-синє вікно *«Дозволити цьому застосунку вносити зміни?»* (UAC) — натисни **Так**.
-3. **Встав команду встановлення.** Скопіюй рядок нижче, встав у синє вікно PowerShell (правою кнопкою миші = вставити) і натисни `Enter`:
-   ```powershell
-   irm https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.ps1 | iex
-   ```
-4. **Що відбувається далі:** скрипт завантажує менеджер, за потреби ставить Python (може ненадовго відкритися окреме вікно інсталятора Python — дочекайся його завершення), і створює завдання автозапуску (Scheduled Task).
-5. **Дозвіл брандмауера.** Вискочить вікно *«Брандмауер Захисника Windows заблокував…»* — постав галочку **«Приватні мережі»** і натисни **«Дозволити доступ»**. Якщо вікно не поверх усього — воно **блимає внизу на панелі задач**, клікни по ньому щоб відкрити.
-6. **Готово.** Відкрий браузер → **http://localhost:9999/** — відкриється дашборд. Менеджер працює у фоні й стартує після входу в систему.
+1. **Завантаж інсталятор.** Відкрий **[barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe)** — файл ляже в теку «Завантаження».
+2. **Встанови.** Подвійний клік по `barhandler-setup.exe` → **Далі → Встановити**. Якщо Windows покаже синій екран *«Windows захистив ваш ПК» / SmartScreen* — натисни **«Докладніше» → «Виконати в будь-якому разі»** (файл без цифрового підпису, це нормально). Дозвіл адміністратора **не потрібен**.
+3. **Готово.** Інсталятор почистить стару версію (якщо була), поставить нову, увімкне автозапуск і сам запустить менеджер. Наприкінці відкриється браузер на **http://localhost:9999/** — дашборд.
 
-> **Порада:** якщо `http://localhost:9999/` не відкривається одразу після встановлення — зачекай 10–20 секунд (перший старт довший) і онови сторінку. Якщо не допомогло — відкрий у менеджері **📋 Логи** пізніше, або перезавантаж компʼютер (менеджер підніметься сам).
+> **Порада:** якщо дашборд не відкрився одразу — зачекай 10–20 секунд (перший старт довший) і онови сторінку. Видалити можна через **Пуск → Параметри → Програми → BarHandler Manager → Видалити** (або «Програми та засоби»).
 
 Після встановлення: `http://localhost:9999/` — дашборд, `http://localhost:9999/health` — liveness.
 
@@ -276,9 +283,22 @@ curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/downl
 
 #### Windows
 
+**`.exe` installer** (no administrator, no Python required):
+
+1. Download **[barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe)**.
+2. Double-click it → **Next → Install**. Done.
+
+The installer **removes any previous version** (including the old Python one and its auto-start task) and installs clean, adds logon auto-start and an entry in "Apps & features" for uninstall. USB printing goes through the **standard Windows printer driver** (doesn't lock the printer from other apps); the PrivatBank USB terminal works over a virtual COM port.
+
+<details><summary>Alternative — Python version via PowerShell</summary>
+
 ```powershell
 irm https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.ps1 | iex
 ```
+
+Installs Python + the manager into `~/.barhandler-manager/` as a Scheduled Task. USB printing and the USB terminal are limited in this build — use the `.exe` installer for those.
+
+</details>
 
 #### Android (Termux)
 
@@ -286,7 +306,7 @@ irm https://github.com/goodpesik/barhandler-manager/releases/latest/download/ins
 curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install-android.sh | bash
 ```
 
-All three installers: install Python 3.11+, unpack the manager to `~/.barhandler-manager/`, create a virtualenv, install dependencies, and register an auto-start service (launchd on macOS, systemd on Linux, termux-services on Android, Scheduled Task on Windows).
+The script installers (macOS / Linux / Android and Windows-PowerShell): install Python 3.11+, unpack the manager to `~/.barhandler-manager/`, create a virtualenv, install dependencies, and register an auto-start service (launchd on macOS, systemd on Linux, termux-services on Android, Scheduled Task on Windows). The Windows `.exe` is self-contained — no Python needed.
 
 After install: `http://localhost:9999/` for the dashboard, `http://localhost:9999/health` for liveness.
 
