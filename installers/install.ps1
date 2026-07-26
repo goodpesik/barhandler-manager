@@ -223,6 +223,11 @@ $Settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Days 365)
 $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
 
+# Stop the task first — a *running* task can't be unregistered, and then
+# Register below hits 0x800700b7 (ERROR_ALREADY_EXISTS) on upgrade. Both the
+# Stop and Unregister are best-effort; -Force on Register is the real
+# guarantee that an existing task is overwritten rather than erroring.
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
 Register-ScheduledTask `
@@ -230,7 +235,8 @@ Register-ScheduledTask `
     -Action $Action `
     -Trigger $Trigger `
     -Settings $Settings `
-    -Principal $Principal | Out-Null
+    -Principal $Principal `
+    -Force | Out-Null
 
 Start-ScheduledTask -TaskName $TaskName
 
