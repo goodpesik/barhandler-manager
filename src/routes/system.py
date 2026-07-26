@@ -29,6 +29,8 @@ router = APIRouter()
 
 IS_WIN = os.name == "nt"
 
+from src.config import APP_DIR
+
 _INSTALL_DIR = Path.home() / ".barhandler-manager"
 _UPDATE_LOG = _INSTALL_DIR / "update.log"
 
@@ -182,8 +184,11 @@ async def trigger_update() -> dict:
     }
 
 
+# bhm.log is written next to the running app (APP_DIR) — the .exe's folder
+# when frozen, the install root otherwise (which equals ~/.barhandler-manager
+# for the Python install). boot/update logs are Python-install artifacts.
 _LOG_SOURCES = {
-    "bhm": _INSTALL_DIR / "bhm.log",
+    "bhm": APP_DIR / "bhm.log",
     "boot": _INSTALL_DIR / "bhm.boot.log",
     "update": _UPDATE_LOG,
 }

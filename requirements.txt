@@ -5,6 +5,11 @@ python-escpos>=3.1
 pydantic>=2.0
 pyyaml>=6.0
 zeroconf>=0.131.0
+
+# Windows-only: print via the native spooler (win32print RAW) so USB
+# printers work through their normal Windows driver — no WinUSB/Zadig,
+# non-exclusive (other apps keep printing). libusb stays for Mac/Linux.
+pywin32>=306; sys_platform == "win32"
 # Used by cli.py for the live operator dashboard. Pure-Python, ~1 MB,
 # also a convenient dep to have around for any future TUI work.
 rich>=13.0

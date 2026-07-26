@@ -47,6 +47,13 @@ hiddenimports += [
     "uvicorn.protocols.websockets.auto",
     "uvicorn.lifespan.on",
     "engineio.async_drivers.aiohttp",
+    # pywin32 — escpos.printer.Win32Raw imports win32print lazily; PyInstaller
+    # can't see that, so pull the modules in explicitly (its hooks then bundle
+    # pywintypes/pythoncom DLLs). No-op on the Windows build if unused.
+    "win32print",
+    "win32api",
+    "win32con",
+    "pywintypes",
 ]
 
 a = Analysis(

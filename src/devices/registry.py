@@ -233,9 +233,11 @@ class PrinterRegistry:
             return device
         reg = self.get_registration(printer_id)
         device = self._build_device(reg)
-        if reg.descriptor.transport == PrinterTransport.usb.value:
-            await device.connect()
-        elif reg.descriptor.transport == PrinterTransport.network.value:
+        if reg.descriptor.transport in (
+            PrinterTransport.usb.value,
+            PrinterTransport.network.value,
+            PrinterTransport.windows_spooler.value,
+        ):
             await device.connect()
         # bluetooth: Phase 2 — device stays disconnected
         self._devices[printer_id] = device
@@ -273,6 +275,12 @@ class PrinterRegistry:
         elif transport == "network":
             net = descriptor.network
             cfg.update({"connection": "network", "host": net.host, "port": net.port})
+        elif transport == "windows_spooler":
+            win = descriptor.windows
+            cfg.update({
+                "connection": "windows_spooler",
+                "printer_name": win.printer_name if win else "",
+            })
         elif transport == "bluetooth":
             raise NotImplementedError("bluetooth transport is Phase 2")
         return PrinterDevice(descriptor.id, cfg)
