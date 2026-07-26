@@ -18,7 +18,7 @@ except ImportError:
 
 import uvicorn
 
-from src.config import load_config
+from src.config import APP_DIR, load_config
 from src.server import create_app
 
 config = load_config()
@@ -42,7 +42,7 @@ def _configure_logging(cfg: dict) -> None:
     backup_count = int(logging_cfg.get("backup_count", 5))
     level = logging_cfg.get("level", "INFO").upper()
 
-    log_path = Path(__file__).resolve().parent / "bhm.log"
+    log_path = APP_DIR / "bhm.log"
     handler = logging.handlers.RotatingFileHandler(
         log_path,
         maxBytes=max_bytes,
@@ -84,9 +84,7 @@ if __name__ == "__main__":
     import sys
 
     if sys.stdout is None or sys.stderr is None:
-        _devlog = open(
-            Path(__file__).resolve().parent / "bhm.log", "a", encoding="utf-8"
-        )
+        _devlog = open(APP_DIR / "bhm.log", "a", encoding="utf-8")
         if sys.stdout is None:
             sys.stdout = _devlog
         if sys.stderr is None:
