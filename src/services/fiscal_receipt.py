@@ -38,7 +38,7 @@ printed by Vchasno Kasa). We try to match that layout as closely as a
 from __future__ import annotations
 
 import qrcode
-from PIL import Image
+from PIL import Image, ImageFilter
 
 from src.models.fiscal_receipt import FiscalReceipt, FiscalReceiptItem
 from src.services.bitmap_render import dots_for, image_to_gs_v_0
@@ -47,17 +47,28 @@ from src.services.bitmap_render import dots_for, image_to_gs_v_0
 def _qr_box_size(modules_across: int, paper_w: int) -> int:
     """Dots per QR module.
 
-    Target a fixed physical size (~3 cm) so the QR looks the SAME sensible
-    size on 58 mm and 80 mm — filling the paper width would print a huge QR on
-    80 mm. But floor at 4 dots/module: below that a cheap 58 mm thermal head
-    smears the modules into an unscannable blob (this was the bug — the old
-    ~160-dot target dropped long fiscal URLs to 2-3 dots/module). Never wider
-    than the paper, so `box * modules_across <= paper_w` and we never resize
-    (resizing a 1-bit QR misaligns modules and breaks scanning)."""
-    TARGET_DOTS = 240  # ~3 cm at 8 dots/mm
+    Cheap 58 mm heads over-ink: every black module bleeds ~1-2 dots outward
+    and, at the old ~6-dot modules, the white gaps close and the whole code
+    merges into one unscannable blob. We proved this by *decoding a real
+    failed print* — it was ~64 % black (a clean QR is ~50 %) and no decoder
+    could read it, while our source bitmap decoded fine and only failed once
+    we simulated ≥2 dots of bleed.
+
+    Two changes fix it together: (1) bigger modules here — target ~4 cm so a
+    fixed ~2-dot bleed is a smaller fraction, floored at 7 dots; (2) ink-spread
+    compensation in the renderer (erode black by 1 dot). The floor matters
+    *with* the erosion: below ~7 dots the 1-dot erosion eats too much and a
+    *clean* printer stops scanning (verified — box 6 + erode reads a bleeding
+    print but not a crisp one; box ≥ 7 + erode reads both).
+
+    Same physical size on 58 and 80 mm (filling 80 mm would print a giant QR);
+    never wider than the paper, so `box * modules_across <= paper_w` and we
+    never resize a 1-bit QR (which misaligns modules and breaks scanning)."""
+    TARGET_DOTS = 320  # ~4 cm at 8 dots/mm
     m = max(1, modules_across)
-    box = max(4, round(TARGET_DOTS / m))   # readable floor
-    return max(1, min(box, paper_w // m))  # but never overflow the paper
+    fit = max(1, paper_w // m)               # largest that still fits the paper
+    box = max(7, round(TARGET_DOTS / m))     # readable floor for ink-spread comp
+    return max(1, min(box, fit))             # but never overflow the paper
 
 
 def _format_money(value: float) -> str:
@@ -235,21 +246,40 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
         # (80 mm / better heads still just barely read it). Bigger modules
         # scan reliably. box_size is an integer and box_size * modules_across
         # <= paper_w by construction, so we never resize (resizing a 1-bit QR
-        # misaligns modules and is exactly what breaks scanning). The QR's
-        # `border` already carries the required quiet zone.
-        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=2)
+        # misaligns modules and is exactly what breaks scanning).
+        #
+        # border=4: the ISO/IEC 18004 quiet zone is FOUR modules on every
+        # side. We shipped border=2 and phones refused to scan — the QR sat
+        # right against the dashed separator with no breathing room. Four
+        # modules is the standard minimum and the single most reliable fix
+        # for "printed fine but won't scan". (It doesn't shrink the modules —
+        # _qr_box_size keeps the same physical size, it just adds white.)
+        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=4)
         qr.add_data(receipt.qr_url)
         qr.make(fit=True)
         modules_across = qr.modules_count + qr.border * 2
         qr.box_size = _qr_box_size(modules_across, paper_w)
         qr_img = qr.make_image(fill_color="black", back_color="white").convert("1")
-        # Centre on the paper. A small bottom gap is baked into the canvas
-        # instead of a trailing LF: GS v 0 already feeds its own height, and
-        # an extra "\n" would add a firmware-dependent feed (the same issue
-        # fixed for text lines in the bitmap pipeline).
-        bottom_gap = 8
-        canvas = Image.new("1", (paper_w, qr_img.height + bottom_gap), 1)
-        canvas.paste(qr_img, ((paper_w - qr_img.width) // 2, 0))
+        # Ink-spread compensation: thin every black module by one printer dot.
+        # A cheap 58 mm head bleeds black outward ~1-2 dots; printing the
+        # modules a dot thinner cancels that so the white gaps survive and the
+        # code scans (proven by decoding a real failed print + a bleed
+        # simulation — box>=7 modules keep this from over-thinning a crisp
+        # printer). MaxFilter(3) grows white / shrinks black by 1 px.
+        qr_img = (
+            qr_img.convert("L")
+            .filter(ImageFilter.MaxFilter(3))
+            .point(lambda p: 255 if p >= 128 else 0)
+            .convert("1")
+        )
+        # Centre on the paper, with a little vertical padding above and below
+        # so the quiet zone survives contact with the surrounding text/lines.
+        # The gaps are baked into the canvas instead of trailing LFs: GS v 0
+        # already feeds its own height, and an extra "\n" would add a
+        # firmware-dependent feed (the same issue fixed for text lines).
+        top_gap, bottom_gap = 8, 8
+        canvas = Image.new("1", (paper_w, qr_img.height + top_gap + bottom_gap), 1)
+        canvas.paste(qr_img, ((paper_w - qr_img.width) // 2, top_gap))
         printer._raw(image_to_gs_v_0(canvas))
 
     # ---- Pos footer ----

@@ -26,7 +26,8 @@ URLS = [
 
 
 def _modules(url: str) -> int:
-    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=2)
+    # border=4 mirrors the ISO quiet zone the renderer now uses.
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=4)
     qr.add_data(url)
     qr.make(fit=True)
     return qr.modules_count + qr.border * 2
@@ -39,21 +40,28 @@ def test_qr_readable_fits_and_consistent_across_widths():
         b80 = _qr_box_size(m, PAPER_80)
         for paper, box in ((PAPER_58, b58), (PAPER_80, b80)):
             assert box * m <= paper, f"QR overflows {paper}px paper ({box}*{m})"
-            assert box >= 4, (
-                f"QR only {box} dots/module on {paper}px for {url!r} — "
-                f"too small to scan on a thermal head"
-            )
-        # Fixed physical size: same on 58 & 80 (NOT full-width on 80mm),
-        # and ~3 cm rather than a giant QR eating the wide receipt.
+            # Ink-spread floor: typical fiscal URLs (that fit ≥7 dots/module)
+            # must print big modules so the 1-dot erosion + thermal bleed still
+            # scans. Only a QR too dense to fit 7 dots may fall back lower.
+            if PAPER_58 // m >= 7:
+                assert box >= 7, (
+                    f"QR only {box} dots/module on {paper}px for {url!r} — "
+                    f"too small to survive ink-spread on a cheap thermal head"
+                )
+        # Same physical size on 58 & 80 mm — never full-width on 80 mm (the
+        # user's "80 на всю ширину — зашквар"): well under the 80 mm width.
         assert b58 == b80, f"QR size differs across widths ({b58} vs {b80})"
-        assert b80 * m <= 320, f"QR too big on 80mm: {b80 * m}px"
+        assert b80 * m <= 0.75 * PAPER_80, f"QR too wide on 80mm: {b80 * m}px"
 
 
 def test_box_size_floor_and_guard():
-    # Dense QR: floored at 4 dots/module (readable) and still fits.
-    assert _qr_box_size(70, PAPER_58) >= 4
+    # Bigger modules for ink-spread tolerance: a typical 41-module fiscal QR
+    # gets ~8 dots/module (≈4 cm), the same on 58 and 80 mm.
+    assert _qr_box_size(41, PAPER_58) >= 7
+    assert _qr_box_size(41, PAPER_58) == _qr_box_size(41, PAPER_80)
+    # Dense QR that can't fit the floor: capped by the paper, still fits.
     assert _qr_box_size(70, PAPER_58) * 70 <= PAPER_58
-    # A short QR stays ~target width, not the full paper.
-    assert _qr_box_size(25, PAPER_80) * 25 <= 320
+    # A short QR stays a sensible size, not the full 80 mm width.
+    assert _qr_box_size(25, PAPER_80) * 25 <= 0.75 * PAPER_80
     # Divide-by-zero guard.
     assert _qr_box_size(0, PAPER_58) >= 1
