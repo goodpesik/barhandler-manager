@@ -65,12 +65,9 @@ curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/downl
 
 #### Windows
 
-**Інсталятор `.exe`** (не потребує адміністратора, не потребує Python):
+Встановлення виконується інсталятором **[barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe)** — прав адміністратора та Python не потребує.
 
-1. Завантаж **[barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe)**.
-2. Запусти подвійним кліком → **Далі → Встановити**. Готово.
-
-Інсталятор сам **видаляє будь-яку попередню версію** (у т.ч. стару Python-версію та її завдання автозапуску) і ставиться начисто, додає автозапуск при вході та пункт видалення у «Програми та засоби». Друк по USB йде через **стандартний драйвер принтера Windows** (не блокує принтер для інших програм), USB-термінал ПриватБанку — через віртуальний COM-порт.
+Інсталятор автоматично видаляє попередню версію (зокрема стару Python-версію та її завдання автозапуску), встановлює поточну начисто, налаштовує автозапуск при вході в систему та додає запис до розділу «Програми та засоби» для подальшого видалення. Друк по USB виконується через стандартний драйвер принтера Windows (принтер лишається доступним для інших програм), USB-термінал ПриватБанку працює через віртуальний COM-порт. Оновлення застосовуються кнопкою **«⬆ Оновити»** на дашборді.
 
 <details><summary>Альтернатива — Python-версія через PowerShell</summary>
 
@@ -104,13 +101,13 @@ curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/downl
 5. **Дозволи мережі.** macOS може показати вікно *«…хоче приймати вхідні з'єднання»* — натисни **Дозволити / Allow**. Воно з'явиться поверх екрана (може також блимнути іконкою в доку).
 6. **Готово.** Відкрий браузер і зайди на **http://localhost:9999/** — має відкритися дашборд менеджера. Термінал можна закривати, менеджер працює у фоні й сам стартує після перезавантаження.
 
-#### 🪟 Докладно, крок за кроком — Windows
+#### 🪟 Докладніше — Windows
 
-1. **Завантаж інсталятор.** Відкрий **[barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe)** — файл ляже в теку «Завантаження».
-2. **Встанови.** Подвійний клік по `barhandler-setup.exe` → **Далі → Встановити**. Якщо Windows покаже синій екран *«Windows захистив ваш ПК» / SmartScreen* — натисни **«Докладніше» → «Виконати в будь-якому разі»** (файл без цифрового підпису, це нормально). Дозвіл адміністратора **не потрібен**.
-3. **Готово.** Інсталятор почистить стару версію (якщо була), поставить нову, увімкне автозапуск і сам запустить менеджер. Наприкінці відкриється браузер на **http://localhost:9999/** — дашборд.
+1. **Завантаження інсталятора.** Файл [barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe) зберігається до теки «Завантаження».
+2. **Встановлення.** Запуск `barhandler-setup.exe` → **Далі → Встановити**. Якщо з'явиться попередження *«Windows захистив ваш ПК» (SmartScreen)* — оберіть **«Докладніше» → «Виконати в будь-якому разі»**: файл не має цифрового підпису, це очікувано. Права адміністратора не потрібні.
+3. **Завершення.** Інсталятор видаляє попередню версію (за наявності), встановлює поточну, вмикає автозапуск і запускає менеджер; наприкінці відкривається дашборд на **http://localhost:9999/**.
 
-> **Порада:** якщо дашборд не відкрився одразу — зачекай 10–20 секунд (перший старт довший) і онови сторінку. Видалити можна через **Пуск → Параметри → Програми → BarHandler Manager → Видалити** (або «Програми та засоби»).
+> **Примітка.** Якщо дашборд не відкрився одразу — зачекайте 10–20 секунд (перший старт триваліший) і оновіть сторінку. Видалення — через **Пуск → Параметри → Програми → BarHandler Manager → Видалити** (або «Програми та засоби»).
 
 Після встановлення: `http://localhost:9999/` — дашборд, `http://localhost:9999/health` — liveness.
 
@@ -283,12 +280,9 @@ curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/downl
 
 #### Windows
 
-**`.exe` installer** (no administrator, no Python required):
+Installation is performed by the **[barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe)** installer — it requires neither administrator rights nor Python.
 
-1. Download **[barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe)**.
-2. Double-click it → **Next → Install**. Done.
-
-The installer **removes any previous version** (including the old Python one and its auto-start task) and installs clean, adds logon auto-start and an entry in "Apps & features" for uninstall. USB printing goes through the **standard Windows printer driver** (doesn't lock the printer from other apps); the PrivatBank USB terminal works over a virtual COM port.
+The installer automatically removes any previous version (including the old Python install and its auto-start task), installs the current one clean, configures start-up at logon, and adds an entry to "Apps & features" for later removal. USB printing goes through the standard Windows printer driver (the printer stays available to other applications); the PrivatBank USB terminal works over a virtual COM port. Updates are applied with the **"⬆ Update"** button on the dashboard.
 
 <details><summary>Alternative — Python version via PowerShell</summary>
 
@@ -324,19 +318,13 @@ After install: `http://localhost:9999/` for the dashboard, `http://localhost:999
 5. **Network permission.** macOS may show *"…wants to accept incoming connections"* — click **Allow**. It appears on top of the screen (may also bounce an icon in the Dock).
 6. **Done.** Open a browser at **http://localhost:9999/** — the dashboard should load. You can close Terminal; the manager runs in the background and starts itself after a reboot.
 
-#### 🪟 Step by step — Windows
+#### 🪟 More detail — Windows
 
-1. **Open PowerShell as administrator.** Press `Win` (Start), type `PowerShell`. On the right (or right-click "Windows PowerShell") choose **Run as administrator**.
-2. **Confirm the UAC prompt.** A dark-blue *"Do you want to allow this app to make changes?"* window appears — click **Yes**.
-3. **Paste the install command.** Copy the line below, paste into the blue PowerShell window (right-click = paste), press `Enter`:
-   ```powershell
-   irm https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.ps1 | iex
-   ```
-4. **What happens next:** the script downloads the manager, installs Python if needed (a separate Python installer window may briefly open — let it finish), and creates the auto-start Scheduled Task.
-5. **Firewall permission.** A *"Windows Defender Firewall has blocked…"* window pops up — tick **Private networks** and click **Allow access**. If it isn't on top, it **blinks in the taskbar at the bottom** — click it to bring it up.
-6. **Done.** Open a browser → **http://localhost:9999/** — the dashboard loads. The manager runs in the background and starts after you log in.
+1. **Download.** The [barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe) file is saved to the Downloads folder.
+2. **Installation.** Run `barhandler-setup.exe` → **Next → Install**. If a *"Windows protected your PC" (SmartScreen)* prompt appears, choose **"More info" → "Run anyway"**: the file is unsigned, which is expected. Administrator rights are not required.
+3. **Completion.** The installer removes any previous version, installs the current one, enables auto-start, and launches the manager; the dashboard opens at **http://localhost:9999/**.
 
-> **Tip:** if `http://localhost:9999/` doesn't open right after install, wait 10–20 seconds (first start is slower) and refresh. Still nothing? Open **📋 Logs** in the dashboard later, or reboot (the manager comes back on its own).
+> **Note.** If the dashboard doesn't open immediately, wait 10–20 seconds (the first start is slower) and refresh. Uninstall via **Start → Settings → Apps → BarHandler Manager → Uninstall** (or "Apps & features").
 
 ### Auto-start after reboot
 
