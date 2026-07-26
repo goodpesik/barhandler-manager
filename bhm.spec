@@ -41,6 +41,13 @@ for pkg in ("uvicorn", "zeroconf", "escpos", "engineio", "socketio",
 # to `src/`, so preserve that exact layout inside the bundle.
 datas += [("src/assets", "src/assets")]
 
+# Ship the VERSION file at the bundle root. server.py / system.py read it via
+# `Path(__file__).resolve().parent.parent[/.parent] / "VERSION"`, which under a
+# PyInstaller onefile build resolves to _MEIPASS — so without this the exe
+# reports version "0.0.0" (the missing-file fallback). CI writes the real
+# version into VERSION before building.
+datas += [("VERSION", ".")]
+
 hiddenimports += [
     "uvicorn.loops.auto",
     "uvicorn.protocols.http.auto",
