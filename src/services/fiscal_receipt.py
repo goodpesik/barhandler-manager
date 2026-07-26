@@ -47,27 +47,29 @@ from src.services.bitmap_render import dots_for, image_to_gs_v_0
 def _qr_box_size(modules_across: int, paper_w: int) -> int:
     """Dots per QR module.
 
-    Cheap 58 mm heads over-ink: every black module bleeds ~1-2 dots outward
-    and, at the old ~6-dot modules, the white gaps close and the whole code
-    merges into one unscannable blob. We proved this by *decoding a real
-    failed print* — it was ~64 % black (a clean QR is ~50 %) and no decoder
-    could read it, while our source bitmap decoded fine and only failed once
-    we simulated ≥2 dots of bleed.
+    The 80 mm printer already scans fine — leave it EXACTLY as it was
+    (target ~3 cm, floor 4 dots, no ink-spread erosion). Only the cheap 58 mm
+    head needs the fix, so this branches on paper width and touches 80 mm not
+    at all.
 
-    Two changes fix it together: (1) bigger modules here — target ~4 cm so a
-    fixed ~2-dot bleed is a smaller fraction, floored at 7 dots; (2) ink-spread
-    compensation in the renderer (erode black by 1 dot). The floor matters
-    *with* the erosion: below ~7 dots the 1-dot erosion eats too much and a
-    *clean* printer stops scanning (verified — box 6 + erode reads a bleeding
-    print but not a crisp one; box ≥ 7 + erode reads both).
+    58 mm story: that head over-inks — every black module bleeds ~1-2 dots
+    outward and, at the old ~6-dot modules, the white gaps close and the whole
+    code merges into one unscannable blob. Proven by *decoding a real failed
+    print* — ~64 % black (a clean QR is ~50 %), no decoder could read it, while
+    our source bitmap decoded fine and only failed once ≥2 dots of bleed were
+    simulated. Fix (58 mm only): bigger modules (~4 cm, floor 7 dots so a
+    fixed ~2-dot bleed is a smaller fraction) plus ink-spread compensation in
+    the renderer (erode black 1 dot). The floor matters *with* the erosion —
+    below ~7 dots the erosion eats too much and a crisp printer stops scanning.
 
-    Same physical size on 58 and 80 mm (filling 80 mm would print a giant QR);
-    never wider than the paper, so `box * modules_across <= paper_w` and we
+    Never wider than the paper, so `box * modules_across <= paper_w` and we
     never resize a 1-bit QR (which misaligns modules and breaks scanning)."""
-    TARGET_DOTS = 320  # ~4 cm at 8 dots/mm
     m = max(1, modules_across)
     fit = max(1, paper_w // m)               # largest that still fits the paper
-    box = max(7, round(TARGET_DOTS / m))     # readable floor for ink-spread comp
+    if paper_w <= 384:                       # 58 mm — big modules for ink-spread
+        box = max(7, round(320 / m))         # ~4 cm, floor 7 dots
+    else:                                    # 80 mm — unchanged, it already scans
+        box = max(4, round(240 / m))         # ~3 cm, floor 4 dots (old behaviour)
     return max(1, min(box, fit))             # but never overflow the paper
 
 
@@ -239,45 +241,44 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
         # native printer.qr() bypasses our bitmap patch and was always
         # left-justified on this hardware.
         paper_w = 576 if width >= 48 else 384
-        # Size the QR to FILL the paper width with the LARGEST integer
-        # dots-per-module that still fits. The old ~160-dot target left only
-        # 2-3 dots per module once the fiscal URL got long — cheap 58 mm
-        # thermal heads smear modules that small into an unscannable blob
-        # (80 mm / better heads still just barely read it). Bigger modules
-        # scan reliably. box_size is an integer and box_size * modules_across
-        # <= paper_w by construction, so we never resize (resizing a 1-bit QR
-        # misaligns modules and is exactly what breaks scanning).
+        # 80 mm scans fine and MUST stay exactly as it was — so the two
+        # fixes below (wider quiet zone, bigger modules, ink-spread erosion)
+        # apply to 58 mm ONLY. On 80 mm this is byte-for-byte the old code.
+        narrow = paper_w <= 384  # 58 mm — the cheap head that over-inks
         #
-        # border=4: the ISO/IEC 18004 quiet zone is FOUR modules on every
-        # side. We shipped border=2 and phones refused to scan — the QR sat
-        # right against the dashed separator with no breathing room. Four
-        # modules is the standard minimum and the single most reliable fix
-        # for "printed fine but won't scan". (It doesn't shrink the modules —
-        # _qr_box_size keeps the same physical size, it just adds white.)
-        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=4)
+        # box_size is an integer and box_size * modules_across <= paper_w by
+        # construction, so we never resize (resizing a 1-bit QR misaligns
+        # modules and is exactly what breaks scanning).
+        #
+        # Quiet zone: 58 mm uses border=4 (ISO/IEC 18004 minimum) for a bit
+        # more breathing room; 80 mm keeps its original border=2.
+        border = 4 if narrow else 2
+        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=border)
         qr.add_data(receipt.qr_url)
         qr.make(fit=True)
         modules_across = qr.modules_count + qr.border * 2
         qr.box_size = _qr_box_size(modules_across, paper_w)
         qr_img = qr.make_image(fill_color="black", back_color="white").convert("1")
-        # Ink-spread compensation: thin every black module by one printer dot.
-        # A cheap 58 mm head bleeds black outward ~1-2 dots; printing the
-        # modules a dot thinner cancels that so the white gaps survive and the
-        # code scans (proven by decoding a real failed print + a bleed
-        # simulation — box>=7 modules keep this from over-thinning a crisp
-        # printer). MaxFilter(3) grows white / shrinks black by 1 px.
-        qr_img = (
-            qr_img.convert("L")
-            .filter(ImageFilter.MaxFilter(3))
-            .point(lambda p: 255 if p >= 128 else 0)
-            .convert("1")
-        )
-        # Centre on the paper, with a little vertical padding above and below
-        # so the quiet zone survives contact with the surrounding text/lines.
-        # The gaps are baked into the canvas instead of trailing LFs: GS v 0
-        # already feeds its own height, and an extra "\n" would add a
-        # firmware-dependent feed (the same issue fixed for text lines).
-        top_gap, bottom_gap = 8, 8
+        if narrow:
+            # Ink-spread compensation — 58 mm ONLY. That head bleeds black
+            # outward ~1-2 dots; printing the modules a dot thinner cancels it
+            # so the white gaps survive and the code scans (proven by decoding
+            # a real failed print + a bleed simulation; the box>=7 floor keeps
+            # this from over-thinning a crisp printer). MaxFilter(3) grows
+            # white / shrinks black by 1 px. 80 mm skips this entirely.
+            qr_img = (
+                qr_img.convert("L")
+                .filter(ImageFilter.MaxFilter(3))
+                .point(lambda p: 255 if p >= 128 else 0)
+                .convert("1")
+            )
+        # Centre on the paper. A bottom gap is baked into the canvas instead
+        # of a trailing LF: GS v 0 already feeds its own height, and an extra
+        # "\n" would add a firmware-dependent feed. On 58 mm add a matching
+        # top gap so the quiet zone survives contact with the text above; on
+        # 80 mm keep it exactly as it was (bottom gap only, pasted at y=0).
+        bottom_gap = 8
+        top_gap = 8 if narrow else 0
         canvas = Image.new("1", (paper_w, qr_img.height + top_gap + bottom_gap), 1)
         canvas.paste(qr_img, ((paper_w - qr_img.width) // 2, top_gap))
         printer._raw(image_to_gs_v_0(canvas))
