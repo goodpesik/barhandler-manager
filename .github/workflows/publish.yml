@@ -22,6 +22,9 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -156,3 +159,37 @@ jobs:
             dist/install.sh
             dist/install-android.sh
             dist/install.ps1
+
+  # Gate the Windows exe on a green test run. The source release above is
+  # unaffected (ships as before); this only ADDS bhm.exe to it.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: pytest tests/ -q
+
+  # Build the Windows exe on a Windows runner and attach it to the release
+  # created above (same vX.Y.Z tag → stable /releases/latest/download/bhm.exe).
+  build-windows-exe:
+    needs: [release, test]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}   # the freshly-cut release tag
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps + PyInstaller + libusb
+        run: pip install -r requirements.txt pyinstaller libusb-package
+      - name: Build exe
+        run: pyinstaller --noconfirm bhm.spec
+      - name: Attach exe to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release.outputs.tag }}
+          files: dist/bhm.exe

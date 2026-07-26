@@ -33,6 +33,10 @@ class PrinterTransport(str, Enum):
     usb = "usb"
     network = "network"
     bluetooth = "bluetooth"
+    # Windows print spooler (win32print RAW). The printer stays a NORMAL
+    # Windows printer usable by every app — no WinUSB/Zadig, non-exclusive.
+    # This is the DEFAULT USB path on Windows; libusb is Mac/Linux only.
+    windows_spooler = "windows_spooler"
 
 
 class PrintProtocol(str, Enum):
@@ -71,6 +75,12 @@ class BluetoothAddress(BaseModel):
     channel: int = 1
 
 
+class WindowsSpoolerAddress(BaseModel):
+    """A named printer in the Windows print spooler (win32print)."""
+
+    printer_name: str
+
+
 class PrinterDescriptor(BaseModel):
     """Everything the manager needs to reach a physical printer."""
 
@@ -84,6 +94,7 @@ class PrinterDescriptor(BaseModel):
     usb: Optional[UsbAddress] = None
     network: Optional[NetworkAddress] = None
     bluetooth: Optional[BluetoothAddress] = None
+    windows: Optional[WindowsSpoolerAddress] = None
 
 
 class PrinterRegistration(BaseModel):

@@ -192,6 +192,9 @@ class PrinterDevice:
 
     # ----- internals ---------------------------------------------------
 
+    def _is_spooler(self) -> bool:
+        return (self._config.get("connection") or "").lower() == "windows_spooler"
+
     def _build_printer(self):
         connection = (self._config.get("connection") or "usb").lower()
         if connection == "network":
@@ -200,6 +203,15 @@ class PrinterDevice:
             if not host:
                 raise ValueError("network printer requires host")
             return Network(host=host, port=port, profile=self._config.get("profile"))
+
+        if connection == "windows_spooler":
+            # Windows print spooler (win32print RAW). The printer is a normal
+            # Windows printer (its own driver / Generic-Text) — no WinUSB, and
+            # every other app can still print to it. We open a fresh spool
+            # document per receipt in the worker (Win32Raw = one doc per
+            # open/close), so we DON'T auto-open here.
+            from escpos.printer import Win32Raw
+            return Win32Raw(printer_name=self._config.get("printer_name") or "")
 
         # USB — PrinterRegistry supplies fully-resolved vendor/product/
         # endpoints from a discovered descriptor, so we never need to scan
@@ -342,27 +354,31 @@ class PrinterDevice:
     async def _worker(self) -> None:
         while True:
             job, done = await self._queue.get()
+            spooler = self._is_spooler()
             try:
                 # Pre-flight status — bail out before sending bytes so a
                 # paper-empty printer doesn't swallow an entire receipt
                 # silently. The check is best-effort: cheap clones just
                 # don't answer the status query and we proceed normally
                 # (the operator hears the printer click and notices).
-                status = self.check_status()
-                if status["supported"]:
-                    if status["paper"] == "empty":
-                        raise PrinterUnavailable(
-                            f"{self.name}: paper is out", code="out_of_paper",
-                        )
-                    if not status["online"]:
-                        # Most printers raise this when the cover is open
-                        # or the head is parked; we can't tell the two
-                        # apart from real-time status alone, but
-                        # "cover_open" is the more actionable hint.
-                        raise PrinterUnavailable(
-                            f"{self.name}: not online (cover or head)",
-                            code="cover_open",
-                        )
+                # Skipped for the Windows spooler: it's write-only, real-time
+                # status (DLE EOT) doesn't apply — the OS owns paper state.
+                if not spooler:
+                    status = self.check_status()
+                    if status["supported"]:
+                        if status["paper"] == "empty":
+                            raise PrinterUnavailable(
+                                f"{self.name}: paper is out", code="out_of_paper",
+                            )
+                        if not status["online"]:
+                            # Most printers raise this when the cover is open
+                            # or the head is parked; we can't tell the two
+                            # apart from real-time status alone, but
+                            # "cover_open" is the more actionable hint.
+                            raise PrinterUnavailable(
+                                f"{self.name}: not online (cover or head)",
+                                code="cover_open",
+                            )
 
                 # Render mode selection:
                 #   - "bitmap" (default): every text() call is rasterised
@@ -384,7 +400,17 @@ class PrinterDevice:
                 elif code_page:
                     with suppress(Exception):
                         self._printer.magic.force_encoding(self.code_page)
-                await job(self._printer)
+                if spooler:
+                    # Open one spool document, run the whole receipt into it,
+                    # then close so it flushes as a single Windows print job.
+                    self._printer.open(job_name="barhandler", raise_not_found=True)
+                    try:
+                        await job(self._printer)
+                    finally:
+                        with suppress(Exception):
+                            self._printer.close()
+                else:
+                    await job(self._printer)
                 if not done.done():
                     done.set_result(None)
             except OSError as exc:

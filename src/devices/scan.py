@@ -24,6 +24,7 @@ from src.models.printer import (
     PrinterDescriptor,
     PrinterTransport,
     UsbAddress,
+    WindowsSpoolerAddress,
     make_id,
 )
 
@@ -589,6 +590,41 @@ def discover_network_terminals(
     return asyncio.run(_probe_all())
 
 
+def discover_windows_printers() -> list[PrinterDescriptor]:
+    """Enumerate printers installed in the Windows print spooler.
+
+    This is the DEFAULT USB path on Windows: the operator installs the
+    printer's normal Windows driver (or a Generic/Text-Only driver) and it
+    shows up here — no WinUSB/Zadig, and it stays usable by every other app
+    (non-exclusive), unlike a libusb-claimed device. We send raw ESC/POS to
+    it through the spooler (`escpos.printer.Win32Raw`).
+
+    No-op on non-Windows (win32print import fails) — Mac/Linux use libusb.
+    """
+    try:
+        import win32print  # type: ignore
+    except Exception:  # noqa: BLE001 — not Windows / pywin32 absent
+        return []
+
+    found: list[PrinterDescriptor] = []
+    try:
+        flags = win32print.PRINTER_ENUM_LOCAL | win32print.PRINTER_ENUM_CONNECTIONS
+        for entry in win32print.EnumPrinters(flags, None, 1):
+            # level-1 tuple: (flags, description, name, comment)
+            name = entry[2]
+            if not name:
+                continue
+            found.append(PrinterDescriptor(
+                id=make_id(PrinterTransport.windows_spooler, name),
+                transport=PrinterTransport.windows_spooler,
+                label=name,
+                windows=WindowsSpoolerAddress(printer_name=name),
+            ))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Windows printer enumeration failed: %s", exc)
+    return found
+
+
 def discover_bluetooth() -> list[PrinterDescriptor]:
     """Best-effort Classic Bluetooth scrape.
 
@@ -665,6 +701,7 @@ def discover_all() -> list[PrinterDescriptor]:
     """
     out: list[PrinterDescriptor] = []
     for transport_name, fn in (
+        ("Windows spooler", discover_windows_printers),  # no-op off Windows
         ("USB", discover_usb),
         ("network", discover_network),
         ("Bluetooth", discover_bluetooth),

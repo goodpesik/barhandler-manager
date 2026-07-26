@@ -1,0 +1,52 @@
+# Windows exe — TEST channel (silent).
+#
+# Manual "Run workflow" button. Runs the test suite, then builds the Windows
+# exe and publishes it to a FIXED `nightly` PRE-RELEASE, overwriting the asset
+# each run. Because it's a prerelease, GitHub's /releases/latest ignores it —
+# so NO version bump, NO vX.Y.Z tag, and clients never see an update. Use this
+# to iterate on the exe as many times as you like.
+#
+# Stable download URL (for a test box):
+#   https://github.com/<repo>/releases/download/nightly/bhm.exe
+
+name: build-exe-dev
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: write  # create/update the nightly prerelease + upload the asset
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run tests
+        run: pytest tests/ -q
+
+  build-windows:
+    needs: test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps + PyInstaller + libusb
+        run: pip install -r requirements.txt pyinstaller libusb-package
+      - name: Build exe
+        run: pyinstaller --noconfirm bhm.spec
+      - name: Publish to nightly prerelease (silent — not "latest")
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          name: "nightly (test build — NOT a release)"
+          body: "Rolling Windows test build. Not a release; version unchanged. Overwritten on each run."
+          prerelease: true
+          files: dist/bhm.exe
