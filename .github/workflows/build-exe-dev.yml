@@ -48,7 +48,10 @@ jobs:
           choco install innosetup -y --no-progress
           $exe = (Resolve-Path dist\bhm.exe).Path
           $out = (Resolve-Path dist).Path
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=0.0.0 "/DExePath=$exe" "/O$out" installers\barhandler-setup.iss
+          # Show the real VERSION with a -nightly suffix so a test build never
+          # reads as "0.0.0" — it's still a prerelease, so not seen as "latest".
+          $ver = (Get-Content VERSION -Raw).Trim() + "-nightly"
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=$ver "/DExePath=$exe" "/O$out" installers\barhandler-setup.iss
       - name: Publish to nightly prerelease (silent — not "latest")
         uses: softprops/action-gh-release@v2
         with:
