@@ -19,6 +19,7 @@ import datetime as _dt
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -28,16 +29,24 @@ from pydantic import BaseModel, Field
 router = APIRouter()
 
 IS_WIN = os.name == "nt"
+# A frozen build is the standalone Windows .exe (PyInstaller). It has no
+# .barhandler-manager checkout and no update.sh/.ps1 — it updates by
+# downloading the latest installer and running it (see _build_update_argv).
+FROZEN = bool(getattr(sys, "frozen", False))
 
 from src.config import APP_DIR
 
 _INSTALL_DIR = Path.home() / ".barhandler-manager"
-_UPDATE_LOG = _INSTALL_DIR / "update.log"
+# The exe has no ~/.barhandler-manager; keep its update.log next to the exe
+# (APP_DIR), which the installer leaves in place across upgrades.
+_UPDATE_LOG = (APP_DIR if FROZEN else _INSTALL_DIR) / "update.log"
 
 
 @router.get("/version")
 async def get_version() -> dict:
-    version_file = Path("VERSION")
+    # Resolve VERSION relative to the code (bundled at the root of the exe's
+    # _MEIPASS too), not the cwd — the exe's cwd is arbitrary.
+    version_file = Path(__file__).resolve().parent.parent.parent / "VERSION"
     version = version_file.read_text().strip() if version_file.exists() else "unknown"
     return {"version": version}
 
@@ -52,6 +61,30 @@ def _build_update_argv() -> tuple[list[str], str]:
     The 2-second sleep gives the HTTP response time to reach the browser
     before the manager restarts out from under it.
     """
+    if IS_WIN and FROZEN:
+        # Standalone .exe: download the latest installer and run it silently.
+        # barhandler-setup.exe (Inno, PrivilegesRequired=lowest → no UAC)
+        # stops+cleans the running exe, installs fresh, and relaunches the
+        # manager itself. We just fetch it and hand off. -Wait keeps this
+        # detached PowerShell alive until the installer is done (the manager
+        # it kills is a different process, so this survives the restart).
+        inner = (
+            "Start-Sleep -Seconds 2; "
+            "$u = 'https://github.com/goodpesik/barhandler-manager"
+            "/releases/latest/download/barhandler-setup.exe'; "
+            "$tmp = Join-Path $env:TEMP 'barhandler-setup.exe'; "
+            "Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri $u -OutFile $tmp; "
+            "if ((Get-Item $tmp).Length -lt 100000) { "
+            "Write-Host 'update: installer download too small — nothing changed'; exit 1 }; "
+            "Start-Process -FilePath $tmp "
+            "-ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait"
+        )
+        argv = [
+            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-Command", inner,
+        ]
+        return argv, inner
+
     if IS_WIN:
         script = _INSTALL_DIR / "update.ps1"
         if script.exists():
