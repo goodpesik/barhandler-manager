@@ -92,8 +92,10 @@ begin
     'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"',
     '', SW_HIDE, ewWaitUntilTerminated, Rc);
 
-  { Remove the old Python install directory entirely (user: clean everything). }
-  DelTree(ExpandConstant('{userprofile}\.barhandler-manager'), True, True, True);
+  // Remove the old Python install directory entirely (user: clean
+  // everything). Inno has no userprofile constant, so expand the
+  // USERPROFILE environment variable instead.
+  DelTree(ExpandConstant('{%USERPROFILE}\.barhandler-manager'), True, True, True);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
