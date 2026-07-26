@@ -203,6 +203,74 @@ async def send_tcp(
             pass
 
 
+async def send_serial(
+    com,
+    message: dict,
+    *,
+    leading_delimiter: bool = False,
+    timeout: float = REQUEST_TIMEOUT_S,
+) -> dict:
+    """Same PB ECR JSON exchange as `send_tcp`, but over a serial/COM port.
+
+    On Windows a USB-connected terminal enumerates as a virtual COM port and
+    speaks the identical 0x00-terminated JSON — this is how Checkbox PayLink &
+    co. drive PrivatBank over USB. pyserial is blocking, so the whole
+    open→write→read→close runs in a thread executor. `com` is a
+    `TerminalSerialAddress` (port / baudrate / 8N1).
+    """
+    def _io() -> dict:
+        try:
+            import serial  # pyserial
+        except ImportError as exc:  # not installed (non-Windows dev box)
+            raise TerminalUnavailable(
+                "pyserial not available — serial transport unsupported here",
+                code="not_configured",
+            ) from exc
+        try:
+            ser = serial.Serial(
+                port=com.port, baudrate=com.baudrate, bytesize=com.bytesize,
+                parity=com.parity, stopbits=com.stopbits,
+                timeout=timeout, write_timeout=timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 — serial.SerialException etc.
+            raise TerminalUnavailable(
+                f"cannot open {com.port}: {exc}", code="unreachable",
+            ) from exc
+        try:
+            ser.reset_input_buffer()
+            ser.reset_output_buffer()
+            ser.write(encode_frame(message, leading_delimiter=leading_delimiter))
+            ser.flush()
+            buf = bytearray()
+            leading_skipped = False
+            while True:
+                b = ser.read(1)
+                if not b:
+                    raise TerminalUnavailable(
+                        f"timeout reading from {com.port}", code="timeout",
+                    )
+                if not leading_skipped and b == DELIMITER_BYTE and not buf:
+                    leading_skipped = True   # skip the handshake leading 0x00
+                    continue
+                buf += b
+                if b == DELIMITER_BYTE:
+                    break
+            try:
+                return decode_frame(bytes(buf))
+            except FrameError as exc:
+                raise TerminalUnavailable(
+                    f"malformed serial response from {com.port}: {exc}",
+                    code="protocol_error",
+                ) from exc
+        finally:
+            try:
+                ser.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return await asyncio.wait_for(asyncio.to_thread(_io), timeout=timeout + 3)
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -302,6 +370,12 @@ class PrivatBankTerminalAdapter(TerminalAdapter):
         self, message: dict, *, leading_delimiter: bool = False,
         timeout: float = REQUEST_TIMEOUT_S,
     ) -> dict:
+        # USB terminal → serial/COM port; otherwise TCP. Same JSON either way.
+        com = getattr(self.descriptor, "com", None)
+        if com is not None:
+            return await send_serial(
+                com, message, leading_delimiter=leading_delimiter, timeout=timeout,
+            )
         host, port = self._addr()
         return await send_tcp(
             host, port, message,

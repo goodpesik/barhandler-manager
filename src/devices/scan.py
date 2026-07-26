@@ -625,6 +625,46 @@ def discover_windows_printers() -> list[PrinterDescriptor]:
     return found
 
 
+def list_serial_ports() -> list:
+    """List serial/COM ports as candidate USB terminals.
+
+    On Windows a USB-connected PrivatBank/Ingenico/PAX terminal enumerates as
+    a virtual COM port; the same ECR JSON is spoken over it. We only LIST the
+    ports (never probe — writing to an arbitrary COM could disturb another
+    serial device); the operator picks the port + bank in the dashboard's
+    "Add terminal manually → USB" tab. Empty list off Windows / no pyserial.
+
+    Kept OUT of the network terminal scan on purpose so the LAN discovery
+    stays untouched.
+    """
+    try:
+        from serial.tools import list_ports  # pyserial
+    except Exception:  # noqa: BLE001 — pyserial absent
+        return []
+    from src.models.terminal import (
+        TerminalDescriptor,
+        TerminalSerialAddress,
+        TerminalTransport,
+        make_terminal_id,
+    )
+    out: list = []
+    try:
+        for p in list_ports.comports():
+            name = p.device  # "COM4" (Windows) / "/dev/ttyACM0" (Linux)
+            desc = (getattr(p, "description", "") or "").strip()
+            label = name + (f" — {desc}" if desc and desc.lower() != "n/a" else "")
+            out.append(TerminalDescriptor(
+                id=make_terminal_id(TerminalTransport.serial, name),
+                transport=TerminalTransport.serial,
+                label=label,
+                model=desc or None,
+                com=TerminalSerialAddress(port=name),
+            ))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("serial port listing failed: %s", exc)
+    return out
+
+
 def discover_bluetooth() -> list[PrinterDescriptor]:
     """Best-effort Classic Bluetooth scrape.
 

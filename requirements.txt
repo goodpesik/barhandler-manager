@@ -10,6 +10,11 @@ zeroconf>=0.131.0
 # printers work through their normal Windows driver — no WinUSB/Zadig,
 # non-exclusive (other apps keep printing). libusb stays for Mac/Linux.
 pywin32>=306; sys_platform == "win32"
+
+# Serial/COM transport for USB-connected POS terminals (PrivatBank etc.):
+# on Windows a USB terminal enumerates as a virtual COM port and speaks the
+# same ECR JSON. Cross-platform, tiny — safe on Mac/Linux too.
+pyserial>=3.5
 # Used by cli.py for the live operator dashboard. Pure-Python, ~1 MB,
 # also a convenient dep to have around for any future TUI work.
 rich>=13.0

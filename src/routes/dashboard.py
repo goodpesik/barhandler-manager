@@ -207,51 +207,97 @@ _HTML_TEMPLATE = r"""<!doctype html>
   <div id="manual-terminal-modal" class="modal-backdrop" style="display:none;">
     <div class="modal">
       <h2 data-i18n="mt_title">Додати термінал вручну</h2>
-      <p class="modal-desc" data-i18n="mt_desc">
-        Резерв на випадок коли скан не побачив (CGNAT мобільного
-        оператора, hotspot планшета з нестандартним subnet, окрема
-        VLAN). IP терміналу дивись у його admin меню.
-      </p>
-      <label class="modal-row">
-        <span data-i18n="mt_host_label">IP / Host</span>
-        <input id="mt-host" type="text" data-i18n-ph="mt_host_ph" placeholder="10.245.122.201" />
-      </label>
-      <label class="modal-row">
-        <span data-i18n="mt_port_label">Port</span>
-        <input id="mt-port" type="number" value="3000" />
-      </label>
-      <label class="modal-row">
-        <span data-i18n="mt_bank_label">Банк</span>
-        <select id="mt-kind" onchange="mtKindChanged()">
-          <optgroup label="SSI (Servus)">
-            <option value="mono_pos">Monobank — SSI</option>
-            <option value="generic_ssi">Інший SSI / Other SSI</option>
-          </optgroup>
-          <optgroup label="PrivatBank JSON">
-            <option value="privat_pos">ПриватБанк — JSON</option>
-          </optgroup>
-          <optgroup label="Printec PosAPI">
-            <option value="raif_pos">Райффайзен — PosAPI</option>
-            <option value="pumb_pos">ПУМБ — PosAPI</option>
-            <option value="generic_posapi">Інший PosAPI</option>
-          </optgroup>
-          <optgroup label="BPOS">
-            <option value="pivdenny_pos">Південний — BPOS1</option>
-            <option value="sense_pos">Sense / Альфа — BPOS</option>
-            <option value="generic_bpos">Інший BPOS</option>
-          </optgroup>
-          <optgroup label="Oschad ECR">
-            <option value="oschad_pos">Ощадбанк — ECR</option>
-          </optgroup>
-        </select>
-      </label>
-      <label class="modal-row">
-        <span data-i18n="mt_nickname_label">Псевдонім (опційно)</span>
-        <input id="mt-nickname" type="text" data-i18n-ph="mt_nickname_ph" placeholder="Бар / Каса 1" />
-      </label>
-      <div class="modal-actions">
-        <button class="btn btn-default" data-i18n="btn_cancel" onclick="closeManualTerminalModal()">Скасувати</button>
-        <button id="mt-save" class="btn btn-update" data-i18n="btn_mt_save" onclick="saveManualTerminal()">Додати</button>
+
+      <div style="display:flex; gap:8px; margin-bottom:14px;">
+        <button id="mt-tabbtn-network" class="btn btn-default" data-i18n="mt_tab_network" onclick="mtTab('network')">🌐 Мережа</button>
+        <button id="mt-tabbtn-usb" class="btn btn-default" data-i18n="mt_tab_usb" onclick="mtTab('usb')">🔌 USB</button>
+      </div>
+
+      <!-- NETWORK tab -->
+      <div id="mt-tab-network">
+        <p class="modal-desc" data-i18n="mt_desc">
+          Резерв на випадок коли скан не побачив (CGNAT мобільного
+          оператора, hotspot планшета з нестандартним subnet, окрема
+          VLAN). IP терміналу дивись у його admin меню.
+        </p>
+        <label class="modal-row">
+          <span data-i18n="mt_host_label">IP / Host</span>
+          <input id="mt-host" type="text" data-i18n-ph="mt_host_ph" placeholder="10.245.122.201" />
+        </label>
+        <label class="modal-row">
+          <span data-i18n="mt_port_label">Port</span>
+          <input id="mt-port" type="number" value="3000" />
+        </label>
+        <label class="modal-row">
+          <span data-i18n="mt_bank_label">Банк</span>
+          <select id="mt-kind" onchange="mtKindChanged()">
+            <optgroup label="SSI (Servus)">
+              <option value="mono_pos">Monobank — SSI</option>
+              <option value="generic_ssi">Інший SSI / Other SSI</option>
+            </optgroup>
+            <optgroup label="PrivatBank JSON">
+              <option value="privat_pos">ПриватБанк — JSON</option>
+            </optgroup>
+            <optgroup label="Printec PosAPI">
+              <option value="raif_pos">Райффайзен — PosAPI</option>
+              <option value="pumb_pos">ПУМБ — PosAPI</option>
+              <option value="generic_posapi">Інший PosAPI</option>
+            </optgroup>
+            <optgroup label="BPOS">
+              <option value="pivdenny_pos">Південний — BPOS1</option>
+              <option value="sense_pos">Sense / Альфа — BPOS</option>
+              <option value="generic_bpos">Інший BPOS</option>
+            </optgroup>
+            <optgroup label="Oschad ECR">
+              <option value="oschad_pos">Ощадбанк — ECR</option>
+            </optgroup>
+          </select>
+        </label>
+        <label class="modal-row">
+          <span data-i18n="mt_nickname_label">Псевдонім (опційно)</span>
+          <input id="mt-nickname" type="text" data-i18n-ph="mt_nickname_ph" placeholder="Бар / Каса 1" />
+        </label>
+        <div class="modal-actions">
+          <button class="btn btn-default" data-i18n="btn_cancel" onclick="closeManualTerminalModal()">Скасувати</button>
+          <button id="mt-save" class="btn btn-update" data-i18n="btn_mt_save" onclick="saveManualTerminal()">Додати</button>
+        </div>
+      </div>
+
+      <!-- USB tab -->
+      <div id="mt-tab-usb" style="display:none;">
+        <p class="modal-desc" data-i18n="mt_usb_desc">
+          USB-термінал (ПриватБанк) на Windows — це віртуальний COM-порт.
+          Натисни «Пошук», обери порт і зареєструй. Термінал має бути в
+          режимі ПК-USB-ECR (увімкнути через підтримку ПриватБанку).
+        </p>
+        <div style="margin-bottom:12px;">
+          <button id="mt-serial-scan" class="btn btn-default" data-i18n="mt_usb_scan" onclick="scanSerialPorts(this)">🔍 Пошук USB-терміналів</button>
+        </div>
+        <label class="modal-row">
+          <span data-i18n="mt_usb_port_label">COM-порт</span>
+          <select id="mt-serial-port"><option value="" data-i18n="mt_usb_no_ports">— натисни «Пошук» —</option></select>
+        </label>
+        <label class="modal-row">
+          <span data-i18n="mt_usb_baud_label">Швидкість</span>
+          <select id="mt-serial-baud">
+            <option value="115200">115200</option>
+            <option value="9600">9600</option>
+          </select>
+        </label>
+        <label class="modal-row">
+          <span data-i18n="mt_bank_label">Банк</span>
+          <select id="mt-serial-kind">
+            <option value="privat_pos">ПриватБанк — JSON (COM)</option>
+          </select>
+        </label>
+        <label class="modal-row">
+          <span data-i18n="mt_nickname_label">Псевдонім (опційно)</span>
+          <input id="mt-serial-nick" type="text" data-i18n-ph="mt_nickname_ph" placeholder="Каса USB" />
+        </label>
+        <div class="modal-actions">
+          <button class="btn btn-default" data-i18n="btn_cancel" onclick="closeManualTerminalModal()">Скасувати</button>
+          <button id="mt-serial-save" class="btn btn-update" data-i18n="btn_mt_save" onclick="saveSerialTerminal()">Додати</button>
+        </div>
       </div>
     </div>
   </div>
@@ -435,6 +481,16 @@ _HTML_TEMPLATE = r"""<!doctype html>
       mt_host_ph: "10.245.122.201",
       mt_port_label: "Port",
       mt_bank_label: "Банк",
+      mt_tab_network: "🌐 Мережа",
+      mt_tab_usb: "🔌 USB",
+      mt_usb_desc: "USB-термінал (ПриватБанк) на Windows — це віртуальний COM-порт. Натисни «Пошук», обери порт і зареєструй. Термінал має бути в режимі ПК-USB-ECR (увімкнути через підтримку ПриватБанку).",
+      mt_usb_scan: "🔍 Пошук USB-терміналів",
+      mt_usb_port_label: "COM-порт",
+      mt_usb_baud_label: "Швидкість",
+      mt_usb_no_ports: "— натисни «Пошук» —",
+      mt_usb_none_found: "COM-портів не знайдено (постав драйвер / не Windows)",
+      mt_usb_found: "Знайдено портів: {n}",
+      mt_usb_pick_port: "Обери COM-порт",
       mt_opt_mono: "Monobank (SSI)",
       mt_opt_privat: "ПриватБанк (PB)",
       mt_opt_raif: "Райффайзен (SSI)",
@@ -547,6 +603,16 @@ _HTML_TEMPLATE = r"""<!doctype html>
       mt_host_ph: "10.245.122.201",
       mt_port_label: "Port",
       mt_bank_label: "Bank",
+      mt_tab_network: "🌐 Network",
+      mt_tab_usb: "🔌 USB",
+      mt_usb_desc: "A USB terminal (PrivatBank) on Windows is a virtual COM port. Click Scan, pick the port and register. The terminal must be in PC-USB-ECR mode (enable it via PrivatBank support).",
+      mt_usb_scan: "🔍 Scan USB terminals",
+      mt_usb_port_label: "COM port",
+      mt_usb_baud_label: "Baud",
+      mt_usb_no_ports: "— click Scan —",
+      mt_usb_none_found: "No COM ports found (install the driver / not Windows)",
+      mt_usb_found: "Ports found: {n}",
+      mt_usb_pick_port: "Pick a COM port",
       mt_opt_mono: "Monobank (SSI)",
       mt_opt_privat: "PrivatBank (PB)",
       mt_opt_raif: "Raiffeisen (SSI)",
@@ -745,7 +811,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
     const rows = (terminals?.terminals || []).map((reg) => {
       const d = reg.descriptor || {};
       const net = d.network || {};
-      const addr = net.host ? escHtml(net.host) + ":" + escHtml(net.port ?? "?") : escHtml(d.transport || "");
+      const addr = net.host
+        ? escHtml(net.host) + ":" + escHtml(net.port ?? "?")
+        : (d.com && d.com.port ? escHtml(d.com.port) + " (USB)" : escHtml(d.transport || ""));
       return "<tr>"
         + "<td class='id'>" + escHtml((d.id || "").slice(0, 12)) + "</td>"
         + "<td>" + escHtml(reg.nickname || d.label || "") + "</td>"
@@ -893,7 +961,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
     tb.innerHTML = list.map((d) => {
       const id = escHtml(d.id);
       const net = d.network || {};
-      const addr = net.host ? escHtml(net.host) + ":" + escHtml(net.port ?? "?") : escHtml(d.transport || "");
+      const addr = net.host
+        ? escHtml(net.host) + ":" + escHtml(net.port ?? "?")
+        : (d.com && d.com.port ? escHtml(d.com.port) + " (USB)" : escHtml(d.transport || ""));
       const opts = BANK_KINDS.map(([v, l]) =>
         "<option value='" + v + "'" + (v === d.kind ? " selected" : "") + ">" + escHtml(l) + "</option>").join("");
       return "<tr data-id='" + id + "'>"
@@ -1003,10 +1073,74 @@ _HTML_TEMPLATE = r"""<!doctype html>
     $("mt-port").value = "3000";
     $("mt-kind").value = "mono_pos";
     $("mt-nickname").value = "";
+    mtTab("network");
   }
 
   function closeManualTerminalModal() {
     $("manual-terminal-modal").style.display = "none";
+  }
+
+  function mtTab(name) {
+    const net = name === "network";
+    $("mt-tab-network").style.display = net ? "" : "none";
+    $("mt-tab-usb").style.display = net ? "none" : "";
+    $("mt-tabbtn-network").classList.toggle("btn-update", net);
+    $("mt-tabbtn-usb").classList.toggle("btn-update", !net);
+  }
+
+  // ---- USB (serial/COM) terminal — PrivatBank over USB ---------------------
+
+  async function scanSerialPorts(btn) {
+    btn.disabled = true;
+    btn.textContent = "…";
+    try {
+      const res = await api("POST", "/terminal/serial-scan", true);
+      const ports = res.ports || [];
+      const sel = $("mt-serial-port");
+      if (!ports.length) {
+        sel.innerHTML = '<option value="">' + escHtml(t("mt_usb_none_found")) + "</option>";
+        showToast(t("mt_usb_none_found"), "err");
+      } else {
+        sel.innerHTML = ports.map((p) => {
+          const port = (p.com && p.com.port) || "";
+          const label = p.label || port;
+          return '<option value="' + escHtml(port) + '">' + escHtml(label) + "</option>";
+        }).join("");
+        showToast(t("mt_usb_found", { n: ports.length }), "ok");
+      }
+    } catch (e) {
+      showToast(t("toast_scan_error", { err: e.message }), "err");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = t("mt_usb_scan");
+    }
+  }
+
+  async function saveSerialTerminal() {
+    const port = $("mt-serial-port").value;
+    const baudrate = Number($("mt-serial-baud").value) || 115200;
+    const kind = $("mt-serial-kind").value;
+    const nickname = $("mt-serial-nick").value.trim() || null;
+    if (!port) {
+      showToast(t("mt_usb_pick_port"), "err");
+      return;
+    }
+    const btn = $("mt-serial-save");
+    btn.disabled = true;
+    btn.textContent = t("btn_adding");
+    try {
+      await api("POST", "/terminal/register-serial", true, {
+        port, baudrate, kind, nickname,
+      });
+      showToast(t("toast_terminal_added"), "ok");
+      closeManualTerminalModal();
+      await refresh();
+    } catch (e) {
+      showToast(t("error_prefix", { err: e.message || e }), "err");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = t("btn_mt_save");
+    }
   }
 
   async function saveManualTerminal() {
