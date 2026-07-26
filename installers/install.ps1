@@ -223,6 +223,11 @@ $Settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit (New-TimeSpan -Days 365)
 $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
 
+# Stop the task first — a *running* task can't be unregistered, and then
+# Register below hits 0x800700b7 (ERROR_ALREADY_EXISTS) on upgrade. Both the
+# Stop and Unregister are best-effort; -Force on Register is the real
+# guarantee that an existing task is overwritten rather than erroring.
+Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
 
 Register-ScheduledTask `
@@ -230,7 +235,8 @@ Register-ScheduledTask `
     -Action $Action `
     -Trigger $Trigger `
     -Settings $Settings `
-    -Principal $Principal | Out-Null
+    -Principal $Principal `
+    -Force | Out-Null
 
 Start-ScheduledTask -TaskName $TaskName
 
@@ -282,11 +288,20 @@ try {
     Write-Host "✗ update: could not download install.ps1 (`$(`$_.Exception.Message))" -ForegroundColor Red
     exit 1
 }
-if (-not `$resp.Content -or `$resp.Content.Length -lt 100) {
+# GitHub serves release assets as application/octet-stream, so on PowerShell
+# 5.1 `\$resp.Content` comes back as a byte[] — interpolating that into a
+# string yields "60 35 10 ..." and Invoke-Expression chokes. Decode to text.
+if (`$resp.Content -is [byte[]]) {
+    `$code = [System.Text.Encoding]::UTF8.GetString(`$resp.Content)
+} else {
+    `$code = [string]`$resp.Content
+}
+if (`$code.Length -gt 0 -and `$code[0] -eq [char]0xFEFF) { `$code = `$code.Substring(1) }
+if (-not `$code -or `$code.Length -lt 100) {
     Write-Host '✗ update: empty installer downloaded — nothing changed' -ForegroundColor Red
     exit 1
 }
-Invoke-Expression "& { `$(`$resp.Content) } -Force"
+Invoke-Expression "& { `$code } -Force"
 "@
 
 # Write the .ps1 helpers as UTF-8 *with BOM*. These contain non-ASCII

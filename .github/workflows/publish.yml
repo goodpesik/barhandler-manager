@@ -188,8 +188,17 @@ jobs:
         run: pip install -r requirements.txt pyinstaller libusb-package
       - name: Build exe
         run: pyinstaller --noconfirm bhm.spec
-      - name: Attach exe to the release
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          $exe = (Resolve-Path dist\bhm.exe).Path
+          $out = (Resolve-Path dist).Path
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=${{ needs.release.outputs.version }} "/DExePath=$exe" "/O$out" installers\barhandler-setup.iss
+      - name: Attach exe + installer to the release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.release.outputs.tag }}
-          files: dist/bhm.exe
+          files: |
+            dist/bhm.exe
+            dist/barhandler-setup.exe
