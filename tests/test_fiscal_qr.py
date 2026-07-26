@@ -32,24 +32,28 @@ def _modules(url: str) -> int:
     return qr.modules_count + qr.border * 2
 
 
-def test_qr_readable_and_fits_on_both_widths():
+def test_qr_readable_fits_and_consistent_across_widths():
     for url in URLS:
         m = _modules(url)
-        for paper in (PAPER_58, PAPER_80):
-            box = _qr_box_size(m, paper)
-            assert box * m <= paper, (
-                f"QR overflows {paper}px paper ({box}*{m}) — would need a "
-                f"module-misaligning resize"
-            )
+        b58 = _qr_box_size(m, PAPER_58)
+        b80 = _qr_box_size(m, PAPER_80)
+        for paper, box in ((PAPER_58, b58), (PAPER_80, b80)):
+            assert box * m <= paper, f"QR overflows {paper}px paper ({box}*{m})"
             assert box >= 4, (
-                f"QR only {box} dots/module on {paper}px paper for {url!r} — "
+                f"QR only {box} dots/module on {paper}px for {url!r} — "
                 f"too small to scan on a thermal head"
             )
+        # Fixed physical size: same on 58 & 80 (NOT full-width on 80mm),
+        # and ~3 cm rather than a giant QR eating the wide receipt.
+        assert b58 == b80, f"QR size differs across widths ({b58} vs {b80})"
+        assert b80 * m <= 320, f"QR too big on 80mm: {b80 * m}px"
 
 
-def test_box_size_caps_and_floors():
-    # Very few modules → capped at 8 (no giant QR).
-    assert _qr_box_size(10, PAPER_58) == 8
-    # Very dense → shrinks to still fit, never divides by zero.
-    assert _qr_box_size(400, PAPER_58) * 400 <= PAPER_58 or _qr_box_size(400, PAPER_58) == 1
+def test_box_size_floor_and_guard():
+    # Dense QR: floored at 4 dots/module (readable) and still fits.
+    assert _qr_box_size(70, PAPER_58) >= 4
+    assert _qr_box_size(70, PAPER_58) * 70 <= PAPER_58
+    # A short QR stays ~target width, not the full paper.
+    assert _qr_box_size(25, PAPER_80) * 25 <= 320
+    # Divide-by-zero guard.
     assert _qr_box_size(0, PAPER_58) >= 1

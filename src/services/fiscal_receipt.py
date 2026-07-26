@@ -45,13 +45,19 @@ from src.services.bitmap_render import dots_for, image_to_gs_v_0
 
 
 def _qr_box_size(modules_across: int, paper_w: int) -> int:
-    """Dots per QR module: the largest integer box that fits the paper width,
-    capped at 8 so a short URL doesn't print a giant QR. Filling the width
-    (vs. a fixed ~160-dot target) keeps modules big enough that cheap 58 mm
-    thermal heads print a scannable code. `box * modules_across <= paper_w`
-    by construction, so the caller never has to resize (which would misalign
-    modules and break scanning)."""
-    return min(8, max(1, paper_w // max(1, modules_across)))
+    """Dots per QR module.
+
+    Target a fixed physical size (~3 cm) so the QR looks the SAME sensible
+    size on 58 mm and 80 mm — filling the paper width would print a huge QR on
+    80 mm. But floor at 4 dots/module: below that a cheap 58 mm thermal head
+    smears the modules into an unscannable blob (this was the bug — the old
+    ~160-dot target dropped long fiscal URLs to 2-3 dots/module). Never wider
+    than the paper, so `box * modules_across <= paper_w` and we never resize
+    (resizing a 1-bit QR misaligns modules and breaks scanning)."""
+    TARGET_DOTS = 240  # ~3 cm at 8 dots/mm
+    m = max(1, modules_across)
+    box = max(4, round(TARGET_DOTS / m))   # readable floor
+    return max(1, min(box, paper_w // m))  # but never overflow the paper
 
 
 def _format_money(value: float) -> str:
