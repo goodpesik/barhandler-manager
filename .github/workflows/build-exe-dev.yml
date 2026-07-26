@@ -42,6 +42,11 @@ jobs:
         run: pip install -r requirements.txt pyinstaller libusb-package
       - name: Build exe
         run: pyinstaller --noconfirm bhm.spec
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=0.0.0 /DExePath=dist\bhm.exe installers\barhandler-setup.iss
       - name: Publish to nightly prerelease (silent — not "latest")
         uses: softprops/action-gh-release@v2
         with:
@@ -49,4 +54,6 @@ jobs:
           name: "nightly (test build — NOT a release)"
           body: "Rolling Windows test build. Not a release; version unchanged. Overwritten on each run."
           prerelease: true
-          files: dist/bhm.exe
+          files: |
+            dist/bhm.exe
+            dist/barhandler-setup.exe
