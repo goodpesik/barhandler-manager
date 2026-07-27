@@ -13,7 +13,7 @@
 ;   ISCC.exe /DMyAppVersion=X.Y.Z /DExePath=dist\bhm.exe installers\barhandler-setup.iss
 ;   -> dist\barhandler-setup.exe
 
-#define MyAppName "BarHandler Manager"
+#define MyAppName "Handler Device Manager"
 #define MyAppPublisher "goodpesik"
 #define MyAppExeName "bhm.exe"
 #define MyAppUrl "http://localhost:9999/"

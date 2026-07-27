@@ -1,4 +1,4 @@
-# barhandler-manager
+# Handler Device Manager
 
 > 🇺🇦 **Українською нижче** / **[English below](#english)**
 
@@ -107,7 +107,7 @@ curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/downl
 2. **Встановлення.** Запуск `barhandler-setup.exe` → **Далі → Встановити**. Якщо з'явиться попередження *«Windows захистив ваш ПК» (SmartScreen)* — оберіть **«Докладніше» → «Виконати в будь-якому разі»**: файл не має цифрового підпису, це очікувано. Права адміністратора не потрібні.
 3. **Завершення.** Інсталятор видаляє попередню версію (за наявності), встановлює поточну, вмикає автозапуск і запускає менеджер; наприкінці відкривається дашборд на **http://localhost:9999/**.
 
-> **Примітка.** Якщо дашборд не відкрився одразу — зачекайте 10–20 секунд (перший старт триваліший) і оновіть сторінку. Видалення — через **Пуск → Параметри → Програми → BarHandler Manager → Видалити** (або «Програми та засоби»).
+> **Примітка.** Якщо дашборд не відкрився одразу — зачекайте 10–20 секунд (перший старт триваліший) і оновіть сторінку. Видалення — через **Пуск → Параметри → Програми → Handler Device Manager → Видалити** (або «Програми та засоби»).
 
 Після встановлення: `http://localhost:9999/` — дашборд, `http://localhost:9999/health` — liveness.
 
@@ -324,7 +324,7 @@ After install: `http://localhost:9999/` for the dashboard, `http://localhost:999
 2. **Installation.** Run `barhandler-setup.exe` → **Next → Install**. If a *"Windows protected your PC" (SmartScreen)* prompt appears, choose **"More info" → "Run anyway"**: the file is unsigned, which is expected. Administrator rights are not required.
 3. **Completion.** The installer removes any previous version, installs the current one, enables auto-start, and launches the manager; the dashboard opens at **http://localhost:9999/**.
 
-> **Note.** If the dashboard doesn't open immediately, wait 10–20 seconds (the first start is slower) and refresh. Uninstall via **Start → Settings → Apps → BarHandler Manager → Uninstall** (or "Apps & features").
+> **Note.** If the dashboard doesn't open immediately, wait 10–20 seconds (the first start is slower) and refresh. Uninstall via **Start → Settings → Apps → Handler Device Manager → Uninstall** (or "Apps & features").
 
 ### Auto-start after reboot
 

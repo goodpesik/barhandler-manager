@@ -239,7 +239,7 @@ def _build_dashboard() -> Panel:
     if not health:
         return Panel(
             Text("manager unreachable on " + DEFAULT_URL, style="bold red"),
-            title="barhandler-manager",
+            title="Handler Device Manager",
             border_style="red",
         )
 
@@ -308,7 +308,7 @@ def _build_dashboard() -> Panel:
     footer = Text("press Ctrl+C to exit", style="dim")
     return Panel(
         Group(header, Text(""), printers_table, Text(""), terminals_table, Text(""), footer),
-        title="barhandler-manager",
+        title="Handler Device Manager",
         border_style="green",
     )
 
@@ -330,7 +330,7 @@ def cmd_status(_args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="bhm",
-        description="barhandler-manager operator CLI",
+        description="Handler Device Manager operator CLI",
     )
     sub = parser.add_subparsers(dest="cmd")
 
