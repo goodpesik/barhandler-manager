@@ -83,11 +83,6 @@ if __name__ == "__main__":
     # on write, so route them to the rotating log file before use.
     import sys
 
-    # Frozen mac .app: register a login autostart LaunchAgent (the unsigned
-    # .dmg has no installer to do it). No-op on Windows/source runs.
-    from src.services.mac_autostart import ensure_launch_agent
-    ensure_launch_agent()
-
     if sys.stdout is None or sys.stderr is None:
         _devlog = open(APP_DIR / "bhm.log", "a", encoding="utf-8")
         if sys.stdout is None:

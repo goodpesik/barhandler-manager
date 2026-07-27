@@ -13,33 +13,15 @@ def _app_dir() -> Path:
     Frozen (PyInstaller onefile exe): `__file__` lives inside the temp
     `_MEIPASS` extraction dir, which is WIPED on every run — so config and
     data must live next to the .exe instead, or they'd vanish each restart
-    (and there'd be no config.yaml on first run → FileNotFoundError).
-
-    Windows: the directory that contains the .exe (its install dir under
-    %LocalAppData%, which is user-writable).
-
-    macOS (.app): the executable lives inside `BarhandlerManager.app/
-    Contents/MacOS/` — typically under /Applications, which ISN'T user-
-    writable. So the mac build keeps its data in `~/.barhandler-manager`,
-    the SAME place the curl|bash installer uses — the two installs share
-    config/printers/terminals, and either can drive the machine.
+    (and there'd be no config.yaml on first run → FileNotFoundError). We use
+    the directory that contains the .exe.
     """
     if getattr(sys, "frozen", False):
-        if sys.platform == "darwin":
-            return Path.home() / ".barhandler-manager"
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
 
 
 APP_DIR = _app_dir()
-# On a frozen mac .app APP_DIR is ~/.barhandler-manager, which may not exist
-# on first launch (no prior curl|bash install) — create it so the config /
-# registry writes below don't fail. Best-effort: a read-only location just
-# falls through to in-memory defaults in load_config().
-try:
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-except OSError:
-    pass
 # Backwards-compatible alias — some call sites imported this name.
 _INSTALL_ROOT = APP_DIR
 

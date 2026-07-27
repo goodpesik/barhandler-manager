@@ -57,14 +57,7 @@
 
 ### Встановлення
 
-#### macOS
-
-Два способи — обирай зручніший:
-
-- **Інсталятор `.dmg`** (подвійний клік): завантаж **[BarhandlerManager.dmg](https://github.com/goodpesik/barhandler-manager/releases/latest/download/BarhandlerManager.dmg)**, відкрий і перетягни **Barhandler Manager** до **Applications**. Перший запуск — **правий клік по застосунку → «Відкрити»** (macOS покаже «непідтверджений розробник»: застосунок без платного підпису Apple, це очікувано), потім ще раз «Відкрити». Працює у фоні, автозапуск при вході в систему. Дані — у `~/.barhandler-manager`.
-- **Або через термінал** (без жодних попереджень Gatekeeper): `curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash`
-
-#### Linux / Raspberry Pi
+#### macOS / Linux / Raspberry Pi
 
 ```bash
 curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash
@@ -279,14 +272,7 @@ Tested on: STMicro-class 58 mm USB, Epson TM-i (network), Xprinter XP-246B (48 m
 
 ### Install
 
-#### macOS
-
-Two options — whichever you prefer:
-
-- **`.dmg` installer** (double-click): download **[BarhandlerManager.dmg](https://github.com/goodpesik/barhandler-manager/releases/latest/download/BarhandlerManager.dmg)**, open it and drag **Barhandler Manager** to **Applications**. First launch is **right-click the app → Open** (macOS shows "unidentified developer" — the app isn't paid-Apple-signed, which is expected), then Open again. Runs in the background, auto-starts at login. Data lives in `~/.barhandler-manager`.
-- **Or via the terminal** (no Gatekeeper prompt at all): `curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash`
-
-#### Linux / Raspberry Pi
+#### macOS / Linux / Raspberry Pi
 
 ```bash
 curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash

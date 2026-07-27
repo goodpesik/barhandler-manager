@@ -62,37 +62,3 @@ jobs:
           files: |
             dist/bhm.exe
             dist/barhandler-setup.exe
-
-  # macOS .app → .dmg, TEST channel. Runs after build-windows so both jobs
-  # don't race to create the `nightly` release; this one only adds the .dmg.
-  build-macos:
-    needs: build-windows
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Install deps + PyInstaller + libusb
-        run: pip install -r requirements.txt pyinstaller libusb-package
-      - name: Build .app
-        run: pyinstaller --noconfirm bhm.spec
-      - name: Ad-hoc sign + package .dmg
-        run: |
-          APP="dist/BarhandlerManager.app"
-          # Ad-hoc signature (free, no Apple account) so Apple Silicon doesn't
-          # hard-block it as "damaged"; it's still "unidentified developer",
-          # so first launch is right-click → Open.
-          codesign --force --deep --sign - "$APP"
-          STAGE="$(mktemp -d)"
-          cp -R "$APP" "$STAGE/"
-          ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "Barhandler Manager" -srcfolder "$STAGE" \
-            -ov -format UDZO dist/BarhandlerManager.dmg
-      - name: Publish .dmg to nightly prerelease
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: nightly
-          name: "nightly (test build — NOT a release)"
-          prerelease: true
-          files: dist/BarhandlerManager.dmg
