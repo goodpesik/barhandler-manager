@@ -96,3 +96,31 @@ exe = EXE(
     runtime_tmpdir=None,   # default %TEMP%; can be pinned to the install dir later
     console=False,         # headless — no console window
 )
+
+# macOS: wrap the single headless binary in a .app so it double-clicks and
+# drags to /Applications. LSUIElement=True makes it a background agent (no
+# Dock icon, no menu bar) — it's a server, not a window. Data lives in
+# ~/.barhandler-manager (see src/config._app_dir), not inside the bundle,
+# because /Applications isn't user-writable. The .app is ad-hoc signed and
+# packaged into a .dmg in CI (see the macos job in the workflows).
+import sys as _sys
+
+if _sys.platform == "darwin":
+    try:
+        _ver = open("VERSION").read().strip() or "0.0.0"
+    except Exception:
+        _ver = "0.0.0"
+    app = BUNDLE(
+        exe,
+        name="BarhandlerManager.app",
+        icon=None,
+        bundle_identifier="com.goodpesik.barhandler-manager",
+        info_plist={
+            "CFBundleName": "Barhandler Manager",
+            "CFBundleDisplayName": "Barhandler Manager",
+            "CFBundleShortVersionString": _ver,
+            "CFBundleVersion": _ver,
+            "LSUIElement": True,          # background agent — no Dock icon
+            "NSHighResolutionCapable": True,
+        },
+    )
