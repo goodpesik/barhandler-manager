@@ -250,7 +250,7 @@ try {
         exit 0
     }
 } catch {}
-Write-Host '▸ starting barhandler-manager' -ForegroundColor Cyan
+Write-Host '▸ starting Handler Device Manager' -ForegroundColor Cyan
 Start-ScheduledTask -TaskName '$TaskName'
 Start-Sleep -Seconds 2
 try {
@@ -261,7 +261,7 @@ try {
 }
 "@
 $StopPs1 = @"
-Write-Host '▸ stopping barhandler-manager' -ForegroundColor Cyan
+Write-Host '▸ stopping Handler Device Manager' -ForegroundColor Cyan
 Stop-ScheduledTask -TaskName '$TaskName'
 "@
 $StatusPs1 = @"

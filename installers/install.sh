@@ -46,7 +46,7 @@ is_installed() {
 # --- short-circuit if already installed ------------------------------
 if is_installed && [ $FORCE -eq 0 ]; then
     if is_running; then
-        say "barhandler-manager is already installed and running at http://localhost:9999"
+        say "Handler Device Manager is already installed and running at http://localhost:9999"
         say "    → re-run with --force to upgrade to the latest release"
         exit 0
     else
@@ -345,7 +345,7 @@ EOF
         UNIT="/etc/systemd/system/${SERVICE_NAME}.service"
         sudo tee "$UNIT" >/dev/null <<EOF
 [Unit]
-Description=Barhandler Manager (local hardware bridge)
+Description=Handler Device Manager (local hardware bridge)
 After=network.target
 
 [Service]
@@ -402,7 +402,7 @@ if curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
     echo "✓ already running at http://localhost:9999"
     exit 0
 fi
-echo "▸ starting barhandler-manager"
+echo "▸ starting Handler Device Manager"
 if ! $SERVICE_CMD_START; then
     echo "⚠ service manager (launchctl/systemd) refused — falling back to direct spawn"
     # nohup keeps it alive after this shell closes; \`disown\` removes it
@@ -438,7 +438,7 @@ EOF
 
 cat > "$INSTALL_DIR/stop.sh" <<EOF
 #!/usr/bin/env bash
-echo "▸ stopping barhandler-manager"
+echo "▸ stopping Handler Device Manager"
 # Whichever route start.sh took (service manager vs direct spawn) we
 # want stop.sh to kill both — bootout is a no-op if not loaded, pkill
 # is a no-op if no process matches.

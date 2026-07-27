@@ -23,7 +23,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>barhandler-manager</title>
+<title>Handler Device Manager</title>
 <style>
   :root {
     --bg: #fafafa; --panel: #fff; --text: #1f2328; --muted: #6b7280;
@@ -173,7 +173,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
 <div class="wrap">
 
   <header>
-    <h1><span id="status-dot" class="dot"></span> barhandler-manager</h1>
+    <h1><span id="status-dot" class="dot"></span> Handler Device Manager</h1>
     <div class="meta">
       <span><span data-i18n="version_label">версія</span> <code id="version">—</code></span>
       <span><span data-i18n="updated_label">оновлено</span> <code id="updated">—</code></span>

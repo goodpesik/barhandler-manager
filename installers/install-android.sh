@@ -35,7 +35,7 @@ say "platform: Android (Termux)"
 # --- short-circuit if already installed ------------------------------
 if is_installed && [ $FORCE -eq 0 ]; then
     if is_running; then
-        say "barhandler-manager is already installed and running at http://localhost:9999"
+        say "Handler Device Manager is already installed and running at http://localhost:9999"
         say "    → re-run with --force to upgrade to the latest release"
         exit 0
     else
@@ -280,7 +280,7 @@ if curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
     echo "✓ already running at http://localhost:9999"
     exit 0
 fi
-echo "▸ starting barhandler-manager"
+echo "▸ starting Handler Device Manager"
 if ! sv up $SERVICE_NAME 2>/dev/null; then
     echo "⚠ runit not ready — spawning manager directly"
     (
