@@ -151,7 +151,17 @@ def _make_handler(state: PrinterState):
 
 
 def start_web_thread(host: str, port: int, state: PrinterState) -> ThreadingHTTPServer:
-    server = ThreadingHTTPServer((host, port), _make_handler(state))
+    # Viewer gets the same next-free-port fallback as the RAW sink, so a
+    # second emulator on the same host doesn't die on the viewer bind (8090).
+    last_exc = None
+    for candidate in range(port, port + 21):
+        try:
+            server = ThreadingHTTPServer((host, candidate), _make_handler(state))
+            break
+        except OSError as exc:
+            last_exc = exc
+    else:
+        raise OSError(f"no free web port in {port}..{port + 20} on {host!r}: {last_exc}")
     import threading
     threading.Thread(target=server.serve_forever, name="label-web", daemon=True).start()
     return server
@@ -285,6 +295,11 @@ def main() -> None:
             f"{args.port}[/] (дискавер сканує 9100–9102, тож знайде обидва)."
         )
     web = start_web_thread(args.web_host, args.web_port, state)
+    if web.server_port != args.web_port:
+        console.print(
+            f"[yellow]⚠ Веб-порт {args.web_port} зайнятий — вʼюер на "
+            f"{web.server_port}[/]."
+        )
     web_url = f"http://{args.web_host}:{web.server_port}"
 
     if args.register:
