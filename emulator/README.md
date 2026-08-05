@@ -121,8 +121,11 @@ Open the viewer it prints (default <http://127.0.0.1:8090>). Options:
 hint; actual width auto-detected from the `BITMAP` header),
 `--manager-port`, `--register`.
 
-> Uses RAW port 9100 (what LAN discovery scans) — so run **either** the
-> receipt emulator **or** the label emulator on 9100 at a time, not both.
+> Both emulators default to RAW port 9100. You can now run the receipt
+> **and** the label emulator together on one host: whichever starts second
+> finds 9100 busy and automatically steps to the next free port (9101/9102),
+> printing a notice. LAN discovery scans 9100–9102, so **both** show up in
+> Discover — register each with its role.
 
 ## Point the manager at it
 

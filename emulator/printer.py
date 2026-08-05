@@ -262,7 +262,13 @@ def main() -> None:
 
     state.on_notify(_notify)
 
-    start_server_thread(args.host, args.port, state, PAPER_DOTS[args.paper])
+    requested_port = args.port
+    args.port = start_server_thread(args.host, args.port, state, PAPER_DOTS[args.paper])
+    if args.port != requested_port:
+        console.print(
+            f"[yellow]⚠ RAW-порт {requested_port} зайнятий — слухаю на "
+            f"{args.port}[/] (дискавер сканує 9100–9102, тож знайде обидва)."
+        )
     web = start_web_thread(args.web_host, args.web_port, state)
     web_url = f"http://{args.web_host}:{web.server_port}"
 

@@ -2,8 +2,8 @@
 
 USB walks the bus and picks every device exposing a printer-class
 interface (`bInterfaceClass == 7`). Network combines mDNS browsing
-(printers that announce themselves) with a port-9100 scan of the host's
-own /24 (anything not announcing but listening on the raw print port).
+(printers that announce themselves) with a raw-print-port scan (9100–9102)
+of the host's own /24 (anything not announcing but listening on a raw port).
 Bluetooth stays best-effort for now — the cross-platform Python BT
 story is fiddly enough that the operator hand-registers paired devices.
 """
@@ -173,6 +173,11 @@ def discover_usb() -> list[PrinterDescriptor]:
 
 
 RAW_PRINT_PORT = 9100  # ESC/POS / PCL raw socket port, universal across vendors
+# Multi-port HP JetDirect units expose extra raw sinks on 9101/9102, and a
+# receipt + label printer (or their emulators) co-located on ONE host can only
+# hold 9100 once — the second falls back to the next port. Scanning this short
+# range lets both be discovered instead of only whichever grabbed 9100 first.
+RAW_PRINT_PORTS = (9100, 9101, 9102)
 IPP_PORT = 631
 MDNS_SERVICES = (
     "_pdl-datastream._tcp.local.",  # HP / generic raw-9100 printers
@@ -405,27 +410,32 @@ def _discover_mdns(timeout: float = 2.0) -> list[PrinterDescriptor]:
 
 
 def _discover_lan_scan(timeout: float = 0.3) -> list[PrinterDescriptor]:
-    """Probe every host on the local /24 for TCP 9100. Concurrent so the
-    full sweep finishes in roughly `timeout` seconds, not 254×timeout."""
+    """Probe every host on the local /24 for the raw print ports
+    (`RAW_PRINT_PORTS`, 9100–9102). Concurrent so the full sweep finishes in
+    roughly `timeout` seconds, not hosts×ports×timeout."""
     subnet = _local_subnet()
     if subnet is None:
         return []
     hosts = [str(h) for h in subnet.hosts()]
     found: list[PrinterDescriptor] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
-        future_to_host = {
-            pool.submit(_probe_tcp, host, RAW_PRINT_PORT, timeout): host
+        future_to_target = {
+            pool.submit(_probe_tcp, host, port, timeout): (host, port)
             for host in hosts
+            for port in RAW_PRINT_PORTS
         }
-        for future in concurrent.futures.as_completed(future_to_host):
-            host = future_to_host[future]
+        for future in concurrent.futures.as_completed(future_to_target):
+            host, port = future_to_target[future]
             try:
                 if not future.result():
                     continue
             except Exception:  # noqa: BLE001
                 continue
-            label = _reverse_dns(host) or f"Network printer {host}"
-            found.append(_network_descriptor(host, RAW_PRINT_PORT, label))
+            base = _reverse_dns(host) or f"Network printer {host}"
+            # Append the port for the non-default sinks so two printers on
+            # one host stay distinguishable in the registration picker.
+            label = base if port == RAW_PRINT_PORT else f"{base}:{port}"
+            found.append(_network_descriptor(host, port, label))
     return found
 
 

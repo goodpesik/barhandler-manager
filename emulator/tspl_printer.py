@@ -50,7 +50,12 @@ from PIL import Image
 # just a (small) Receipt whose paper_mm is its width. dots_to_mm's
 # `round(width_px / 8)` fallback already yields mm at 8 dots/mm (e.g.
 # 320 dots → 40 mm), so nothing label-specific is needed there.
-from .escpos_printer import PrinterState, Receipt, dots_to_mm  # noqa: F401
+from .escpos_printer import (  # noqa: F401
+    PrinterState,
+    Receipt,
+    bind_raw_socket,
+    dots_to_mm,
+)
 
 log = logging.getLogger("emulator.label")
 
@@ -247,10 +252,10 @@ async def _serve_client(
 
 
 async def run_server(
-    host: str, port: int, state: PrinterState, default_width: int
+    sock, state: PrinterState, default_width: int
 ) -> None:
     server = await asyncio.start_server(
-        lambda r, w: _serve_client(r, w, state, default_width), host, port
+        lambda r, w: _serve_client(r, w, state, default_width), sock=sock
     )
     async with server:
         await server.serve_forever()
@@ -258,12 +263,17 @@ async def run_server(
 
 def start_server_thread(
     host: str, port: int, state: PrinterState, default_width: int
-) -> threading.Thread:
-    """Run the TSPL server on its own asyncio loop in a daemon thread."""
+) -> int:
+    """Bind the RAW sink (with port fallback via ``bind_raw_socket``) and run
+    the TSPL server on its own asyncio loop in a daemon thread. Returns the
+    ACTUAL bound port — may differ from ``port`` when 9100 was already taken
+    (e.g. the receipt emulator is already running alongside)."""
+    sock = bind_raw_socket(host, port)
+    actual_port = sock.getsockname()[1]
 
     def _run() -> None:
-        asyncio.run(run_server(host, port, state, default_width))
+        asyncio.run(run_server(sock, state, default_width))
 
     thread = threading.Thread(target=_run, name="label-emulator-server", daemon=True)
     thread.start()
-    return thread
+    return actual_port
