@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -528,11 +529,43 @@ class _suppress:
         return True
 
 
+def bind_raw_socket(host: str, port: int, *, span: int = 20) -> socket.socket:
+    """Bind a listening TCP socket on ``host:port``, falling back to the next
+    free port (``port+1 … port+span``) when the desired one is already taken.
+
+    Why: both emulators default to RAW/9100, and the manager's LAN discovery
+    scans a small 9100+ range — so running the receipt and label emulators
+    together on one host used to leave the second one's RAW sink silently
+    dead (``asyncio.start_server`` raised EADDRINUSE inside its daemon thread).
+    Now it just steps to the next port and stays discoverable.
+
+    ``SO_REUSEADDR`` only smooths TIME_WAIT reuse across quick restarts — it
+    does NOT let two live listeners share a port, so an already-serving
+    emulator still correctly bumps us to the next one. Returns the bound,
+    listening socket to hand to ``asyncio.start_server(sock=...)``.
+    """
+    last_exc: Optional[OSError] = None
+    for candidate in range(port, port + span + 1):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((host, candidate))
+            s.listen(128)
+            s.setblocking(False)
+            return s
+        except OSError as exc:
+            last_exc = exc
+            s.close()
+    raise OSError(
+        f"no free port in {port}..{port + span} on {host!r}: {last_exc}"
+    )
+
+
 async def run_server(
-    host: str, port: int, state: PrinterState, default_width: int
+    sock: socket.socket, state: PrinterState, default_width: int
 ) -> None:
     server = await asyncio.start_server(
-        lambda r, w: _serve_client(r, w, state, default_width), host, port
+        lambda r, w: _serve_client(r, w, state, default_width), sock=sock
     )
     async with server:
         await server.serve_forever()
@@ -540,13 +573,17 @@ async def run_server(
 
 def start_server_thread(
     host: str, port: int, state: PrinterState, default_width: int
-) -> threading.Thread:
-    """Run the asyncio ESC/POS server on its own loop in a daemon thread so
-    the main thread is free to own the console (mirrors ssi_terminal)."""
+) -> int:
+    """Bind the RAW sink (with port fallback) and run the asyncio ESC/POS
+    server on its own loop in a daemon thread so the main thread is free to
+    own the console (mirrors ssi_terminal). Returns the ACTUAL bound port,
+    which may differ from ``port`` when 9100 was already taken."""
+    sock = bind_raw_socket(host, port)
+    actual_port = sock.getsockname()[1]
 
     def _run() -> None:
-        asyncio.run(run_server(host, port, state, default_width))
+        asyncio.run(run_server(sock, state, default_width))
 
     thread = threading.Thread(target=_run, name="printer-emulator-server", daemon=True)
     thread.start()
-    return thread
+    return actual_port
