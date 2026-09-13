@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import os
+import platform
 import re
 import subprocess
 import sys
@@ -55,6 +56,31 @@ async def get_version() -> dict:
     # видалення показуємо ЛИШЕ там, де вона справді щось знімає. У скриптовій
     # інсталяції та на вінді за це відповідають їхні власні інсталятори.
     return {"version": version, "mac_app_install": IS_MAC_APP_INSTALL}
+
+
+def _mac_host_arch() -> str:
+    """«silicon» або «intel» — архітектура МАШИНИ, не процесу.
+
+    Знайдено ревʼю: `platform.machine()` віддає архітектуру процесу. Intel-збірка
+    під Rosetta на Apple Silicon репортує x86_64 — і кнопка «Оновити» назавжди
+    підсовувала б Intel-пакет, тобто машина лишалась би на трансляції довіку й
+    сама б із цього не вибралась (а таке буває: перенесли користувача з
+    Intel-мака через Migration Assistant або поставили не той пакет).
+
+    `sysctl.proc_translated` = 1 означає «цей процес іде під Rosetta», а отже
+    сам хост — arm64. Ключ існує лише на маку й лише під трансляцією, тож
+    відсутність або помилка = не транслюємось.
+    """
+    try:
+        translated = subprocess.run(
+            ["sysctl", "-n", "sysctl.proc_translated"],
+            capture_output=True, text=True, timeout=5, check=False,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        translated = ""
+    if translated == "1":
+        return "silicon"
+    return "silicon" if platform.machine() == "arm64" else "intel"
 
 
 def _build_update_argv() -> tuple[list[str], str]:
@@ -118,6 +144,29 @@ def _build_update_argv() -> tuple[list[str], str]:
             "-Command", inner,
         ]
         return argv, inner
+
+    if IS_MAC_APP_INSTALL:
+        # BH-150 — мак-застосунок оновлюється СВОЇМ інсталятором, а не
+        # скриптом. Знайдено ревʼю: доти ця гілка провалювалась у POSIX-шлях
+        # нижче, тобто `curl | bash install.sh`, і та команда ставила поруч
+        # СКРИПТОВУ інсталяцію — інший спосіб установки, який ще й воює за
+        # порт 9999. Тобто кнопка «Оновити» в мак-застосунку не оновлювала
+        # його ніколи.
+        #
+        # `open` віддає пакет системному інсталятору: там і прогрес, і
+        # запит прав адміністратора, який агент користувача сам дати не
+        # може. Архітектуру беремо з МАШИНИ — див. _mac_host_arch().
+        arch = _mac_host_arch()
+        asset = f"device-handler-{arch}.pkg"
+        cmd = (
+            "sleep 2 && set -o pipefail && "
+            'TMP="$(mktemp -d "${TMPDIR:-/tmp}/bhm-pkg.XXXXXX")" && '
+            f'curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/{asset} '
+            f'-o "$TMP/{asset}" && '
+            f'{{ [ -s "$TMP/{asset}" ] || {{ echo "✗ update: порожній пакет — нічого не змінено" >&2; exit 1; }}; }} && '
+            f'open "$TMP/{asset}"'
+        )
+        return ["bash", "-c", cmd], cmd
 
     script = _INSTALL_DIR / "update.sh"
     if not script.exists():
@@ -221,9 +270,18 @@ async def trigger_update() -> dict:
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"не вдалось запустити оновлення: {exc}") from exc
 
+    # Знайдено ревʼю: для мак-застосунку загальний текст брехав. Там нічого не
+    # «перезапуститься за ~30 секунд» саме собою — відкривається майстер
+    # установки, і поки людина не пройде його та не введе пароль адміністратора,
+    # не зміниться нічого.
+    message = (
+        "Відкрився інсталятор — пройдіть його, і менеджер оновиться"
+        if IS_MAC_APP_INSTALL
+        else "Оновлення запущено — менеджер перезапуститься за ~30 секунд"
+    )
     return {
         "status": "updating",
-        "message": "Оновлення запущено — менеджер перезапуститься за ~30 секунд",
+        "message": message,
         "log": str(_UPDATE_LOG),
     }
 
@@ -267,7 +325,7 @@ def _build_uninstall_script(purge_data: bool) -> str:
 
 
 @router.post("/uninstall")
-async def trigger_uninstall(purge_data: bool = False) -> dict:
+async def trigger_uninstall(request: Request, purge_data: bool = False) -> dict:
     """Знести мак-збірку: агент автозапуску, застосунок і (за згодою) дані.
 
     Тільки для встановленої мак-збірки. Скриптову інсталяцію знімає її власний
@@ -278,6 +336,20 @@ async def trigger_uninstall(purge_data: bool = False) -> dict:
         raise HTTPException(
             status_code=400,
             detail="кнопка видалення працює лише для застосунку macOS з .dmg/.pkg",
+        )
+
+    # Знайдено ревʼю. Ключ API у нас статичний і лежить у відкритому репо, а
+    # cors_origin_regex пускає будь-який сайт на *.web.app — Firebase Hosting
+    # безкоштовний, тож «будь-який» тут буквальне. Досі найгірше, що можна було
+    # зробити таким запитом, — надрукувати чек; тепер тут незворотне видалення,
+    # тому окрема умова: якщо запит прийшов із чужої сторінки, відмовляємо.
+    # Дашборд ходить із localhost або взагалі без Origin (curl), інструменти
+    # діагностики — так само.
+    origin = request.headers.get("origin")
+    if origin and not re.match(r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$", origin):
+        raise HTTPException(
+            status_code=403,
+            detail="видалення можна запустити лише зі сторінки менеджера",
         )
 
     cmd = _build_uninstall_script(purge_data)

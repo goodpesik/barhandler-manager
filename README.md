@@ -64,7 +64,7 @@
 - **Інсталятор `.pkg`** (подвійний клік) — обери під свій процесор:
   **[Apple Silicon (M1–M4)](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-silicon.pkg)** · **[Intel](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-intel.pkg)**.
   Звичайний майстер установки: прогрес, «готово» і посилання на сторінку менеджера. Менеджер запускається одразу, без перелогіну.
-  Поряд лежать ті самі збірки в `.dmg` ([Silicon](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-silicon.dmg) · [Intel](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-intel.dmg)) — для тих, хто волить перетягнути застосунок у Applications руками.
+  Ті самі збірки лежать і як `.dmg` ([Silicon](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-silicon.dmg) · [Intel](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-intel.dmg)), але це запасний шлях: із нього менеджер стартує сам лише з наступного входу в систему, а `.pkg` піднімає його одразу.
   Який у тебе — меню  → **About This Mac**, рядок «Chip» (Apple M…) або «Processor» (Intel).
   Відкрий образ і перетягни **Barhandler Manager** до **Applications** — і все, звичайний подвійний клік. Збірка підписана Developer ID і пронотаризована Apple, тож жодних «непідтверджений розробник» і жодного правого кліка не буде. Працює у фоні, автозапуск при вході в систему. Дані — у `~/.barhandler-manager`.
 - **Або через термінал** (без жодних попереджень Gatekeeper): `curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash`
@@ -291,7 +291,7 @@ Two options — whichever you prefer:
 - **`.pkg` installer** (double-click) — pick the one for your chip:
   **[Apple Silicon (M1–M4)](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-silicon.pkg)** · **[Intel](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-intel.pkg)**.
   A normal install wizard: progress, a "done" screen and a link to the manager page. The manager starts right away, no re-login.
-  The same builds are also published as `.dmg` ([Silicon](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-silicon.dmg) · [Intel](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-intel.dmg)) for anyone who prefers dragging the app into Applications.
+  The same builds are also published as `.dmg` ([Silicon](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-silicon.dmg) · [Intel](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-intel.dmg)), but that is the fallback: from the .dmg the manager only starts on its own at the next login, while the .pkg brings it up immediately.
   Not sure which you have?  → **About This Mac**: "Chip" (Apple M…) or "Processor" (Intel).
   Open the image and drag **Barhandler Manager** to **Applications** — then just double-click it. The build is signed with a Developer ID and notarized by Apple, so there is no "unidentified developer" prompt and no right-click dance. Runs in the background, auto-starts at login. Data lives in `~/.barhandler-manager`.
 - **Or via the terminal** (no Gatekeeper prompt at all): `curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash`

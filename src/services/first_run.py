@@ -64,18 +64,24 @@ def open_dashboard_once(app_dir: Path, port: int) -> None:
             logger.warning("first run: сервер не відповів, дашборд не відкриваю")
             return
 
-        # Позначку ставимо ПЕРЕД відкриттям: якщо webbrowser кине, другої
-        # спроби при наступному вході бути не має — це та сама нав'язливість,
-        # від якої нас береже позначка.
+        # Позначку ставимо ПІСЛЯ успішного відкриття. Знайдено ревʼю: у
+        # зворотному порядку невдача webbrowser (немає типового браузера, MDM
+        # заборонив Safari, збій одразу після логіну) назавжди забирала другу
+        # спробу — і виходила рівно та скарга, з якої все почалось: «дашборд
+        # ніхто не пропонує».
+        try:
+            opened = webbrowser.open(url)
+        except Exception as exc:  # noqa: BLE001 — вкладка не варта падіння
+            logger.warning("first run: не вдалося відкрити браузер: %s", exc)
+            return
+        if not opened:
+            logger.warning("first run: браузер не відкрився, спробуємо наступного разу")
+            return
+        logger.info("first run: відкрив дашборд %s", url)
         try:
             marker.parent.mkdir(parents=True, exist_ok=True)
             marker.write_text("opened\n")
         except OSError as exc:
             logger.warning("first run: не змогли поставити позначку: %s", exc)
-        try:
-            webbrowser.open(url)
-            logger.info("first run: відкрив дашборд %s", url)
-        except Exception as exc:  # noqa: BLE001 — вкладка не варта падіння
-            logger.warning("first run: не вдалося відкрити браузер: %s", exc)
 
     threading.Thread(target=_wait_and_open, name="first-run-dashboard", daemon=True).start()
