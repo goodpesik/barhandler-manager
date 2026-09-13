@@ -311,16 +311,24 @@ def test_installers_do_not_spawn_a_second_copy() -> None:
         # Місць запуску другої копії може бути кілька — під захистом мусять
         # бути ВСІ. Знайдено цим самим тестом: в install-android.sh їх два, і
         # спершу я поправив лише те, що нижче.
-        spawn_line = 'nohup "$INSTALL_DIR/.venv/bin/python"'
-        starts = [m.start() for m in re.finditer(re.escape(spawn_line), script)]
+        # Патерн НЕ чіпляється до лапок: у згенерованих скриптах шлях
+        # підставляється без них. Знайдено ревʼю — саме через лапки тест не
+        # бачив третього місця запуску в install-android.sh і проходив із
+        # живою вадою.
+        starts = [
+            m.start()
+            for m in re.finditer(r'nohup\s+"?\$INSTALL_DIR/\.venv/bin/python"?', script)
+        ]
         assert starts, f"{name}: не знайшов запуску через nohup"
         for nth, pos in enumerate(starts, 1):
             # Запобіжник мусить стояти ПОРУЧ із цим запуском, а не будь-де у
             # файлі: перевірка з іншої гілки наступну не рятує.
             nearby = script[max(0, pos - 900) : pos]
-            assert 'pgrep -f "$INSTALL_DIR/main.py"' in nearby, (
-                f"{name}: запуск №{nth} без перевірки, чи процес уже є"
+            guarded = (
+                "manager_alive" in nearby
+                or 'pgrep -f "$INSTALL_DIR/main.py"' in nearby
             )
+            assert guarded, f"{name}: запуск №{nth} без перевірки, чи процес уже є"
 
     android = (REPO / "installers" / "install-android.sh").read_text(encoding="utf-8")
     # У скрипті ДВА таких фолбеки — рання гілка «встановлено, але не працює» і
@@ -331,3 +339,49 @@ def test_installers_do_not_spawn_a_second_copy() -> None:
         "зʼявилась друга копія"
     )
     assert "sleep 1\nif ! curl" not in android, "лишився старий однесекундний фолбек"
+
+
+def test_every_spawn_site_is_counted() -> None:
+    """Скільком місцям запуску ми довіряємо — стільком і маємо давати перевірку.
+
+    Тест вище обходить знайдені місця; цей стежить, щоб їх не стало більше
+    непоміченими. Знайдено ревʼю: перша версія бачила два з трьох, бо чіплялась
+    до лапок, і проходила при живій ваді.
+    """
+    expected = {"install-android.sh": 3, "install.sh": 2}
+    for name, count in expected.items():
+        script = (REPO / "installers" / name).read_text(encoding="utf-8")
+        found = re.findall(r'nohup\s+"?\$INSTALL_DIR/\.venv/bin/python"?', script)
+        assert len(found) == count, (
+            f"{name}: місць запуску {len(found)}, очікували {count} — "
+            "перевір, чи нове місце захищене, і онови число"
+        )
+
+
+def test_android_verifies_the_result_outside_the_spawn_branch() -> None:
+    """Перевірка версії не має лежати всередині гілки «ми запускали самі».
+
+    Знайдено ревʼю: доти вона була під `if`, і гілка «процес живий» його
+    проминала — скрипт друкував успіх і виходив 0, навіть якщо той процес
+    завис і /health не відповів ні разу.
+    """
+    code = _code_lines(REPO / "installers" / "install-android.sh")
+    spawn_if = next(i for i, line in enumerate(code) if line.startswith('if [ "$NEED_SPAWN"'))
+    fi_after = next(i for i, line in enumerate(code[spawn_if:], spawn_if) if line == "fi")
+    version_check = next(
+        i for i, line in enumerate(code) if line.startswith('EXPECTED_VERSION=')
+    )
+    assert version_check > fi_after, (
+        "перевірка версії лежить у гілці запуску — гілка «процес живий» її проминає"
+    )
+
+
+def test_termux_installs_procps() -> None:
+    """Без pgrep/pkill усі запобіжники тихо деградують у «не працює».
+
+    Термукс не завжди має procps у базі, а на ньому тримається і знесення
+    старого процесу, і перевірка перед запуском другої копії.
+    """
+    script = (REPO / "installers" / "install-android.sh").read_text(encoding="utf-8")
+    pkg_install = script[script.index("pkg install -y") :][:400]
+    assert "procps" in pkg_install, "procps не ставиться — pgrep може бути відсутній"

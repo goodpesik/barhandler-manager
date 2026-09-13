@@ -1286,7 +1286,12 @@ _HTML_TEMPLATE = r"""<!doctype html>
   //   • never recovered in time → timeout, surface update.log
   async function watchUpdate(beforeVer) {
     const POLL_MS = 3000;
-    const DEADLINE_MS = 150000;       // 2.5 min — covers venv rebuilds
+    // 5 хв. Було 2.5 — і це замало для Android: там інсталятор сам чекає до
+    // 30 с на підняття плюс до 120 с на потрібну версію, а перед тим ще ставить
+    // залежності (rust-збірки — це хвилини). Знайдено ревʼю: успішне, але
+    // повільне оновлення на планшеті встигало впасти в «менеджер не піднявся»,
+    // хоча скрипт у цей момент спокійно доробляв.
+    const DEADLINE_MS = 300000;
     const started = Date.now();
     let sawDown = false;              // did the manager actually restart?
     let progressShown = false;
