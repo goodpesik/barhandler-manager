@@ -152,6 +152,15 @@ def test_uninstall_keeps_data_by_default():
     assert f'rm -rf "{system_routes.APP_DIR}"' in purge
 
 
+def test_uninstall_removes_the_system_wide_agent_too():
+    """Агент могли покласти й у /Library/LaunchAgents — так робить пакет, коли
+    установка йде без залогіненого користувача. Лишити його означає, що
+    менеджер «повернеться» при наступному вході в систему."""
+    cmd = system_routes._build_uninstall_script(purge_data=False)
+
+    assert "/Library/LaunchAgents/com.goodpesik.barhandler-manager.plist" in cmd
+
+
 def test_uninstall_kill_pattern_targets_only_the_app():
     """pkill мусить влучати саме в бандл. Патерн на кшталт «bhm» зняв би й
     скриптову інсталяцію, якщо людина тримає обидві."""

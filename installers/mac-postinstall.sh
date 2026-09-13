@@ -24,9 +24,39 @@ APP="/Applications/BarhandlerManager.app/Contents/MacOS/bhm"
 # а `logname` під installd може не мати tty.
 CONSOLE_USER="$(stat -f "%Su" /dev/console 2>/dev/null || echo "")"
 if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
-  echo "device-handler: не вдалося визначити користувача графічної сесії — агент не реєструю"
-  exit 0   # НЕ валимо установку: застосунок сам зареєструє автозапуск при першому запуску
+  # Нікого не залогінено: установка по SSH, через MDM або на екрані входу.
+  # Доти тут був просто `exit 0` — тихий провал: агент не зареєстрований,
+  # ніхто про це не дізнається, а фінальний екран обіцяє, що менеджер уже
+  # працює (знайдено ревʼю).
+  #
+  # Тому кладемо АГЕНТ ДЛЯ ВСІХ у /Library/LaunchAgents: launchd підхопить
+  # його при вході будь-якого користувача. Права root у пакета є, а для
+  # POS-машини «агент для того, хто сяде за неї» — саме те, що треба.
+  echo "device-handler: нікого не залогінено — ставлю агент для всіх користувачів"
+  SYS_PLIST="/Library/LaunchAgents/$LABEL.plist"
+  cat > "$SYS_PLIST" <<SYS_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array><string>$APP</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+</dict>
+</plist>
+SYS_EOF
+  chown root:wheel "$SYS_PLIST"
+  chmod 644 "$SYS_PLIST"
+  echo "device-handler: агент для всіх покладено в $SYS_PLIST — стартує при наступному вході"
+  exit 0
 fi
+
+# Хтось за машиною є — ставимо агент саме йому, а не всім. І прибираємо
+# агент «для всіх», якщо він лишився з headless-установки: інакше дві копії
+# воювали б за порт 9999.
+rm -f "/Library/LaunchAgents/$LABEL.plist" 2>/dev/null || true
 CONSOLE_UID="$(id -u "$CONSOLE_USER")"
 HOME_DIR="$(eval echo "~$CONSOLE_USER")"
 PLIST="$HOME_DIR/Library/LaunchAgents/$LABEL.plist"

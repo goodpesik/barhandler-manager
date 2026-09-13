@@ -27,8 +27,11 @@ datas, binaries, hiddenimports = [], [], []
 #   engineio/socketio — the uplink client's async drivers
 #   certifi        — CA bundle main.py points SSL at
 #   libusb_package — ships the libusb-1.0 DLL pyusb's backend needs on Windows
+#   ServiceManagement — pyobjc-шар, через який реєструється агент автозапуску
+#       з бандла (BH-150). Лише на маку; на інших платформах collect_all просто
+#       не знайде пакет і тихо пропустить.
 for pkg in ("uvicorn", "zeroconf", "escpos", "engineio", "socketio",
-            "certifi", "libusb_package"):
+            "certifi", "libusb_package", "ServiceManagement"):
     try:
         d, b, h = collect_all(pkg)
         datas += d

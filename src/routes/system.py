@@ -311,6 +311,15 @@ def _build_uninstall_script(purge_data: bool) -> str:
         "sleep 2",
         f'launchctl bootout "gui/$(id -u)/{_MAC_AGENT_LABEL}" 2>/dev/null || true',
         f'rm -f "{_MAC_AGENT_PLIST}"',
+        # Агент міг бути покладений трьома способами, і знімати треба всі:
+        #   • у домівці — старий шлях і .dmg-установка;
+        #   • у /Library/LaunchAgents — headless-установка пакетом (там нікого
+        #     не було залогінено, тож агент поклали для всіх);
+        #   • через SMAppService — агент із бандла; він зникає разом із
+        #     застосунком, але system-плист треба прибрати руками.
+        # rm у /Library потребує прав, яких у агента немає — тому `|| true`:
+        # не змогли, то й не змогли, решта видалення має доробитись.
+        f'rm -f "/Library/LaunchAgents/{_MAC_AGENT_LABEL}.plist" 2>/dev/null || true',
         f'rm -rf "{_MAC_APP}"',
     ]
     if purge_data:

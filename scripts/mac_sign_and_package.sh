@@ -36,6 +36,17 @@ ENTITLEMENTS="${MAC_ENTITLEMENTS:-installers/entitlements-mac.plist}"
 
 [ -d "$APP" ] || { echo "::error::немає $APP"; exit 1; }
 
+# Агент автозапуску кладемо В БАНДЛ і ДО підпису: SMAppService реєструє лише
+# те, що лежить у Contents/Library/LaunchAgents і накрите підписом
+# застосунку. Саме через це система показує в «Автозапуск і розширення»
+# «Device Handler», а не команду сертифіката (BH-150).
+AGENT_SRC="${MAC_LAUNCHAGENT:-installers/mac-launchagent.plist}"
+if [ -f "$AGENT_SRC" ]; then
+  echo "==> Кладу агент у бандл: $(basename "$AGENT_SRC")"
+  mkdir -p "$APP/Contents/Library/LaunchAgents"
+  cp "$AGENT_SRC" "$APP/Contents/Library/LaunchAgents/com.goodpesik.barhandler-manager.plist"
+fi
+
 KEYCHAIN=""
 WORKDIR=""
 P12=""
