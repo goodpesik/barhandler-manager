@@ -32,6 +32,47 @@ logger = logging.getLogger(__name__)
 _LABEL = "com.goodpesik.barhandler-manager"
 
 
+_BUNDLED_AGENT = "com.goodpesik.barhandler-manager.plist"
+
+
+def _register_via_service_management() -> bool:
+    """Зареєструвати агент із бандла через SMAppService. True, якщо вийшло.
+
+    Це той шлях, який дає системі впізнати НАС: у «Автозапуск і розширення»
+    зʼявляється «Device Handler» з іконкою застосунку. Доти там стояло «ПЗ
+    Maksym Levynets» — назва команди з сертифіката, бо plist у
+    ~/Library/LaunchAgents система ні з яким бандлом не звʼязує.
+
+    Працює лише для підписаного застосунку, який лежить у /Applications і має
+    plist у Contents/Library/LaunchAgents. Будь-яка невдача — не помилка: нижче
+    лишається старий спосіб, який працює завжди, тільки з чужою назвою.
+    """
+    bundle = Path(sys.executable).resolve().parent.parent.parent  # .../X.app
+    if not (bundle / "Contents" / "Library" / "LaunchAgents" / _BUNDLED_AGENT).exists():
+        logger.info("mac autostart: агента в бандлі немає — старий спосіб")
+        return False
+    try:
+        from ServiceManagement import SMAppService  # type: ignore
+    except Exception as exc:  # noqa: BLE001 — немає pyobjc у цій збірці
+        logger.info("mac autostart: ServiceManagement недоступний (%s)", exc)
+        return False
+    try:
+        service = SMAppService.agentServiceWithPlistName_(_BUNDLED_AGENT)
+        # status 1 = enabled: уже зареєстровано, повторна реєстрація зайва.
+        if int(service.status()) == 1:
+            logger.info("mac autostart: агент уже зареєстрований системою")
+            return True
+        ok, err = service.registerAndReturnError_(None)
+        if ok:
+            logger.info("mac autostart: зареєстровано через SMAppService")
+            return True
+        logger.info("mac autostart: SMAppService відмовив (%s) — старий спосіб", err)
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.info("mac autostart: SMAppService не спрацював (%s) — старий спосіб", exc)
+        return False
+
+
 def ensure_launch_agent() -> None:
     """Register a login LaunchAgent for the frozen mac app. No-op elsewhere.
 
@@ -41,6 +82,12 @@ def ensure_launch_agent() -> None:
     """
     if not (getattr(sys, "frozen", False) and sys.platform == "darwin"):
         return
+
+    # Спершу пробуємо системний шлях — він єдиний, що дає правильну назву в
+    # «Автозапуск і розширення». Не вийшло — лишається старий plist у домівці.
+    if _register_via_service_management():
+        return
+
     try:
         exe = str(Path(sys.executable).resolve())
         log_dir = Path.home() / ".barhandler-manager"

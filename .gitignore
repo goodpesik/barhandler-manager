@@ -30,3 +30,8 @@ bhm.pid
 # Per-install identifier — generated at first uplink start, NOT a secret
 # but unique per machine and shouldn't be committed.
 install_id.txt
+
+# Артефакти локальної збірки PyInstaller. Потрапили в коміт 709eef9 разом із
+# 28-мегабайтним бінарником — саме те, чого в репо бути не має.
+dist/
+build/

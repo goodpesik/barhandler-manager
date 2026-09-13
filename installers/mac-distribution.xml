@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  BH-150 — майстер установки для macOS.
+
+  Раніше мак отримував .dmg: перетягни застосунок у Applications і здогадайся
+  сам, чи щось сталося. Тут звичайний інсталятор: вітання, прогрес, фінальний
+  екран із посиланням на дашборд.
+
+  ЩО ТУТ ВАЖЛИВО, КРІМ ВИГЛЯДУ:
+
+  `installation-check` каже, що менеджер уже встановлено — власник просив саме
+  це: «запуск ще раз каже, що все вже встановлено». Але НЕ забороняє
+  продовжити: знайдено ревʼю, що заборона (type Fatal) відрізала єдиний
+  робочий шлях оновлення — поверх наявної копії не поставити новішу версію, а
+  кнопка «Оновити» в дашборді для пакета качає саме цей пакет. Тобто Fatal
+  замикав людину в старій версії назавжди. Тепер це попередження: продовжиш —
+  оновиться.
+
+  `enable_anywhere="false"` + `rootVolumeOnly="true"` — ставимо тільки на
+  системний том. Менеджер прив'язаний до launchd поточного користувача, і
+  установка на зовнішній диск дала б агент, який указує в нікуди.
+-->
+<installer-gui-script minSpecVersion="2">
+    <title>Device Handler</title>
+    <organization>com.goodpesik</organization>
+    <options customize="never" require-scripts="true" rootVolumeOnly="true" hostArchitectures="arm64,x86_64"/>
+
+    <welcome file="welcome.html" mime-type="text/html"/>
+    <conclusion file="conclusion.html" mime-type="text/html"/>
+
+    <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
+
+    <installation-check script="check_not_installed()"/>
+    <script>
+function check_not_installed() {
+    // Наявність застосунку — єдина ознака, на яку можна спертися до
+    // розпакування: bundle id в системі з'являється лише після першого
+    // запуску, а нам треба відповісти ще на вітальному екрані.
+    if (system.files.fileExistsAtPath("/Applications/BarhandlerManager.app")) {
+        my.result.title = "Device Handler вже встановлено";
+        my.result.message = "Продовжити — і наявна копія оновиться до цієї версії.\n\n" +
+            "Видалити менеджер можна кнопкою «Видалити менеджер» на сторінці " +
+            "http://localhost:9999.";
+        // Warn, а не Fatal: заборона тут відрізала б оновлення взагалі — інших
+        // шляхів поставити новішу версію пакета немає.
+        my.result.type = "Warn";
+        return false;
+    }
+    return true;
+}
+    </script>
+
+    <choices-outline>
+        <line choice="default">
+            <line choice="com.goodpesik.barhandler-manager.app"/>
+        </line>
+    </choices-outline>
+    <choice id="default"/>
+    <choice id="com.goodpesik.barhandler-manager.app" visible="false">
+        <pkg-ref id="com.goodpesik.barhandler-manager.app"/>
+    </choice>
+    <pkg-ref id="com.goodpesik.barhandler-manager.app" version="0" auth="root">app.pkg</pkg-ref>
+</installer-gui-script>

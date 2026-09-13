@@ -27,8 +27,11 @@ datas, binaries, hiddenimports = [], [], []
 #   engineio/socketio — the uplink client's async drivers
 #   certifi        — CA bundle main.py points SSL at
 #   libusb_package — ships the libusb-1.0 DLL pyusb's backend needs on Windows
+#   ServiceManagement — pyobjc-шар, через який реєструється агент автозапуску
+#       з бандла (BH-150). Лише на маку; на інших платформах collect_all просто
+#       не знайде пакет і тихо пропустить.
 for pkg in ("uvicorn", "zeroconf", "escpos", "engineio", "socketio",
-            "certifi", "libusb_package"):
+            "certifi", "libusb_package", "ServiceManagement"):
     try:
         d, b, h = collect_all(pkg)
         datas += d
@@ -114,11 +117,18 @@ if _sys.platform == "darwin":
     app = BUNDLE(
         exe,
         name="BarhandlerManager.app",
-        icon=None,
+        # BH-150 — без іконки macOS малює типову «виконуваний файл», і в
+        # Applications застосунок виглядає як щось випадкове.
+        icon="installers/device-handler.icns",
         bundle_identifier="com.goodpesik.barhandler-manager",
         info_plist={
-            "CFBundleName": "Barhandler Manager",
-            "CFBundleDisplayName": "Barhandler Manager",
+            # Видима назва — «Device Handler», а не «Barhandler Manager»:
+            # менеджер спільний для всіх продуктів (bar, fit, pets), і назва
+            # одного з них на ньому збивала з пантелику. Технічні
+            # ідентифікатори (bundle id, ім'я .app, лейбл LaunchAgent) НЕ
+            # чіпаємо — на них тримається сумісність уже встановлених копій.
+            "CFBundleName": "Device Handler",
+            "CFBundleDisplayName": "Device Handler",
             "CFBundleShortVersionString": _ver,
             "CFBundleVersion": _ver,
             "LSUIElement": True,          # background agent — no Dock icon

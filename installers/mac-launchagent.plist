@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  BH-150 — агент автозапуску, що живе ВСЕРЕДИНІ бандла.
+
+  Доти plist лежав лише в ~/Library/LaunchAgents, і для системи це «безхозний»
+  агент: у «Автозапуск і розширення» вона підписувала його командою
+  сертифіката, тобто «ПЗ Maksym Levynets». Людина, яка бачить це в чужій
+  студії, не має жодного способу зрозуміти, що то за програма.
+
+  Агент у бандлі + реєстрація через SMAppService дають інше: система приписує
+  фонову активність САМОМУ застосунку й показує «Device Handler» з його
+  іконкою. Через це тут `BundleProgram` (шлях відносно бандла), а не
+  `ProgramArguments` з абсолютним шляхом — інакше SMAppService плист не візьме.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.goodpesik.barhandler-manager</string>
+	<key>BundleProgram</key>
+	<string>Contents/MacOS/bhm</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+</dict>
+</plist>
