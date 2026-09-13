@@ -17,21 +17,72 @@
 set -u
 
 LABEL="com.goodpesik.barhandler-manager"
-APP="/Applications/Device Handler.app/Contents/MacOS/bhm"
+
+# $3 — том, на який ставлять. Майже завжди "/", але при розгортанні образу
+# (installer -target /Volumes/Other, MDM-провізіонінг) це інший том, і тоді
+# наші шляхи інші. Доти тут стояло жорстке /Applications — знайдено ревʼю:
+# перевірка нижче падала б, і така установка звалилась би без причини.
+TARGET="${3:-/}"
+TARGET="${TARGET%/}"  # "/" -> "", "/Volumes/X/" -> "/Volumes/X"
+
+APP="$TARGET/Applications/Device Handler.app/Contents/MacOS/bhm"
 # Стара назва бандла — з установок до BH-150. Її треба знести, інакше дві
 # копії будуть воювати за порт 9999.
-OLD_APP="/Applications/BarhandlerManager.app"
+OLD_APP="$TARGET/Applications/BarhandlerManager.app"
 
-# Зносимо стару копію ПЕРШИМ ділом — до будь-яких розгалужень. Спершу це
-# стояло нижче, у гілці «за машиною хтось є», і установка по SSH або через
-# MDM (де нижче стоїть exit 0) лишала старий бандл на місці: два агенти,
-# обидва чекають порт 9999, працює випадковий (знайдено ревʼю).
+# ПЕРШЕ — переконатись, що новий застосунок на місці. Порядок тут не косметика:
+# спершу цей скрипт зносив стару копію й лише потім перевіряв нову, тож будь-яка
+# невдача розпакування лишала машину взагалі без менеджера — гірше, ніж було до
+# установки (знайдено ревʼю).
+if [ ! -x "$APP" ]; then
+  echo "device-handler: застосунку немає за шляхом $APP — установка неповна"
+  exit 1
+fi
+
+# Стара копія — до розгалужень, але вже після перевірки вище. Спершу це стояло
+# аж у гілці «за машиною хтось є», і установка по SSH або через MDM (де нижче
+# стоїть exit 0) лишала старий бандл на місці: два агенти, обидва чекають
+# порт 9999, працює випадковий (знайдено ревʼю).
 if [ -d "$OLD_APP" ]; then
   echo "device-handler: зношу стару копію $OLD_APP"
   rm -rf "$OLD_APP"
   # Її агент указує на шлях, якого вже немає. Системний прибираємо тут,
   # користувацький — нижче, разом із реєстрацією нового.
-  rm -f "/Library/LaunchAgents/$LABEL.plist" 2>/dev/null || true
+  rm -f "$TARGET/Library/LaunchAgents/$LABEL.plist" 2>/dev/null || true
+fi
+
+# Ставлять на інший том (розгортання образу, MDM). Підняти агент зараз
+# неможливо: launchd керує сесіями ЦІЄЇ системи, а не тієї, що на диску. Тому
+# кладемо агент ДЛЯ ВСІХ на той том — launchd підхопить його при першому вході
+# після завантаження з нього.
+#
+# Доти тут стояв лише exit 0 із приміткою «застосунок зареєструє автозапуск
+# сам». Знайдено ревʼю: це неправда. ensure_launch_agent() у застосунку
+# виконується, лише коли його ХТОСЬ запустив, а в безлюдному розгортанні
+# запускати нікому — автозапуск не налаштувався б узагалі.
+#
+# Шлях у plist — від кореня ТІЄЇ системи (/Applications/...), без $TARGET:
+# після завантаження той том і буде "/".
+if [ -n "$TARGET" ]; then
+  SYS_PLIST="$TARGET/Library/LaunchAgents/$LABEL.plist"
+  install -d -m 755 "$TARGET/Library/LaunchAgents"
+  cat > "$SYS_PLIST" <<ALT_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array><string>/Applications/Device Handler.app/Contents/MacOS/bhm</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+</dict>
+</plist>
+ALT_EOF
+  chown root:wheel "$SYS_PLIST" 2>/dev/null || true
+  chmod 644 "$SYS_PLIST"
+  echo "device-handler: том $TARGET — агент для всіх покладено в $SYS_PLIST"
+  exit 0
 fi
 
 # Хто зараз у графічній сесії. `stat /dev/console` — єдиний надійний спосіб:
@@ -48,7 +99,7 @@ if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
   # його при вході будь-якого користувача. Права root у пакета є, а для
   # POS-машини «агент для того, хто сяде за неї» — саме те, що треба.
   echo "device-handler: нікого не залогінено — ставлю агент для всіх користувачів"
-  SYS_PLIST="/Library/LaunchAgents/$LABEL.plist"
+  SYS_PLIST="$TARGET/Library/LaunchAgents/$LABEL.plist"
   cat > "$SYS_PLIST" <<SYS_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -71,7 +122,7 @@ fi
 # Хтось за машиною є — ставимо агент саме йому, а не всім. І прибираємо
 # агент «для всіх», якщо він лишився з headless-установки: інакше дві копії
 # воювали б за порт 9999.
-rm -f "/Library/LaunchAgents/$LABEL.plist" 2>/dev/null || true
+rm -f "$TARGET/Library/LaunchAgents/$LABEL.plist" 2>/dev/null || true
 CONSOLE_UID="$(id -u "$CONSOLE_USER")"
 HOME_DIR="$(eval echo "~$CONSOLE_USER")"
 PLIST="$HOME_DIR/Library/LaunchAgents/$LABEL.plist"

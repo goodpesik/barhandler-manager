@@ -44,8 +44,15 @@ mkdir -p "$SCRIPTS" "$ROOT"
 cp -R "$APP" "$ROOT/"
 install -m 755 "$POSTINSTALL" "$SCRIPTS/postinstall"
 
+# --- заборона переміщення й пропуску установки ----------------------------------
+# Подробиці — у scripts/mac_component_plist.sh: там і причина (пакет поставився
+# в чужу теку), і що саме знімається.
+echo "==> опис компонента"
+bash "$(dirname "$0")/mac_component_plist.sh" "$WORKDIR/root" "$WORKDIR/component.plist"
+
 echo "==> pkgbuild ($VERSION)"
 pkgbuild --root "$WORKDIR/root" \
+  --component-plist "$WORKDIR/component.plist" \
   --scripts "$SCRIPTS" \
   --identifier "$IDENTIFIER" \
   --version "$VERSION" \
