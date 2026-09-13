@@ -324,10 +324,12 @@ def test_installers_do_not_spawn_a_second_copy() -> None:
             # Запобіжник мусить стояти ПОРУЧ із цим запуском, а не будь-де у
             # файлі: перевірка з іншої гілки наступну не рятує.
             nearby = script[max(0, pos - 900) : pos]
-            guarded = (
-                "manager_alive" in nearby
-                or 'pgrep -f "$INSTALL_DIR/main.py"' in nearby
-            )
+            # Приймаємо лише ІМЕНОВАНИЙ хелпер — `manager_alive` в інсталяторі
+            # або `alive()` у згенерованому скрипті. Голий `pgrep` більше не
+            # годиться: знайдено другим колом ревʼю, що без фолбеку на ps він
+            # там, де немає procps, тихо стає «не працює» — тобто вада
+            # вертається, а тест її не бачить.
+            guarded = "manager_alive" in nearby or "if alive;" in nearby
             assert guarded, f"{name}: запуск №{nth} без перевірки, чи процес уже є"
 
     android = (REPO / "installers" / "install-android.sh").read_text(encoding="utf-8")
@@ -385,3 +387,35 @@ def test_termux_installs_procps() -> None:
     script = (REPO / "installers" / "install-android.sh").read_text(encoding="utf-8")
     pkg_install = script[script.index("pkg install -y") :][:400]
     assert "procps" in pkg_install, "procps не ставиться — pgrep може бути відсутній"
+
+
+def test_generated_scripts_survive_a_missing_pgrep() -> None:
+    """У згенерованих start.sh перевірка мусить мати фолбек на `ps`.
+
+    `pgrep`/`pkill` — це пакет procps, якого в Термуксі не завжди є. Без
+    фолбеку перевірка «чи процес уже працює» там тихо стає «не працює», і
+    друга копія запускається знову — та сама вада BH-151, лише без жодного
+    повідомлення. Знайдено другим колом ревʼю: спершу в обох згенерованих
+    скриптах стояв голий `pgrep`.
+    """
+    for name in ("install-android.sh", "install.sh"):
+        script = (REPO / "installers" / name).read_text(encoding="utf-8")
+        helper = script[script.index("alive() {") : script.index("if alive;")]
+        assert "command -v pgrep" in helper, f"{name}: немає перевірки наявності pgrep"
+        assert "ps -A -o args=" in helper, f"{name}: немає фолбеку на ps"
+
+
+def test_install_failure_is_judged_by_version_not_by_anyone_answering() -> None:
+    """Попередження про невдачу — за версією, а не за «хтось відповідає».
+
+    Стара копія, що не завершилась і тримає порт 9999, теж відповідає на
+    /health. Доти умова була `! is_running`, тож найгірший випадок — нова
+    версія не піднялась, працює стара — проходив без попередження: скрипт
+    друкував успіх і виходив 0 (знайдено другим колом ревʼю).
+    """
+    for name in ("install-android.sh", "install.sh"):
+        code = "\n".join(_code_lines(REPO / "installers" / name))
+        assert "VERSION_OK=1" in code, f"{name}: успіх перевірки версії ніде не фіксується"
+        assert "! is_running; then" not in code, (
+            f"{name}: невдача все ще визначається через «хтось відповідає на /health»"
+        )
