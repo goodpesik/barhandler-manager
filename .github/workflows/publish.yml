@@ -124,10 +124,12 @@ jobs:
             echo
             echo "## Install"
             echo
-            echo "**macOS — .dmg (signed + notarized, just double-click)**"
+            echo "**macOS — .pkg installer (signed + notarized, double-click and follow the wizard)**"
             echo
-            echo "- Apple Silicon: device-handler-silicon.dmg"
-            echo "- Intel: device-handler-intel.dmg"
+            echo "- Apple Silicon: device-handler-silicon.pkg"
+            echo "- Intel: device-handler-intel.pkg"
+            echo
+            echo "Same builds as .dmg (drag to Applications): device-handler-silicon.dmg, device-handler-intel.dmg"
             echo
             echo "**macOS / Linux / Raspberry Pi — script**"
             echo '```bash'
@@ -293,7 +295,8 @@ jobs:
         run: |
           bash scripts/mac_sign_and_package.sh \
             dist/BarhandlerManager.app \
-            "dist/device-handler-${{ matrix.arch }}.dmg"
+            "dist/device-handler-${{ matrix.arch }}.dmg" \
+            "dist/device-handler-${{ matrix.arch }}.pkg"
       # Не action-gh-release: дві джоби матриці пишуть в ОДИН реліз паралельно,
       # а той екшн оновлює реліз цілком (в історії є гонка «Existing releases
       # are no longer updated»). `gh release upload` додає конкретний файл —
@@ -303,4 +306,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ needs.release.outputs.tag }}" \
+            "dist/device-handler-${{ matrix.arch }}.pkg" \
             "dist/device-handler-${{ matrix.arch }}.dmg" --clobber

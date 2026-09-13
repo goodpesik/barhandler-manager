@@ -202,6 +202,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <button class="btn btn-default" data-i18n="btn_logs" onclick="openLogs()">📋 Логи</button>
     <button class="btn btn-default" data-i18n="btn_usb" onclick="runUsbProbe()">🔌 USB діагностика</button>
     <button id="btn-uplink" class="btn btn-default" onclick="openUplinkModal()"><span data-i18n="btn_uplink">📡 Віддалена діагностика</span><span id="uplink-badge" class="badge" data-i18n="uplink_badge_connected" style="display:none;">● підключено</span></button>
+    <!-- BH-150 — видалення менеджера. Показуємо ЛИШЕ для встановленого
+         мак-застосунку (/version віддає mac_app_install): у скриптовій
+         інсталяції та на вінді знімають власні інсталятори, і кнопка, яка
+         нічого не зніме, гірша за її відсутність. -->
+    <button id="btn-uninstall" class="btn btn-danger" data-i18n="btn_uninstall" onclick="doUninstall()" style="display:none;">🗑 Видалити менеджер</button>
   </div>
 
   <div id="manual-terminal-modal" class="modal-backdrop" style="display:none;">
@@ -466,6 +471,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
       version_label: "версія",
       updated_label: "оновлено",
       btn_update: "⬆ Оновити",
+      btn_uninstall: "🗑 Видалити менеджер",
+      uninstall_confirm: "Зняти менеджер пристроїв із цього комп'ютера?",
+      uninstall_purge: "Видалити й налаштування разом із переліком пристроїв?\n\nСкасувати — лишити їх на місці.",
+      uninstall_started: "Менеджер знімається",
+      uninstall_error: "Не вдалося зняти: {err}",
       controls_actions: "Дії",
       btn_refresh_status: "↻ Оновити статус",
       btn_scan_printers: "🔍 Сканувати принтери",
@@ -588,6 +598,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
       version_label: "version",
       updated_label: "updated",
       btn_update: "⬆ Update",
+      btn_uninstall: "🗑 Remove manager",
+      uninstall_confirm: "Remove the device manager from this computer?",
+      uninstall_purge: "Also delete the settings and the device list?\n\nCancel keeps them in place.",
+      uninstall_started: "Removing the manager",
+      uninstall_error: "Could not remove: {err}",
       controls_actions: "Actions",
       btn_refresh_status: "↻ Refresh status",
       btn_scan_printers: "🔍 Scan printers",
@@ -1209,6 +1224,33 @@ _HTML_TEMPLATE = r"""<!doctype html>
     }
   }
 
+  // ---- uninstall (лише встановлений мак-застосунок) ------------------------
+
+  // Кнопку показуємо після того, як сервер підтвердив, що це саме
+  // мак-застосунок. Питаємо двічі й окремо: спершу про сам менеджер, потім про
+  // налаштування з переліком пристроїв — це різні втрати, і зносити друге
+  // разом із першим молча не можна.
+  async function refreshUninstallButton() {
+    try {
+      const v = await api("GET", "/version", false);
+      if (v && v.mac_app_install) $("btn-uninstall").style.display = "";
+    } catch (_) {}
+  }
+
+  async function doUninstall() {
+    if (!confirm(t("uninstall_confirm"))) return;
+    const purge = confirm(t("uninstall_purge"));
+    const btn = $("btn-uninstall");
+    btn.disabled = true;
+    try {
+      const res = await api("POST", "/system/uninstall?purge_data=" + (purge ? "true" : "false"), true);
+      showToast(res.message || t("uninstall_started"), "ok", 15000);
+    } catch (e) {
+      showToast(t("uninstall_error", { err: e.message }), "err");
+      btn.disabled = false;
+    }
+  }
+
   // ---- update --------------------------------------------------------------
 
   async function doUpdate() {
@@ -1389,6 +1431,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       renderTerminals(terminals);
       $("uplink-badge").style.display = (uplink && uplink.connected) ? "" : "none";
       $("updated").textContent = new Date().toLocaleTimeString(localeTag());
+      refreshUninstallButton();
       $("status-dot").className = "dot ok";
       $("error-banner").className = "error-banner";
     } catch (e) {
