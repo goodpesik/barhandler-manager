@@ -295,15 +295,28 @@ EOF
         # is a no-op when port 9999 is still held by the old process.
         launchctl bootout "$LAUNCH_TARGET" 2>/dev/null || true
         pkill -f "$INSTALL_DIR/main.py" 2>/dev/null || true
+        # Той самий порт 9999 може тримати збірка з .dmg — це окремий процес,
+        # скомпільований бінарник `bhm`, і патерн вище в нього не влучає. Без
+        # цього install.sh «успішно» завершувався, а порт лишався за .app
+        # (знайдено ревʼю).
+        pkill -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true
         # SIGTERM triggers uvicorn's graceful shutdown which can take
         # 5+ seconds. Wait up to 10s for the process to actually exit;
         # if it's still alive after that, escalate to SIGKILL so the
         # new launchd instance can bind to port 9999.
+        #
+        # Чекаємо на ОБА процеси. Знайдено ревʼю: доти цикл питав лише про
+        # main.py, тож коли порт тримала збірка з .dmg (а скриптової інсталяції
+        # на машині ще не було), pgrep не знаходив нічого, цикл виходив на
+        # першій ітерації — і .app отримував SIGKILL майже одразу після SIGTERM,
+        # посеред запису config.yaml чи printers.json.
         for i in 1 2 3 4 5 6 7 8 9 10; do
-            pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1 || break
+            pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1 && { sleep 1; continue; }
+            pgrep -f "BarhandlerManager.app/Contents/MacOS/bhm" >/dev/null 2>&1 || break
             sleep 1
         done
         pkill -9 -f "$INSTALL_DIR/main.py" 2>/dev/null || true
+        pkill -9 -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true
         sleep 1
         launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST" 2>&1 || \
             { warn "launchctl bootstrap failed — trying legacy load"; \
@@ -444,6 +457,8 @@ echo "▸ stopping Handler Device Manager"
 # is a no-op if no process matches.
 $SERVICE_CMD_STOP 2>/dev/null || true
 pkill -f "$INSTALL_DIR/main.py" 2>/dev/null || true
+# .dmg-копія — окремий процес, її стоп-скрипт теж мусить знімати.
+pkill -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true
 EOF
 
 cat > "$INSTALL_DIR/status.sh" <<EOF

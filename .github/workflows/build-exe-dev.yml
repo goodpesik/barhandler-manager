@@ -62,3 +62,55 @@ jobs:
           files: |
             dist/bhm.exe
             dist/barhandler-setup.exe
+
+  # macOS .app → .dmg, TEST channel. Runs after build-windows so both jobs
+  # don't race to create the `nightly` release; this one only adds the .dmg.
+  # Нічний канал: обидві архітектури, підпис Developer ID є, а нотаризації
+  # НЕМА — палити запит до Apple на кожну нічну збірку не треба. Механіка саме
+  # така: ad-hoc чи повний підпис скрипт обирає за MAC_CERT_*, а MAC_NOTARY_*
+  # лише вмикає нотаризацію; тут ми передаємо перші й не передаємо другі.
+  # (Знайдено ревʼю: попередній коментар описував цей вибір неправильно.)
+  # Такий .dmg Gatekeeper пустить лише через System Settings — це свідомо,
+  # бо на нічний канал ні README, ні релізні нотатки не посилаються.
+  build-macos:
+    needs: build-windows
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: silicon
+          # macos-13 знято з Actions у грудні 2025 — офіційна заміна для
+          # x86_64 це macos-15-intel (знайдено ревʼю: на macos-13 джоба просто
+          # не знайшла б раннера, і Intel-збірки не було б ніколи).
+          - runner: macos-15-intel
+            arch: intel
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps + PyInstaller + libusb
+        run: pip install -r requirements.txt pyinstaller libusb-package
+      - name: Build .app
+        run: pyinstaller --noconfirm bhm.spec
+      - name: Sign and package
+        env:
+          MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
+          MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
+        run: |
+          bash scripts/mac_sign_and_package.sh \
+            dist/BarhandlerManager.app \
+            "dist/device-handler-${{ matrix.arch }}.dmg"
+      # Той самий привід, що й у релізному каналі: дві джоби матриці не мають
+      # переписувати пререлізний обʼєкт одночасно.
+      - name: Publish .dmg to nightly prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view nightly >/dev/null 2>&1 || \
+            gh release create nightly --prerelease \
+              --title "nightly (test build — NOT a release)" --notes "nightly build"
+          gh release upload nightly \
+            "dist/device-handler-${{ matrix.arch }}.dmg" --clobber

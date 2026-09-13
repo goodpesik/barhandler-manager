@@ -57,7 +57,17 @@
 
 ### Встановлення
 
-#### macOS / Linux / Raspberry Pi
+#### macOS
+
+Два способи — обирай зручніший:
+
+- **Інсталятор `.dmg`** (подвійний клік) — обери під свій процесор:
+  **[Apple Silicon (M1–M4)](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-silicon.dmg)** · **[Intel](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-intel.dmg)**.
+  Який у тебе — меню  → **About This Mac**, рядок «Chip» (Apple M…) або «Processor» (Intel).
+  Відкрий образ і перетягни **Barhandler Manager** до **Applications** — і все, звичайний подвійний клік. Збірка підписана Developer ID і пронотаризована Apple, тож жодних «непідтверджений розробник» і жодного правого кліка не буде. Працює у фоні, автозапуск при вході в систему. Дані — у `~/.barhandler-manager`.
+- **Або через термінал** (без жодних попереджень Gatekeeper): `curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash`
+
+#### Linux / Raspberry Pi
 
 ```bash
 curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash
@@ -65,7 +75,7 @@ curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/downl
 
 #### Windows
 
-Встановлення виконується інсталятором **[barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe)** — прав адміністратора та Python не потребує.
+Встановлення виконується інсталятором **[device-handler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-setup.exe)** — прав адміністратора та Python не потребує.
 
 Інсталятор автоматично видаляє попередню версію (зокрема стару Python-версію та її завдання автозапуску), встановлює поточну начисто, налаштовує автозапуск при вході в систему та додає запис до розділу «Програми та засоби» для подальшого видалення. Друк по USB виконується через стандартний драйвер принтера Windows (принтер лишається доступним для інших програм), USB-термінал ПриватБанку працює через віртуальний COM-порт. Оновлення застосовуються кнопкою **«⬆ Оновити»** на дашборді.
 
@@ -103,8 +113,8 @@ curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/downl
 
 #### 🪟 Докладніше — Windows
 
-1. **Завантаження інсталятора.** Файл [barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe) зберігається до теки «Завантаження».
-2. **Встановлення.** Запуск `barhandler-setup.exe` → **Далі → Встановити**. Якщо з'явиться попередження *«Windows захистив ваш ПК» (SmartScreen)* — оберіть **«Докладніше» → «Виконати в будь-якому разі»**: файл не має цифрового підпису, це очікувано. Права адміністратора не потрібні.
+1. **Завантаження інсталятора.** Файл [device-handler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-setup.exe) зберігається до теки «Завантаження».
+2. **Встановлення.** Запуск `device-handler-setup.exe` → **Далі → Встановити**. Якщо з'явиться попередження *«Windows захистив ваш ПК» (SmartScreen)* — оберіть **«Докладніше» → «Виконати в будь-якому разі»**: файл не має цифрового підпису, це очікувано. Права адміністратора не потрібні.
 3. **Завершення.** Інсталятор видаляє попередню версію (за наявності), встановлює поточну, вмикає автозапуск і запускає менеджер; наприкінці відкривається дашборд на **http://localhost:9999/**.
 
 > **Примітка.** Якщо дашборд не відкрився одразу — зачекайте 10–20 секунд (перший старт триваліший) і оновіть сторінку. Видалення — через **Пуск → Параметри → Програми → Handler Device Manager → Видалити** (або «Програми та засоби»).
@@ -272,7 +282,17 @@ Tested on: STMicro-class 58 mm USB, Epson TM-i (network), Xprinter XP-246B (48 m
 
 ### Install
 
-#### macOS / Linux / Raspberry Pi
+#### macOS
+
+Two options — whichever you prefer:
+
+- **`.dmg` installer** (double-click) — pick the one for your chip:
+  **[Apple Silicon (M1–M4)](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-silicon.dmg)** · **[Intel](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-intel.dmg)**.
+  Not sure which you have?  → **About This Mac**: "Chip" (Apple M…) or "Processor" (Intel).
+  Open the image and drag **Barhandler Manager** to **Applications** — then just double-click it. The build is signed with a Developer ID and notarized by Apple, so there is no "unidentified developer" prompt and no right-click dance. Runs in the background, auto-starts at login. Data lives in `~/.barhandler-manager`.
+- **Or via the terminal** (no Gatekeeper prompt at all): `curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash`
+
+#### Linux / Raspberry Pi
 
 ```bash
 curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh | bash
@@ -280,7 +300,7 @@ curl -fsSL https://github.com/goodpesik/barhandler-manager/releases/latest/downl
 
 #### Windows
 
-Installation is performed by the **[barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe)** installer — it requires neither administrator rights nor Python.
+Installation is performed by the **[device-handler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-setup.exe)** installer — it requires neither administrator rights nor Python.
 
 The installer automatically removes any previous version (including the old Python install and its auto-start task), installs the current one clean, configures start-up at logon, and adds an entry to "Apps & features" for later removal. USB printing goes through the standard Windows printer driver (the printer stays available to other applications); the PrivatBank USB terminal works over a virtual COM port. Updates are applied with the **"⬆ Update"** button on the dashboard.
 
@@ -320,8 +340,8 @@ After install: `http://localhost:9999/` for the dashboard, `http://localhost:999
 
 #### 🪟 More detail — Windows
 
-1. **Download.** The [barhandler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-setup.exe) file is saved to the Downloads folder.
-2. **Installation.** Run `barhandler-setup.exe` → **Next → Install**. If a *"Windows protected your PC" (SmartScreen)* prompt appears, choose **"More info" → "Run anyway"**: the file is unsigned, which is expected. Administrator rights are not required.
+1. **Download.** The [device-handler-setup.exe](https://github.com/goodpesik/barhandler-manager/releases/latest/download/device-handler-setup.exe) file is saved to the Downloads folder.
+2. **Installation.** Run `device-handler-setup.exe` → **Next → Install**. If a *"Windows protected your PC" (SmartScreen)* prompt appears, choose **"More info" → "Run anyway"**: the file is unsigned, which is expected. Administrator rights are not required.
 3. **Completion.** The installer removes any previous version, installs the current one, enables auto-start, and launches the manager; the dashboard opens at **http://localhost:9999/**.
 
 > **Note.** If the dashboard doesn't open immediately, wait 10–20 seconds (the first start is slower) and refresh. Uninstall via **Start → Settings → Apps → Handler Device Manager → Uninstall** (or "Apps & features").

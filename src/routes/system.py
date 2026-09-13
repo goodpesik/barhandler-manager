@@ -63,16 +63,21 @@ def _build_update_argv() -> tuple[list[str], str]:
     """
     if IS_WIN and FROZEN:
         # Standalone .exe: download the latest installer and run it silently.
-        # barhandler-setup.exe (Inno, PrivilegesRequired=lowest → no UAC)
+        # device-handler-setup.exe (Inno, PrivilegesRequired=lowest → no UAC)
         # stops+cleans the running exe, installs fresh, and relaunches the
         # manager itself. We just fetch it and hand off. -Wait keeps this
         # detached PowerShell alive until the installer is done (the manager
         # it kills is a different process, so this survives the restart).
+        #
+        # Ім'я активу нове (BH-148/BH-149), і саме тому реліз публікує ще й
+        # КОПІЮ під старим ім'ям barhandler-setup.exe: копії, вже встановлені
+        # в полі, тягнуть старе ім'я цим самим кодом зі СВОЄЇ версії. Прибрати
+        # старий актив можна буде тоді, коли таких інсталяцій не лишиться.
         inner = (
             "Start-Sleep -Seconds 2; "
             "$u = 'https://github.com/goodpesik/barhandler-manager"
-            "/releases/latest/download/barhandler-setup.exe'; "
-            "$tmp = Join-Path $env:TEMP 'barhandler-setup.exe'; "
+            "/releases/latest/download/device-handler-setup.exe'; "
+            "$tmp = Join-Path $env:TEMP 'device-handler-setup.exe'; "
             "Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri $u -OutFile $tmp; "
             "if ((Get-Item $tmp).Length -lt 100000) { "
             "Write-Host 'update: installer download too small — nothing changed'; exit 1 }; "
