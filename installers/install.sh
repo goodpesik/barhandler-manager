@@ -299,6 +299,7 @@ EOF
         # скомпільований бінарник `bhm`, і патерн вище в нього не влучає. Без
         # цього install.sh «успішно» завершувався, а порт лишався за .app
         # (знайдено ревʼю).
+        pkill -f "Device Handler.app/Contents/MacOS/bhm" 2>/dev/null || true
         pkill -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true
         # SIGTERM triggers uvicorn's graceful shutdown which can take
         # 5+ seconds. Wait up to 10s for the process to actually exit;
@@ -312,10 +313,12 @@ EOF
         # посеред запису config.yaml чи printers.json.
         for i in 1 2 3 4 5 6 7 8 9 10; do
             pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1 && { sleep 1; continue; }
+            pgrep -f "Device Handler.app/Contents/MacOS/bhm" >/dev/null 2>&1 && { sleep 1; continue; }
             pgrep -f "BarhandlerManager.app/Contents/MacOS/bhm" >/dev/null 2>&1 || break
             sleep 1
         done
         pkill -9 -f "$INSTALL_DIR/main.py" 2>/dev/null || true
+        pkill -9 -f "Device Handler.app/Contents/MacOS/bhm" 2>/dev/null || true
         pkill -9 -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true
         sleep 1
         launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST" 2>&1 || \
@@ -457,7 +460,9 @@ echo "▸ stopping Handler Device Manager"
 # is a no-op if no process matches.
 $SERVICE_CMD_STOP 2>/dev/null || true
 pkill -f "$INSTALL_DIR/main.py" 2>/dev/null || true
-# .dmg-копія — окремий процес, її стоп-скрипт теж мусить знімати.
+# Копія із пакета — окремий процес, її стоп-скрипт теж мусить знімати.
+# Друга назва — бандл до BH-150, у полі такі установки ще є.
+pkill -f "Device Handler.app/Contents/MacOS/bhm" 2>/dev/null || true
 pkill -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true
 EOF
 

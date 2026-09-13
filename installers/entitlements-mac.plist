@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Hardened runtime entitlements для BarhandlerManager.app.
+  Hardened runtime entitlements для «Device Handler.app».
 
   Нотаризація вимагає hardened runtime, а він за замовчуванням забороняє те, на
   чому тримається збірка PyInstaller одним файлом: застосунок при старті

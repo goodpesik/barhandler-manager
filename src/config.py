@@ -18,7 +18,7 @@ def _app_dir() -> Path:
     Windows: the directory that contains the .exe (its install dir under
     %LocalAppData%, which is user-writable).
 
-    macOS (.app): the executable lives inside `BarhandlerManager.app/
+    macOS (.app): the executable lives inside `Device Handler.app/
     Contents/MacOS/` — typically under /Applications, which ISN'T user-
     writable. So the mac build keeps its data in `~/.barhandler-manager`,
     the SAME place the curl|bash installer uses — the two installs share

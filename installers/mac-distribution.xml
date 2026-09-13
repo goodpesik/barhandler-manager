@@ -36,7 +36,9 @@ function check_not_installed() {
     // Наявність застосунку — єдина ознака, на яку можна спертися до
     // розпакування: bundle id в системі з'являється лише після першого
     // запуску, а нам треба відповісти ще на вітальному екрані.
-    if (system.files.fileExistsAtPath("/Applications/BarhandlerManager.app")) {
+    // Дві назви: нова і та, що лишилась від установок до BH-150.
+    if (system.files.fileExistsAtPath("/Applications/Device Handler.app") ||
+        system.files.fileExistsAtPath("/Applications/BarhandlerManager.app")) {
         my.result.title = "Device Handler вже встановлено";
         my.result.message = "Продовжити — і наявна копія оновиться до цієї версії.\n\n" +
             "Видалити менеджер можна кнопкою «Видалити менеджер» на сторінці " +

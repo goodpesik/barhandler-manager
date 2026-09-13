@@ -1,23 +1,27 @@
 #!/usr/bin/env bash
 #
-# Підписати BarhandlerManager.app, запакувати в .dmg і (якщо є креденшели)
+# Підписати «Device Handler.app», зібрати з нього .pkg-інсталятор і
 # пронотаризувати його в Apple. Кличуть обидва мак-джоби:
 #   .github/workflows/publish.yml        — релізний канал
 #   .github/workflows/build-exe-dev.yml  — нічний канал
 #
-#   scripts/mac_sign_and_package.sh <шлях до .app> <шлях до .dmg> [шлях до .pkg]
+#   scripts/mac_sign_and_package.sh <шлях до .app> <шлях до .pkg>
 #
-# Третій аргумент необовʼязковий: якщо він є, поряд із .dmg збирається ще й
-# .pkg-інсталятор (BH-150). Збирається ТУТ, а не окремим кроком, свідомо —
-# productsign шукає сертифікат Developer ID Installer у keychain, а вона
-# тимчасова й живе лише до виходу з цього скрипта. Окремий крок у workflow
-# знайшов би порожньо й тихо віддав непідписаний пакет.
+# .dmg ми більше не випускаємо: поки в релізі лежали і пакет, і образ, люди
+# відкривали образ — і отримували те саме перетягування в Applications без
+# жодного підтвердження, від якого й починався BH-150. Один спосіб установки
+# на архітектуру, без вибору «правильного» файлу.
+#
+# Пакет збирається ТУТ, а не окремим кроком, свідомо: productsign шукає
+# сертифікат Developer ID Installer у keychain, а вона тимчасова й живе лише
+# до виходу з цього скрипта. Окремий крок у workflow знайшов би порожньо й
+# тихо віддав непідписаний пакет.
 #
 # Два режими, і вибирає їх наявність секретів, а не прапорець:
 #
 #   ПОВНИЙ — є MAC_CERT_P12_BASE64 + MAC_CERT_PASSWORD: підпис сертифікатом
 #   Developer ID Application з hardened runtime, міткою часу й entitlements.
-#   Якщо додатково є MAC_NOTARY_* — .dmg їде в нотаризацію і отримує staple,
+#   Якщо додатково є MAC_NOTARY_* — пакет їде в нотаризацію і отримує staple,
 #   після чого відкривається подвійним кліком без жодних питань.
 #
 #   AD-HOC — секретів немає (форк, чужа гілка): `codesign --sign -`. Це знімає
@@ -29,9 +33,7 @@
 set -euo pipefail
 
 APP="${1:?перший аргумент — шлях до .app}"
-DMG="${2:?другий аргумент — шлях до .dmg на виході}"
-PKG="${3:-}"
-VOLNAME="${MAC_DMG_VOLNAME:-Barhandler Manager}"
+PKG="${2:?другий аргумент — шлях до .pkg на виході}"
 ENTITLEMENTS="${MAC_ENTITLEMENTS:-installers/entitlements-mac.plist}"
 
 [ -d "$APP" ] || { echo "::error::немає $APP"; exit 1; }
@@ -50,7 +52,6 @@ fi
 KEYCHAIN=""
 WORKDIR=""
 P12=""
-STAGE=""
 cleanup() {
   # Зносимо ЗАВЖДИ — і на помилці теж. Розшифрований .p12 тут головний: якщо
   # `security import` упаде (хибний пароль, битий base64), `set -e` перерве
@@ -58,7 +59,6 @@ cleanup() {
   # (знайдено ревʼю — попередній варіант прибирав лише keychain).
   [ -n "$KEYCHAIN" ] && security delete-keychain "$KEYCHAIN" 2>/dev/null || true
   [ -n "$WORKDIR" ] && rm -rf "$WORKDIR" || true
-  [ -n "$STAGE" ] && rm -rf "$STAGE" || true
 }
 trap cleanup EXIT
 
@@ -120,45 +120,7 @@ fi
 echo "==> Перевіряю підпис застосунку"
 codesign --verify --deep --strict --verbose=2 "$APP"
 
-echo "==> Пакую .dmg"
-STAGE="$(mktemp -d)"
-cp -R "$APP" "$STAGE/"
-ln -s /Applications "$STAGE/Applications"
-mkdir -p "$(dirname "$DMG")"
-hdiutil create -volname "$VOLNAME" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
-rm -rf "$STAGE"
+echo "==> Збираю .pkg, поки keychain із сертифікатами ще жива"
+bash scripts/mac_build_pkg.sh "$APP" "$PKG"
 
-if [ -n "$sign_identity" ]; then
-  # Сам образ теж підписуємо: Gatekeeper перевіряє підпис .dmg ще до того, як
-  # людина дістанеться застосунку всередині.
-  echo "==> Підписую .dmg"
-  codesign --force --timestamp --sign "$sign_identity" "$DMG"
-fi
-
-if [ -n "$sign_identity" ] && [ -n "${MAC_NOTARY_APPLE_ID:-}" ] \
-   && [ -n "${MAC_NOTARY_PASSWORD:-}" ] && [ -n "${MAC_NOTARY_TEAM_ID:-}" ]; then
-  echo "==> Нотаризація (чекаю вердикт Apple)"
-  # --wait: без нього джоба завершиться раніше за перевірку, і staple нічого
-  # не знайде. Помилку не глушимо: непронотаризований .dmg у релізі — це
-  # той самий «unidentified developer», тільки вже під нашим підписом.
-  xcrun notarytool submit "$DMG" \
-    --apple-id "$MAC_NOTARY_APPLE_ID" \
-    --password "$MAC_NOTARY_PASSWORD" \
-    --team-id "$MAC_NOTARY_TEAM_ID" \
-    --wait --timeout 20m
-
-  echo "==> Приклеюю тікет (staple)"
-  xcrun stapler staple "$DMG"
-
-  echo "==> Перевіряю очима Gatekeeper"
-  spctl -a -t open --context context:primary-signature -v "$DMG"
-else
-  echo "==> Нотаризацію пропущено (немає MAC_NOTARY_* або підпис ad-hoc)"
-fi
-
-if [ -n "$PKG" ]; then
-  echo "==> Збираю .pkg, поки keychain із сертифікатами ще жива"
-  bash scripts/mac_build_pkg.sh "$APP" "$PKG"
-fi
-
-echo "==> Готово: $DMG${PKG:+ і $PKG}"
+echo "==> Готово: $PKG"

@@ -1,13 +1,23 @@
+<!DOCTYPE html>
 <!-- BH-150 — вітальний екран майстра. Українською: інсталятор ставлять
-     власники студій і барів, а не розробники. -->
+     власники студій і барів, а не розробники.
+
+     ДОКТАЙП МУСИТЬ БУТИ ПЕРШИМ РЯДКОМ. Installer.app вирішує, чи це HTML,
+     за початком файлу, а `mime-type` у distribution ігнорує. Поки цей
+     коментар стояв перед доктайпом, майстер показував людині ВИХІДНИЙ КОД
+     сторінки замість сторінки (знайдено на живій установці 13.09).
+
+     CSS тут майже весь декоративний: панель малює NSAttributedString, а не
+     WebKit. Колір тексту не задаємо — Installer ставить свій під світлу й
+     темну теми, і будь-який наш `color` дає темне на темному. -->
 <html>
 <head><meta charset="utf-8">
 <style>
-  body { font: 13px -apple-system, "Helvetica Neue", sans-serif; color: #1d1d1f; margin: 0; }
+  body { font: 13px -apple-system, "Helvetica Neue", sans-serif; margin: 0; }
   h2 { font-size: 15px; margin: 0 0 10px; }
   p { margin: 0 0 10px; line-height: 1.45; }
   ul { margin: 0 0 10px 18px; padding: 0; line-height: 1.45; }
-  code { font: 12px "SF Mono", Menlo, monospace; background: #f2f2f4; padding: 1px 4px; border-radius: 3px; }
+  code { font: 12px "SF Mono", Menlo, monospace; }
 </style></head>
 <body>
   <h2>Device Handler</h2>

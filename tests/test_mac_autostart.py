@@ -45,7 +45,7 @@ def test_noop_when_not_frozen(home, monkeypatch):
 
 
 def test_noop_when_not_darwin(home, monkeypatch):
-    exe = home / "Applications" / "BarhandlerManager.app" / "Contents" / "MacOS" / "bhm"
+    exe = home / "Applications" / "Device Handler.app" / "Contents" / "MacOS" / "bhm"
     _as_frozen_app(monkeypatch, exe)
     monkeypatch.setattr(sys, "platform", "win32")
 
@@ -55,7 +55,7 @@ def test_noop_when_not_darwin(home, monkeypatch):
 
 
 def test_registers_when_missing(home, monkeypatch):
-    exe = home / "Applications" / "BarhandlerManager.app" / "Contents" / "MacOS" / "bhm"
+    exe = home / "Applications" / "Device Handler.app" / "Contents" / "MacOS" / "bhm"
     exe.parent.mkdir(parents=True)
     exe.touch()
     _as_frozen_app(monkeypatch, exe)
@@ -80,7 +80,7 @@ def test_keeps_script_install_autostart(home, monkeypatch):
     plist.parent.mkdir(parents=True)
     plist.write_bytes(plistlib.dumps({"Label": "x", "ProgramArguments": script_args}))
 
-    exe = home / "Applications" / "BarhandlerManager.app" / "Contents" / "MacOS" / "bhm"
+    exe = home / "Applications" / "Device Handler.app" / "Contents" / "MacOS" / "bhm"
     exe.parent.mkdir(parents=True)
     exe.touch()
     _as_frozen_app(monkeypatch, exe)
@@ -93,12 +93,12 @@ def test_keeps_script_install_autostart(home, monkeypatch):
 def test_retargets_another_app_copy(home, monkeypatch):
     """А ось перенесену/переставлену .app-копію перенаправляємо на себе:
     інакше після переїзду в /Applications автозапуск указував би в нікуди."""
-    old = home / "Downloads" / "BarhandlerManager.app" / "Contents" / "MacOS" / "bhm"
+    old = home / "Downloads" / "Device Handler.app" / "Contents" / "MacOS" / "bhm"
     plist = _plist(home)
     plist.parent.mkdir(parents=True)
     plist.write_bytes(plistlib.dumps({"Label": "x", "ProgramArguments": [str(old)]}))
 
-    exe = home / "Applications" / "BarhandlerManager.app" / "Contents" / "MacOS" / "bhm"
+    exe = home / "Applications" / "Device Handler.app" / "Contents" / "MacOS" / "bhm"
     exe.parent.mkdir(parents=True)
     exe.touch()
     _as_frozen_app(monkeypatch, exe)
@@ -114,7 +114,7 @@ def test_never_raises_on_broken_plist(home, monkeypatch):
     plist.parent.mkdir(parents=True)
     plist.write_bytes(b"\x00 not a plist")
 
-    exe = home / "Applications" / "BarhandlerManager.app" / "Contents" / "MacOS" / "bhm"
+    exe = home / "Applications" / "Device Handler.app" / "Contents" / "MacOS" / "bhm"
     exe.parent.mkdir(parents=True)
     exe.touch()
     _as_frozen_app(monkeypatch, exe)
@@ -161,7 +161,7 @@ def _fake_sm(monkeypatch, service):
 
 
 def _bundle_with_agent(home: Path) -> Path:
-    exe = home / "Applications" / "BarhandlerManager.app" / "Contents" / "MacOS" / "bhm"
+    exe = home / "Applications" / "Device Handler.app" / "Contents" / "MacOS" / "bhm"
     exe.parent.mkdir(parents=True)
     exe.touch()
     agents = exe.parent.parent / "Library" / "LaunchAgents"
@@ -172,7 +172,7 @@ def _bundle_with_agent(home: Path) -> Path:
 
 def test_service_management_skipped_without_bundled_agent(home, monkeypatch):
     """Немає плиста в бандлі — нема чого реєструвати; йдемо старим шляхом."""
-    exe = home / "Applications" / "BarhandlerManager.app" / "Contents" / "MacOS" / "bhm"
+    exe = home / "Applications" / "Device Handler.app" / "Contents" / "MacOS" / "bhm"
     exe.parent.mkdir(parents=True)
     exe.touch()
     _as_frozen_app(monkeypatch, exe)

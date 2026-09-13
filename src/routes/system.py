@@ -292,7 +292,11 @@ async def trigger_update() -> dict:
 # повторному запуску каже «вже встановлено», а зняти менеджер можна кнопкою —
 # не через термінал і не перетягуванням у корзину, після якого лишаються
 # агент автозапуску й тека даних.
-_MAC_APP = Path("/Applications/BarhandlerManager.app")
+_MAC_APP = Path("/Applications/Device Handler.app")
+# Назва бандла до BH-150. Видалення мусить знати обидві: у полі є інсталяції,
+# поставлені під старою назвою, і лишити їх означає лишити робочий агент, який
+# «повернe» менеджер при наступному вході.
+_MAC_APP_LEGACY = Path("/Applications/BarhandlerManager.app")
 _MAC_AGENT_LABEL = "com.goodpesik.barhandler-manager"
 _MAC_AGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_MAC_AGENT_LABEL}.plist"
 _UNINSTALL_LOG = APP_DIR / "uninstall.log"
@@ -321,13 +325,16 @@ def _build_uninstall_script(purge_data: bool) -> str:
         # не змогли, то й не змогли, решта видалення має доробитись.
         f'rm -f "/Library/LaunchAgents/{_MAC_AGENT_LABEL}.plist" 2>/dev/null || true',
         f'rm -rf "{_MAC_APP}"',
+        f'rm -rf "{_MAC_APP_LEGACY}"',
     ]
     if purge_data:
         steps.append(f'rm -rf "{APP_DIR}"')
     # Себе вбиваємо останнім: доти скрипт має доробити все інше. -f саме по
     # шляху бінарника в бандлі — щоб не влучити в скриптову інсталяцію, якщо
     # людина тримає обидві.
+    # Обидві назви бандла: нова й та, під якою стоять інсталяції до BH-150.
     steps.append(
+        'pkill -f "Device Handler.app/Contents/MacOS/bhm" 2>/dev/null || true; '
         'pkill -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true',
     )
     return " && ".join(steps[:-1]) + "; " + steps[-1]
@@ -344,7 +351,7 @@ async def trigger_uninstall(request: Request, purge_data: bool = False) -> dict:
     if not IS_MAC_APP_INSTALL:
         raise HTTPException(
             status_code=400,
-            detail="кнопка видалення працює лише для застосунку macOS з .dmg/.pkg",
+            detail="кнопка видалення працює лише для застосунку macOS з Applications",
         )
 
     # Знайдено ревʼю. Ключ API у нас статичний і лежить у відкритому репо, а
