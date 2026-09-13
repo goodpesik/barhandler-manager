@@ -44,7 +44,15 @@ if is_installed && [ $FORCE -eq 0 ]; then
         # fresh Termux session where runsv hasn't scanned yet; fall
         # straight to direct nohup spawn so the operator gets a
         # working manager, not a noise message.
-        if ! sv up "$SERVICE_NAME" 2>/dev/null; then
+        # `is_running` вище питає /health. Процес може бути ЖИВИЙ і просто ще
+        # підніматись (на старому планшеті імпорт Pillow + zeroconf — до
+        # хвилини), і тоді друга копія дає колізію на порті 9999: одна тримає,
+        # другу runit піднімає по колу кожні 3 секунди. Саме це 13.09.2026
+        # зривало платежі в барі — термінал показував суму й пікав, а сесію
+        # обривало разом із копією, яку runit убивав.
+        if pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1; then
+            say "manager process is already running — waiting for it to answer"
+        elif ! sv up "$SERVICE_NAME" 2>/dev/null; then
             warn "runit not ready — spawning manager directly"
             (
                 cd "$INSTALL_DIR" && \
@@ -235,8 +243,37 @@ sv up "$SERVICE_NAME" >/dev/null 2>&1 || true
 # fresh install — runsvdir starts at next shell login), spawn the
 # Python directly via nohup so the manager is running RIGHT NOW. The
 # user gets working software immediately; runit takes over on reboot.
-sleep 1
-if ! curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
+#
+# ЧОМУ ТУТ ДОВГЕ ОЧІКУВАННЯ, А НЕ `sleep 1`:
+# 13.09.2026 у клієнта на планшеті працювали ДВІ копії менеджера. Одна
+# тримала порт 9999, другу runit піднімав по колу кожні 3 секунди з
+# `[Errno 98] address already in use`. Фронт при цьому то бачив менеджер,
+# то ні, а платіж падав із «Manager terminal unavailable».
+#
+# Причина була саме тут: ми чекали ОДНУ секунду. Старт uvicorn на планшеті
+# — 4+ секунди (видно в їхньому ж лозі), тож перевірка не встигала, і ми
+# щоразу запускали другу копію поверх тієї, яку вже підняв runit.
+#
+# Тепер: чекаємо здоровʼя до 30 секунд, і перед запуском другої копії
+# перевіряємо, чи процес узагалі є. Якщо є — не плодимо, хай доходить.
+ANDROID_UP=0
+for i in $(seq 1 30); do
+    if curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
+        ANDROID_UP=1
+        break
+    fi
+    sleep 1
+done
+
+if [ "$ANDROID_UP" -eq 0 ] && pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1; then
+    # Процес живий, просто ще піднімається (на слабкому планшеті перший
+    # старт після оновлення залежностей буває довгим). Друга копія тут
+    # зробила б рівно ту колізію, через яку цей коментар і написаний.
+    say "manager is starting up (supervised) — not spawning a second copy"
+    ANDROID_UP=1
+fi
+
+if [ "$ANDROID_UP" -eq 0 ]; then
     say "service supervisor not ready — spawning manager directly"
     # Run from $INSTALL_DIR so any code that reads config.yaml / VERSION
     # via cwd-relative paths still works (runit's `run` script also
