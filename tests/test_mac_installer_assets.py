@@ -13,11 +13,16 @@
 
 from __future__ import annotations
 
+import plistlib
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
-RESOURCES = Path(__file__).resolve().parents[1] / "installers" / "mac-resources"
+REPO = Path(__file__).resolve().parents[1]
+RESOURCES = REPO / "installers" / "mac-resources"
 PAGES = ["welcome.html", "conclusion.html"]
 
 
@@ -97,23 +102,137 @@ def test_system_wide_agent_is_written_only_where_nobody_is_logged_in() -> None:
     )
 
 
-def test_pkg_build_disables_bundle_relocation() -> None:
-    """Пакет не має права переставити застосунок у чужу теку.
+def _code_lines(path: Path) -> list[str]:
+    return [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
 
-    Знайдено на живій установці 13.09: `pkgbuild` типово позначає бандли
-    `BundleIsRelocatable`, і installd через Spotlight шукає вже наявну копію з
-    тим самим CFBundleIdentifier і кладе вміст ПОВЕРХ НЕЇ. На машині власника
-    такою копією виявилась локальна збірка в `dist/` — установка «успішна»,
-    агент зареєстрований на /Applications, а там порожньо.
 
-    Шлях зашитий у LaunchAgent, у кнопку видалення й у перевірку «вже
-    встановлено», тож переміщення для нас — вада. Тест тримає всі три ланки
-    виправлення: опис компонента, знятий прапорець, передачу опису в pkgbuild.
+def test_pkg_build_uses_the_component_description() -> None:
+    """`pkgbuild` мусить збирати пакет саме з нашим описом компонента.
+
+    Попередня версія цього тесту шукала рядки в усьому файлі, разом із
+    коментарями — знайдено ревʼю: так вона проходила б і тоді, коли робочі
+    рядки закомічено, а пояснення лишилось. Тому дивимось лише на КОД і
+    перевіряємо звʼязок: опис складається, і той самий файл іде в pkgbuild.
     """
-    script = (
-        Path(__file__).resolve().parents[1] / "scripts" / "mac_build_pkg.sh"
-    ).read_text(encoding="utf-8")
+    code = _code_lines(REPO / "scripts" / "mac_build_pkg.sh")
+    joined = "\n".join(code)
 
-    assert "pkgbuild --analyze" in script, "опис компонента ніхто не складає"
-    assert "Set :0:BundleIsRelocatable false" in script, "прапорець переміщення не знято"
-    assert "--component-plist" in script, "опис компонента не передано в pkgbuild"
+    assert "mac_component_plist.sh" in joined, "опис компонента ніхто не складає"
+    assert "--component-plist" in joined, "опис компонента не передано в pkgbuild"
+
+    made = next(i for i, line in enumerate(code) if "mac_component_plist.sh" in line)
+    used = next(i for i, line in enumerate(code) if "--component-plist" in line)
+    assert made < used, "опис передають у pkgbuild раніше, ніж він створений"
+
+
+def test_component_script_clears_both_flags_and_checks_the_result() -> None:
+    """У описі знімаємо ОБА прапорці й переконуємось, що це справді сталося.
+
+    `BundleIsRelocatable` — щоб пакет не поставився поверх копії, знайденої
+    Spotlight (саме так вміст поїхав у теку `dist/`). `BundleIsVersionChecked`
+    — щоб копія з більшим номером версії не блокувала розпакування тихо:
+    скрипти тоді відпрацюють, файл на місці, усі перевірки задоволені, а вміст
+    із пакета не поставився (знайдено ревʼю).
+    """
+    code = "\n".join(_code_lines(REPO / "scripts" / "mac_component_plist.sh"))
+
+    for key in ("BundleIsRelocatable", "BundleIsVersionChecked"):
+        assert f"Set :0:$key false" in code or f"Set :0:{key} false" in code, key
+        assert key in code
+
+    assert "Print :0:$key" in code or "Print :0:" in code, (
+        "результат не перечитують — PlistBuddy на помилці часто повертає 0"
+    )
+    assert "Print :1" in code, "ніхто не перевіряє, що бандл у пакеті один"
+    assert "ChildBundles" in code, "вкладені бандли лишились без перевірки"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="pkgbuild і PlistBuddy є лише на macOS")
+@pytest.mark.skipif(shutil.which("pkgbuild") is None, reason="немає pkgbuild")
+def test_built_package_relocates_nothing(tmp_path: Path) -> None:
+    """Справжня перевірка механізму: збираємо пакет і дивимось у PackageInfo.
+
+    Текстові перевірки вище ловлять лише видалені рядки. Ця — поводження: із
+    типовим описом у PackageInfo лежить `<relocate><bundle …></relocate>`, і
+    саме він відправив вміст у чужу теку. Після нашого опису `<relocate>`
+    мусить бути порожній.
+    """
+    app = tmp_path / "root" / "Applications" / "Device Handler.app" / "Contents" / "MacOS"
+    app.mkdir(parents=True)
+    (app / "bhm").write_text("#!/bin/sh\n")
+    (app / "bhm").chmod(0o755)
+    (app.parent / "Info.plist").write_bytes(
+        plistlib.dumps(
+            {
+                "CFBundleIdentifier": "com.goodpesik.barhandler-manager",
+                "CFBundleName": "Device Handler",
+                "CFBundleExecutable": "bhm",
+                "CFBundleShortVersionString": "9.9.9",
+                "CFBundlePackageType": "APPL",
+            }
+        )
+    )
+
+    component = tmp_path / "component.plist"
+    subprocess.run(
+        ["bash", str(REPO / "scripts" / "mac_component_plist.sh"), str(tmp_path / "root"), str(component)],
+        check=True,
+        capture_output=True,
+    )
+    described = plistlib.loads(component.read_bytes())
+    assert described[0]["BundleIsRelocatable"] is False
+    assert described[0]["BundleIsVersionChecked"] is False
+
+    pkg = tmp_path / "app.pkg"
+    subprocess.run(
+        [
+            "pkgbuild",
+            "--root", str(tmp_path / "root"),
+            "--component-plist", str(component),
+            "--identifier", "com.goodpesik.barhandler-manager.app",
+            "--version", "9.9.9",
+            "--install-location", "/",
+            str(pkg),
+        ],
+        check=True,
+        capture_output=True,
+    )
+
+    expanded = tmp_path / "expanded"
+    subprocess.run(["pkgutil", "--expand", str(pkg), str(expanded)], check=True, capture_output=True)
+    info = (expanded / "PackageInfo").read_text(encoding="utf-8")
+
+    relocate = info[info.index("<relocate") : info.index(">", info.index("<relocate")) + 1]
+    if not relocate.endswith("/>"):
+        block = info[info.index("<relocate>") : info.index("</relocate>")]
+        assert "<bundle" not in block, f"бандл лишився переміщуваним: {block}"
+
+
+def test_legacy_bundle_is_removed_only_after_the_new_one_is_confirmed() -> None:
+    """Стару копію зносимо ЛИШЕ коли нова вже на місці.
+
+    Знайдено ревʼю: у зворотному порядку невдале розпакування лишало машину
+    взагалі без менеджера — гірше, ніж було до установки. Помилку показати
+    мало, її треба не робити.
+    """
+    code = _code_lines(REPO / "installers" / "mac-postinstall.sh")
+    check = next(i for i, line in enumerate(code) if line.startswith("if [ ! -x \"$APP\" ]"))
+    removal = next(i for i, line in enumerate(code) if 'rm -rf "$OLD_APP"' in line)
+    assert check < removal, "перевірка нової копії мусить стояти перед знесенням старої"
+
+
+def test_postinstall_respects_the_target_volume() -> None:
+    """Шляхи беруться від тома установки, а не жорстко від «/».
+
+    `installer -target /Volumes/X` (розгортання образу, MDM) кладе вміст на
+    інший том. Із жорстким /Applications перевірка вище не знайшла б застосунку
+    й завалила б установку без причини (знайдено ревʼю).
+    """
+    code = "\n".join(_code_lines(REPO / "installers" / "mac-postinstall.sh"))
+    assert 'TARGET="${3:-/}"' in code, "том установки ($3) не читається"
+    assert 'APP="$TARGET/Applications' in code, "шлях застосунку не залежить від тома"
+    assert 'OLD_APP="$TARGET/Applications' in code, "шлях старої копії не залежить від тома"

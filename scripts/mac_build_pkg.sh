@@ -44,25 +44,11 @@ mkdir -p "$SCRIPTS" "$ROOT"
 cp -R "$APP" "$ROOT/"
 install -m 755 "$POSTINSTALL" "$SCRIPTS/postinstall"
 
-# --- заборона переміщення -----------------------------------------------------
-# Знайдено на живій установці 13.09: пакет поставився НЕ в /Applications, а в
-# теку, де лежала інша копія застосунку (`dist/` після локальної збірки). У
-# лозі це видно рядком «PackageKit: Registered bundle file:///…/dist/Device
-# Handler.app/». Причина — типове поводження pkgbuild: бандли він позначає
-# `BundleIsRelocatable`, і installd через Spotlight шукає вже наявну копію з
-# тим самим CFBundleIdentifier та кладе вміст ПОВЕРХ НЕЇ, де б вона не була.
-#
-# Для нас це вада, а не зручність: шлях зашитий і в LaunchAgent, і в кнопку
-# видалення, і в перевірку «вже встановлено». Досить, щоб у людини колись
-# полежала копія в Downloads — і установка «успішна», а менеджер не працює.
-#
-# Лікується описом компонента: беремо той, що pkgbuild склав би сам
-# (`--analyze`), і вимикаємо в ньому переміщення.
-echo "==> pkgbuild --analyze (опис компонента)"
-pkgbuild --analyze --root "$WORKDIR/root" "$WORKDIR/component.plist"
-/usr/libexec/PlistBuddy -c "Set :0:BundleIsRelocatable false" "$WORKDIR/component.plist"
-/usr/libexec/PlistBuddy -c "Print :0:BundleIsRelocatable" "$WORKDIR/component.plist" | grep -qx false \
-  || { echo "::error::не вдалося вимкнути BundleIsRelocatable"; exit 1; }
+# --- заборона переміщення й пропуску установки ----------------------------------
+# Подробиці — у scripts/mac_component_plist.sh: там і причина (пакет поставився
+# в чужу теку), і що саме знімається.
+echo "==> опис компонента"
+bash "$(dirname "$0")/mac_component_plist.sh" "$WORKDIR/root" "$WORKDIR/component.plist"
 
 echo "==> pkgbuild ($VERSION)"
 pkgbuild --root "$WORKDIR/root" \
