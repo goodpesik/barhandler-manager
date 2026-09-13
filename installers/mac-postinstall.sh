@@ -34,6 +34,16 @@ if [ -d "$OLD_APP" ]; then
   rm -f "/Library/LaunchAgents/$LABEL.plist" 2>/dev/null || true
 fi
 
+# Застосунок мусить лежати саме там, куди вказуватиме агент. Перевіряємо
+# ЯВНО: 13.09 інсталятор через relocatable-бандл переклав вміст у чужу теку
+# (див. коментар у scripts/mac_build_pkg.sh), postinstall бадьоро зареєстрував
+# агент на /Applications, фінальний екран сказав «менеджер працює» — а не було
+# ні застосунку, ні процесу. Краще показати збій установки, ніж таку тишу.
+if [ ! -x "$APP" ]; then
+  echo "device-handler: застосунку немає за шляхом $APP — установка неповна"
+  exit 1
+fi
+
 # Хто зараз у графічній сесії. `stat /dev/console` — єдиний надійний спосіб:
 # $USER тут root, $SUDO_USER не заданий (пакет ставить installd, не sudo),
 # а `logname` під installd може не мати tty.

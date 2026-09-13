@@ -95,3 +95,25 @@ def test_system_wide_agent_is_written_only_where_nobody_is_logged_in() -> None:
     assert min(removals) < writes[0], (
         "системний агент пишеться раніше, ніж зноситься — headless-установка лишиться без агента"
     )
+
+
+def test_pkg_build_disables_bundle_relocation() -> None:
+    """Пакет не має права переставити застосунок у чужу теку.
+
+    Знайдено на живій установці 13.09: `pkgbuild` типово позначає бандли
+    `BundleIsRelocatable`, і installd через Spotlight шукає вже наявну копію з
+    тим самим CFBundleIdentifier і кладе вміст ПОВЕРХ НЕЇ. На машині власника
+    такою копією виявилась локальна збірка в `dist/` — установка «успішна»,
+    агент зареєстрований на /Applications, а там порожньо.
+
+    Шлях зашитий у LaunchAgent, у кнопку видалення й у перевірку «вже
+    встановлено», тож переміщення для нас — вада. Тест тримає всі три ланки
+    виправлення: опис компонента, знятий прапорець, передачу опису в pkgbuild.
+    """
+    script = (
+        Path(__file__).resolve().parents[1] / "scripts" / "mac_build_pkg.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "pkgbuild --analyze" in script, "опис компонента ніхто не складає"
+    assert "Set :0:BundleIsRelocatable false" in script, "прапорець переміщення не знято"
+    assert "--component-plist" in script, "опис компонента не передано в pkgbuild"
