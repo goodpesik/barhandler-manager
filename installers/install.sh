@@ -43,6 +43,26 @@ is_installed() {
     [ -x "$INSTALL_DIR/.venv/bin/python" ] && [ -f "$INSTALL_DIR/main.py" ]
 }
 
+# «Процес менеджера живий?» — це НЕ те саме, що is_running: /health не відповідає
+# і поки процес тільки піднімається. Через змішування цих питань інсталятор
+# запускав другу копію поверх живої, і дві бились за порт 9999 (BH-151).
+#
+# Патернів три — стільки ж, скільки в знесенні нижче: скриптова інсталяція і два
+# імені мак-бандла. Знайдено ревʼю: із одним лише main.py запобіжник не бачив
+# застосунку з пакета, тобто саме той процес, що тримає порт.
+manager_alive() {
+    _alive_pattern() {
+        if command -v pgrep >/dev/null 2>&1; then
+            pgrep -f "$1" >/dev/null 2>&1
+        else
+            ps -A -o args= 2>/dev/null | grep -F "$1" | grep -qv grep
+        fi
+    }
+    _alive_pattern "$INSTALL_DIR/main.py" \
+        || _alive_pattern "Device Handler.app/Contents/MacOS/bhm" \
+        || _alive_pattern "BarhandlerManager.app/Contents/MacOS/bhm"
+}
+
 # --- short-circuit if already installed ------------------------------
 if is_installed && [ $FORCE -eq 0 ]; then
     if is_running; then
@@ -346,6 +366,12 @@ EOF
         done
         if [ $LAUNCHD_OK -eq 1 ]; then
             say "launchd service installed and started"
+        elif manager_alive; then
+            # Процес є, просто ще не відповідає — на слабкій машині перший
+            # старт після оновлення залежностей довгий. Друга копія тут дала б
+            # колізію на порті 9999: одна тримає, другу служба піднімає по колу
+            # (так і сталося 13.09 на Android, див. install-android.sh).
+            say "manager is starting up under launchd — not spawning a second copy"
         else
             warn "launchd accepted the plist but the manager didn't come up — falling back to direct spawn"
             (
@@ -419,7 +445,14 @@ if curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
     exit 0
 fi
 echo "▸ starting Handler Device Manager"
-if ! $SERVICE_CMD_START; then
+# /health не відповів — але процес може бути живий і ще підніматись. Друга
+# копія тут дає колізію на порті 9999: одна тримає, другу служба піднімає по
+# колу. 13.09.2026 саме це зривало платежі в барі (див. install-android.sh).
+if pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1 \
+   || pgrep -f "Device Handler.app/Contents/MacOS/bhm" >/dev/null 2>&1 \
+   || pgrep -f "BarhandlerManager.app/Contents/MacOS/bhm" >/dev/null 2>&1; then
+    echo "▸ manager process is already running — waiting for it to answer"
+elif ! $SERVICE_CMD_START; then
     echo "⚠ service manager (launchctl/systemd) refused — falling back to direct spawn"
     # nohup keeps it alive after this shell closes; \`disown\` removes it
     # from the shell's job table so Ctrl+C here doesn't kill it. The

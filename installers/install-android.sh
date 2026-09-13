@@ -24,6 +24,21 @@ warn() { printf '\033[1;33m⚠\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m✗\033[0m %s\n' "$*" >&2; exit 1; }
 
 is_running() { curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; }
+
+# «Процес менеджера живий?» — окремо від is_running, бо це РІЗНІ питання:
+# /health не відповідає і поки процес тільки піднімається (на планшеті це
+# 4+ секунди, а з холодним імпортом Pillow — до хвилини). Саме через змішування
+# цих двох питань 13.09 інсталятор плодив другу копію (BH-151).
+#
+# pgrep може бути відсутній (procps не в базі Термукса) — тоді падаємо на `ps`,
+# щоб перевірка не перетворилась тихо на «не працює».
+manager_alive() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1
+    else
+        ps -A -o args= 2>/dev/null | grep -F "$INSTALL_DIR/main.py" | grep -qv grep
+    fi
+}
 is_installed() { [ -x "$INSTALL_DIR/.venv/bin/python" ] && [ -f "$INSTALL_DIR/main.py" ]; }
 
 # --- sanity check ----------------------------------------------------
@@ -44,7 +59,15 @@ if is_installed && [ $FORCE -eq 0 ]; then
         # fresh Termux session where runsv hasn't scanned yet; fall
         # straight to direct nohup spawn so the operator gets a
         # working manager, not a noise message.
-        if ! sv up "$SERVICE_NAME" 2>/dev/null; then
+        # `is_running` вище питає /health. Процес може бути ЖИВИЙ і просто ще
+        # підніматись (на старому планшеті імпорт Pillow + zeroconf — до
+        # хвилини), і тоді друга копія дає колізію на порті 9999: одна тримає,
+        # другу runit піднімає по колу кожні 3 секунди. Саме це 13.09.2026
+        # зривало платежі в барі — термінал показував суму й пікав, а сесію
+        # обривало разом із копією, яку runit убивав.
+        if manager_alive; then
+            say "manager process is already running — waiting for it to answer"
+        elif ! sv up "$SERVICE_NAME" 2>/dev/null; then
             warn "runit not ready — spawning manager directly"
             (
                 cd "$INSTALL_DIR" && \
@@ -94,8 +117,12 @@ say "installing required Termux packages"
 # (or png, zlib, freetype). We don't import Pillow ourselves, but
 # python-escpos does (for image-based receipts / labels), so the install
 # fails at pip step without these headers. Add them up front.
+# procps — це `pgrep`/`pkill`. Термукс не завжди має їх у базі, а на них
+# тримаються ДВІ речі: знесення старого процесу перед оновленням і перевірка
+# «чи менеджер уже працює» перед запуском другої копії. Без них перевірка
+# просто завжди «не працює» — тобто вертається баг 13.09 (BH-151), і мовчки.
 pkg install -y \
-    python rust binutils libusb termux-api termux-services \
+    python rust binutils libusb termux-api termux-services procps \
     curl wget tar rsync \
     libjpeg-turbo libpng zlib freetype
 
@@ -235,8 +262,40 @@ sv up "$SERVICE_NAME" >/dev/null 2>&1 || true
 # fresh install — runsvdir starts at next shell login), spawn the
 # Python directly via nohup so the manager is running RIGHT NOW. The
 # user gets working software immediately; runit takes over on reboot.
-sleep 1
-if ! curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
+#
+# ЧОМУ ТУТ ДОВГЕ ОЧІКУВАННЯ, А НЕ `sleep 1`:
+# 13.09.2026 у клієнта на планшеті працювали ДВІ копії менеджера. Одна
+# тримала порт 9999, другу runit піднімав по колу кожні 3 секунди з
+# `[Errno 98] address already in use`. Фронт при цьому то бачив менеджер,
+# то ні, а платіж падав із «Manager terminal unavailable».
+#
+# Причина була саме тут: ми чекали ОДНУ секунду. Старт uvicorn на планшеті
+# — 4+ секунди (видно в їхньому ж лозі), тож перевірка не встигала, і ми
+# щоразу запускали другу копію поверх тієї, яку вже підняв runit.
+#
+# Тепер: чекаємо здоровʼя до 30 секунд, і перед запуском другої копії
+# перевіряємо, чи процес узагалі є. Якщо є — не плодимо, хай доходить.
+ANDROID_UP=0
+for i in $(seq 1 30); do
+    if curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
+        ANDROID_UP=1
+        break
+    fi
+    sleep 1
+done
+
+NEED_SPAWN=0
+if [ "$ANDROID_UP" -eq 0 ]; then
+    if manager_alive; then
+        # Процес живий, просто ще піднімається. Друга копія тут зробила б рівно
+        # ту колізію, через яку цей коментар і написаний.
+        say "manager is starting up (supervised) — not spawning a second copy"
+    else
+        NEED_SPAWN=1
+    fi
+fi
+
+if [ "$NEED_SPAWN" -eq 1 ]; then
     say "service supervisor not ready — spawning manager directly"
     # Run from $INSTALL_DIR so any code that reads config.yaml / VERSION
     # via cwd-relative paths still works (runit's `run` script also
@@ -247,30 +306,34 @@ if ! curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
             > "$INSTALL_DIR/bhm.boot.log" 2>&1 &
         disown 2>/dev/null || true
     )
-    # Wait up to 2 minutes for the NEW version specifically — Pillow
-    # import + zeroconf spinup + first device scan can take 30-60s on
-    # lower-end Android. Match against VERSION file so a stale process
-    # answering before its SIGTERM completes doesn't fool us.
-    EXPECTED_VERSION="$(cat "$INSTALL_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')"
-    WAIT=0
-    printf '%s' "▸ waiting for server (0s)"
-    while [ $WAIT -lt 120 ]; do
-        RESP="$(curl -fsS --max-time 2 http://localhost:9999/health 2>/dev/null || true)"
-        if [ -n "$EXPECTED_VERSION" ] && \
-           echo "$RESP" | grep -q "\"version\":\"$EXPECTED_VERSION\""; then
-            printf '\n'
-            say "✓ v${EXPECTED_VERSION} running at http://localhost:9999 (took ${WAIT}s)"
-            break
-        fi
-        sleep 5
-        WAIT=$((WAIT + 5))
-        printf '\r▸ waiting for server (%ds)' "$WAIT"
-    done
-    if [ $WAIT -ge 120 ] && ! is_running; then
+fi
+
+# Перевірка результату — ЗАВЖДИ, хай ми запускали копію самі чи лишили службі.
+# Знайдено ревʼю: доти вона лежала всередині `if`, і гілка «процес живий» його
+# проминала — скрипт друкував успіх і виходив 0, навіть якщо той процес назавжди
+# завис і /health не відповів ні разу.
+#
+# Порівнюємо саме з VERSION, а не з будь-якою відповіддю: старий процес, який ще
+# не добив SIGTERM, теж відповідає на /health і так може обдурити.
+EXPECTED_VERSION="$(cat "$INSTALL_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')"
+WAIT=0
+printf '%s' "▸ waiting for server (0s)"
+while [ $WAIT -lt 120 ]; do
+    RESP="$(curl -fsS --max-time 2 http://localhost:9999/health 2>/dev/null || true)"
+    if [ -n "$EXPECTED_VERSION" ] && \
+       echo "$RESP" | grep -q "\"version\":\"$EXPECTED_VERSION\""; then
         printf '\n'
-        warn "didn't answer within 120s — check $INSTALL_DIR/bhm.boot.log"
-        warn "    tail -50 $INSTALL_DIR/bhm.boot.log"
+        say "✓ v${EXPECTED_VERSION} running at http://localhost:9999 (took ${WAIT}s)"
+        break
     fi
+    sleep 5
+    WAIT=$((WAIT + 5))
+    printf '\r▸ waiting for server (%ds)' "$WAIT"
+done
+if [ $WAIT -ge 120 ] && ! is_running; then
+    printf '\n'
+    warn "didn't answer within 120s — check $INSTALL_DIR/bhm.boot.log"
+    warn "    tail -50 $INSTALL_DIR/bhm.boot.log"
 fi
 
 # --- helper scripts --------------------------------------------------
@@ -281,7 +344,12 @@ if curl -fsS --max-time 1 http://localhost:9999/health >/dev/null 2>&1; then
     exit 0
 fi
 echo "▸ starting Handler Device Manager"
-if ! sv up $SERVICE_NAME 2>/dev/null; then
+# /health не відповів — але процес може бути живий і ще підніматись. Друга
+# копія дає колізію на порті 9999: одна тримає, другу runit піднімає по колу
+# кожні 3 секунди, і платежі на терміналі зриваються (BH-151).
+if pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1; then
+    echo "▸ manager process is already running — waiting for it to answer"
+elif ! sv up $SERVICE_NAME 2>/dev/null; then
     echo "⚠ runit not ready — spawning manager directly"
     (
         cd $INSTALL_DIR && \\
