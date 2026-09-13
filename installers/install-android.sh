@@ -316,6 +316,7 @@ fi
 # Порівнюємо саме з VERSION, а не з будь-якою відповіддю: старий процес, який ще
 # не добив SIGTERM, теж відповідає на /health і так може обдурити.
 EXPECTED_VERSION="$(cat "$INSTALL_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')"
+VERSION_OK=0
 WAIT=0
 printf '%s' "▸ waiting for server (0s)"
 while [ $WAIT -lt 120 ]; do
@@ -324,16 +325,25 @@ while [ $WAIT -lt 120 ]; do
        echo "$RESP" | grep -q "\"version\":\"$EXPECTED_VERSION\""; then
         printf '\n'
         say "✓ v${EXPECTED_VERSION} running at http://localhost:9999 (took ${WAIT}s)"
+        VERSION_OK=1
         break
     fi
     sleep 5
     WAIT=$((WAIT + 5))
     printf '\r▸ waiting for server (%ds)' "$WAIT"
 done
-if [ $WAIT -ge 120 ] && ! is_running; then
+# Дивимось на РЕЗУЛЬТАТ ПЕРЕВІРКИ ВЕРСІЇ, а не на «хтось відповідає на /health».
+# Доти умова була `! is_running` — а стара копія, яка ще тримає порт, на /health
+# відповідає. Тобто найгірший випадок (нова версія не піднялась, працює стара)
+# не давав ані попередження: скрипт мовчки друкував успіх і виходив 0 (знайдено
+# другим колом ревʼю). Це та сама пастка, про яку попереджає коментар вище.
+if [ "$VERSION_OK" -eq 0 ]; then
     printf '\n'
-    warn "didn't answer within 120s — check $INSTALL_DIR/bhm.boot.log"
+    warn "v${EXPECTED_VERSION:-?} didn't answer within 120s — check $INSTALL_DIR/bhm.boot.log"
     warn "    tail -50 $INSTALL_DIR/bhm.boot.log"
+    if is_running; then
+        warn "    на порті 9999 щось відповідає — схоже, стара копія не завершилась"
+    fi
 fi
 
 # --- helper scripts --------------------------------------------------
@@ -347,7 +357,19 @@ echo "▸ starting Handler Device Manager"
 # /health не відповів — але процес може бути живий і ще підніматись. Друга
 # копія дає колізію на порті 9999: одна тримає, другу runit піднімає по колу
 # кожні 3 секунди, і платежі на терміналі зриваються (BH-151).
-if pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1; then
+#
+# Хелпер свій, бо це окремий файл: функції інсталятора тут недоступні. І з
+# фолбеком на ps — без нього, коли в Термуксі немає procps, `pgrep` каже
+# «не знайдено», перевірка тихо стає «не працює», і баг вертається (знайдено
+# другим колом ревʼю: спершу тут стояв голий pgrep).
+alive() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1
+    else
+        ps -A -o args= 2>/dev/null | grep -F "$INSTALL_DIR/main.py" | grep -qv grep
+    fi
+}
+if alive; then
     echo "▸ manager process is already running — waiting for it to answer"
 elif ! sv up $SERVICE_NAME 2>/dev/null; then
     echo "⚠ runit not ready — spawning manager directly"

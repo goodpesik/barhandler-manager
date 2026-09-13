@@ -448,9 +448,22 @@ echo "▸ starting Handler Device Manager"
 # /health не відповів — але процес може бути живий і ще підніматись. Друга
 # копія тут дає колізію на порті 9999: одна тримає, другу служба піднімає по
 # колу. 13.09.2026 саме це зривало платежі в барі (див. install-android.sh).
-if pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1 \
-   || pgrep -f "Device Handler.app/Contents/MacOS/bhm" >/dev/null 2>&1 \
-   || pgrep -f "BarhandlerManager.app/Contents/MacOS/bhm" >/dev/null 2>&1; then
+# Хелпер свій: це окремий файл, функції інсталятора тут недоступні. Патернів
+# три — скриптова інсталяція і два імені мак-бандла (застосунок із .pkg — то
+# окремий бінарник, і саме він тримає порт). Фолбек на ps — щоб перевірка не
+# стала тихо «не працює» там, де немає pgrep.
+alive() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "$INSTALL_DIR/main.py" >/dev/null 2>&1 \
+            || pgrep -f "Device Handler.app/Contents/MacOS/bhm" >/dev/null 2>&1 \
+            || pgrep -f "BarhandlerManager.app/Contents/MacOS/bhm" >/dev/null 2>&1
+    else
+        ps -A -o args= 2>/dev/null | grep -F -e "$INSTALL_DIR/main.py" \
+            -e "Device Handler.app/Contents/MacOS/bhm" \
+            -e "BarhandlerManager.app/Contents/MacOS/bhm" | grep -qv grep
+    fi
+}
+if alive; then
     echo "▸ manager process is already running — waiting for it to answer"
 elif ! $SERVICE_CMD_START; then
     echo "⚠ service manager (launchctl/systemd) refused — falling back to direct spawn"
@@ -551,6 +564,7 @@ chmod +x "$INSTALL_DIR/start.sh" "$INSTALL_DIR/stop.sh" "$INSTALL_DIR/status.sh"
 # success. Match the response against the VERSION file we just rsynced
 # in to know we're talking to the freshly-installed code.
 EXPECTED_VERSION="$(cat "$INSTALL_DIR/VERSION" 2>/dev/null | tr -d '[:space:]')"
+VERSION_OK=0
 WAIT_MAX=120
 WAIT_ELAPSED=0
 printf '%s' "▸ waiting for server (0s)"
@@ -560,16 +574,23 @@ while [ $WAIT_ELAPSED -lt $WAIT_MAX ]; do
        echo "$RESP" | grep -q "\"version\":\"$EXPECTED_VERSION\""; then
         printf '\n'
         say "✓ manager v${EXPECTED_VERSION} is up at http://localhost:9999 (took ${WAIT_ELAPSED}s)"
+        VERSION_OK=1
         break
     fi
     sleep 5
     WAIT_ELAPSED=$((WAIT_ELAPSED + 5))
     printf '\r▸ waiting for server (%ds)' "$WAIT_ELAPSED"
 done
-if [ $WAIT_ELAPSED -ge $WAIT_MAX ] && ! is_running; then
+# За результатом перевірки ВЕРСІЇ, а не за «хтось відповідає»: стара копія, що
+# не завершилась і тримає порт, теж відповідає на /health — і тоді найгірший
+# випадок проходив без жодного попередження (знайдено другим колом ревʼю).
+if [ "${VERSION_OK:-0}" -eq 0 ]; then
     printf '\n'
-    warn "manager didn't answer /health within ${WAIT_MAX}s — check ${INSTALL_DIR}/bhm.boot.log"
+    warn "manager v${EXPECTED_VERSION:-?} didn't come up within ${WAIT_MAX}s — check ${INSTALL_DIR}/bhm.boot.log"
     warn "    tail -50 ${INSTALL_DIR}/bhm.boot.log"
+    if is_running; then
+        warn "    something answers on port 9999 — looks like the old copy is still there"
+    fi
 fi
 
 cat <<EOF
