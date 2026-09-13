@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Hardened runtime entitlements для BarhandlerManager.app.
+
+  Нотаризація вимагає hardened runtime, а він за замовчуванням забороняє те, на
+  чому тримається збірка PyInstaller одним файлом: застосунок при старті
+  розпаковує свої .so/.dylib у тимчасову теку й вантажить їх звідти.
+
+  disable-library-validation — дозволяє вантажити бібліотеки, підписані не тим
+  самим Team ID (libusb для pyusb, бібліотеки Python).
+  allow-unsigned-executable-memory — цього потребує сам CPython.
+
+  Без цих двох застосунок нотаризацію ПРОЙДЕ, але впаде при запуску: саме такий
+  збій найважче пояснити, бо Gatekeeper при цьому мовчить.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+	<key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+	<true/>
+</dict>
+</plist>
