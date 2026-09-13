@@ -79,13 +79,20 @@ if [ -n "${MAC_CERT_P12_BASE64:-}" ] && [ -n "${MAC_CERT_PASSWORD:-}" ]; then
   security create-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
   security set-keychain-settings -lut 21600 "$KEYCHAIN"
   security unlock-keychain -p "$KEYCHAIN_PASS" "$KEYCHAIN"
-  # -A не ставимо: доступ дається лише codesign/security, а не всьому, що
-  # запуститься на раннері.
+  # -A не ставимо: доступ дається переліченим інструментам, а не всьому, що
+  # запуститься на раннері. productsign і productbuild тут ОБОВʼЯЗКОВІ:
+  # пакет підписує саме productsign, і без дозволу macOS не падає, а піднімає
+  # вікно авторизації — у CI його нікому натиснути, і джоба висить годинами
+  # (так і сталось на релізі v0.5.0: 2+ години на кроці підпису).
   security import "$P12" -k "$KEYCHAIN" -P "$MAC_CERT_PASSWORD" \
-    -T /usr/bin/codesign -T /usr/bin/security
+    -T /usr/bin/codesign -T /usr/bin/security \
+    -T /usr/bin/productsign -T /usr/bin/productbuild
   rm -f "$P12"
   # Без цього codesign на кожен підпис підняв би GUI-запит і завис би в CI.
-  security set-key-partition-list -S apple-tool:,apple:,codesign: \
+  # productsign: і productbuild: — окремі партиції, і їхня відсутність давала
+  # рівно той самий беззвучний зависання на підписі пакета.
+  security set-key-partition-list \
+    -S apple-tool:,apple:,codesign:,productsign:,productbuild: \
     -s -k "$KEYCHAIN_PASS" "$KEYCHAIN" >/dev/null
   # Додаємо в пошук, не витісняючи системні — інакше зникне доступ до
   # кореневих сертифікатів, і notarytool не зможе перевірити ланцюжок.
@@ -138,7 +145,7 @@ if [ -n "$sign_identity" ] && [ -n "${MAC_NOTARY_APPLE_ID:-}" ] \
     --apple-id "$MAC_NOTARY_APPLE_ID" \
     --password "$MAC_NOTARY_PASSWORD" \
     --team-id "$MAC_NOTARY_TEAM_ID" \
-    --wait
+    --wait --timeout 20m
 
   echo "==> Приклеюю тікет (staple)"
   xcrun stapler staple "$DMG"

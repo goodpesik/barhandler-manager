@@ -82,7 +82,7 @@ if [ -n "$installer_identity" ] && [ -n "${MAC_NOTARY_APPLE_ID:-}" ] \
     --apple-id "$MAC_NOTARY_APPLE_ID" \
     --password "$MAC_NOTARY_PASSWORD" \
     --team-id "$MAC_NOTARY_TEAM_ID" \
-    --wait
+    --wait --timeout 20m
   echo "==> Приклеюю тікет (staple)"
   xcrun stapler staple "$PKG"
   echo "==> Перевірка очима Gatekeeper"

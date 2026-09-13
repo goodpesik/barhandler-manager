@@ -86,6 +86,10 @@ jobs:
           - runner: macos-15-intel
             arch: intel
     runs-on: ${{ matrix.runner }}
+    # Тверда межа: підпис, який чекає на вікно авторизації, або нотаризація,
+    # що зависла в черзі Apple, не мають тримати CI годинами. Реліз v0.5.0
+    # простояв 2+ години саме так.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
