@@ -5,7 +5,13 @@
 #   .github/workflows/publish.yml        — релізний канал
 #   .github/workflows/build-exe-dev.yml  — нічний канал
 #
-#   scripts/mac_sign_and_package.sh <шлях до .app> <шлях до .dmg на виході>
+#   scripts/mac_sign_and_package.sh <шлях до .app> <шлях до .dmg> [шлях до .pkg]
+#
+# Третій аргумент необовʼязковий: якщо він є, поряд із .dmg збирається ще й
+# .pkg-інсталятор (BH-150). Збирається ТУТ, а не окремим кроком, свідомо —
+# productsign шукає сертифікат Developer ID Installer у keychain, а вона
+# тимчасова й живе лише до виходу з цього скрипта. Окремий крок у workflow
+# знайшов би порожньо й тихо віддав непідписаний пакет.
 #
 # Два режими, і вибирає їх наявність секретів, а не прапорець:
 #
@@ -24,6 +30,7 @@ set -euo pipefail
 
 APP="${1:?перший аргумент — шлях до .app}"
 DMG="${2:?другий аргумент — шлях до .dmg на виході}"
+PKG="${3:-}"
 VOLNAME="${MAC_DMG_VOLNAME:-Barhandler Manager}"
 ENTITLEMENTS="${MAC_ENTITLEMENTS:-installers/entitlements-mac.plist}"
 
@@ -131,4 +138,9 @@ else
   echo "==> Нотаризацію пропущено (немає MAC_NOTARY_* або підпис ad-hoc)"
 fi
 
-echo "==> Готово: $DMG"
+if [ -n "$PKG" ]; then
+  echo "==> Збираю .pkg, поки keychain із сертифікатами ще жива"
+  bash scripts/mac_build_pkg.sh "$APP" "$PKG"
+fi
+
+echo "==> Готово: $DMG${PKG:+ і $PKG}"
