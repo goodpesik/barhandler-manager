@@ -1,7 +1,8 @@
 # Підпис і нотаризація macOS-збірки — що зробити в Apple
 
-Щоб `.dmg` відкривався подвійним кліком без «unidentified developer», збірку треба
-підписати сертифікатом **Developer ID Application** і пронотаризувати в Apple.
+Щоб інсталятор відкривався подвійним кліком без «unidentified developer», збірку
+треба підписати (застосунок — **Developer ID Application**, пакет — **Developer ID
+Installer**) і пронотаризувати в Apple.
 Сертифікат і креденшели створює власник акаунта один раз; CI далі робить усе саме.
 
 Нижче — рівно ті кроки, які потрібні, і рівно ті пʼять значень, які треба покласти
@@ -115,14 +116,16 @@ base64 -i ~/Downloads/developer-id.p12 | pbcopy
 1. створює тимчасову keychain і ставить туди `.p12`;
 2. підписує `.app` сертифікатом Developer ID з **hardened runtime**, міткою часу
    і entitlements з `installers/entitlements-mac.plist`;
-3. пакує `.dmg` і підписує його теж;
-4. надсилає `.dmg` у нотаризацію (`xcrun notarytool submit --wait`), чекає
+3. кличе `scripts/mac_build_pkg.sh`, поки keychain ще живий: той збирає `.pkg`
+   (`pkgbuild` + `productbuild` з майстром) і підписує його сертифікатом
+   **Developer ID Installer** — це ІНШИЙ сертифікат, `codesign` тут не годиться;
+4. надсилає `.pkg` у нотаризацію (`xcrun notarytool submit --wait`), чекає
    вердикту, робить `xcrun stapler staple`;
-5. перевіряє результат (`spctl -a -t open`) і зносить тимчасову keychain.
+5. перевіряє результат (`spctl -a -t install`) і зносить тимчасову keychain.
 
 Без секретів (форк, чужа гілка, нічна збірка) той самий скрипт підписує ad-hoc і
-нотаризацію пропускає — збірка не падає, але такий `.dmg` відкривається лише
-через right-click → **Open**.
+нотаризацію пропускає — збірка не падає, але такий пакет система відкриє лише
+після дозволу в **System Settings → Privacy & Security**.
 
 ## Чому потрібні entitlements
 

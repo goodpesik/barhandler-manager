@@ -129,8 +129,6 @@ jobs:
             echo "- Apple Silicon: device-handler-silicon.pkg"
             echo "- Intel: device-handler-intel.pkg"
             echo
-            echo "Same builds as .dmg (drag to Applications): device-handler-silicon.dmg, device-handler-intel.dmg"
-            echo
             echo "**macOS / Linux / Raspberry Pi — script**"
             echo '```bash'
             echo "curl -fsSL https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/install.sh | bash"
@@ -224,8 +222,8 @@ jobs:
             dist/bhm.exe
             dist/barhandler-setup.exe
 
-  # Build the macOS .app on mac runners, wrap it in a .dmg and attach it to the
-  # same release. TWO artifacts, not one: PyInstaller freezes for the
+  # Build the macOS .app on mac runners, wrap it in a .pkg installer and attach
+  # it to the same release. TWO artifacts, not one: PyInstaller freezes for the
   # architecture it runs on, so Apple Silicon and Intel each need their own
   # build. universal2 is not an option here — it needs a universal Python and
   # universal wheels for every dependency, and libusb does not play along.
@@ -235,7 +233,7 @@ jobs:
   build-macos-app:
     needs: [release, test]
     strategy:
-      fail-fast: false   # an Intel hiccup must not withhold the Silicon .dmg
+      fail-fast: false   # an Intel hiccup must not withhold the Silicon build
       matrix:
         include:
           - runner: macos-15
@@ -259,7 +257,7 @@ jobs:
           python-version: "3.12"
       # README обіцяє підписану й пронотаризовану збірку БЕЗ застережень, а сам
       # скрипт свідомо вміє ad-hoc, щоб не валити форки. На РЕЛІЗНОМУ каналі
-      # така поблажливість означала б тихо випущений .dmg із «unidentified
+      # така поблажливість означала б тихо випущений пакет із «unidentified
       # developer» при README, який каже протилежне. Тому тут секрети
       # обовʼязкові (знайдено ревʼю).
       # Перевіряємо ВСІ ПʼЯТЬ, а не два: підпис включає пара
@@ -298,17 +296,15 @@ jobs:
           MAC_NOTARY_TEAM_ID: ${{ secrets.MAC_NOTARY_TEAM_ID }}
         run: |
           bash scripts/mac_sign_and_package.sh \
-            dist/BarhandlerManager.app \
-            "dist/device-handler-${{ matrix.arch }}.dmg" \
+            "dist/Device Handler.app" \
             "dist/device-handler-${{ matrix.arch }}.pkg"
       # Не action-gh-release: дві джоби матриці пишуть в ОДИН реліз паралельно,
       # а той екшн оновлює реліз цілком (в історії є гонка «Existing releases
       # are no longer updated»). `gh release upload` додає конкретний файл —
       # незалежні виклики не заважають одне одному. Знайдено ревʼю.
-      - name: Attach .dmg to the release
+      - name: Attach .pkg to the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release upload "${{ needs.release.outputs.tag }}" \
-            "dist/device-handler-${{ matrix.arch }}.pkg" \
-            "dist/device-handler-${{ matrix.arch }}.dmg" --clobber
+            "dist/device-handler-${{ matrix.arch }}.pkg" --clobber

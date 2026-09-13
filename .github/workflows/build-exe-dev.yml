@@ -63,14 +63,14 @@ jobs:
             dist/bhm.exe
             dist/barhandler-setup.exe
 
-  # macOS .app → .dmg, TEST channel. Runs after build-windows so both jobs
-  # don't race to create the `nightly` release; this one only adds the .dmg.
+  # macOS .app → signed .pkg, TEST channel. Runs after build-windows so both
+  # jobs don't race to create the `nightly` release; this one only adds .pkg.
   # Нічний канал: обидві архітектури, підпис Developer ID є, а нотаризації
   # НЕМА — палити запит до Apple на кожну нічну збірку не треба. Механіка саме
   # така: ad-hoc чи повний підпис скрипт обирає за MAC_CERT_*, а MAC_NOTARY_*
   # лише вмикає нотаризацію; тут ми передаємо перші й не передаємо другі.
   # (Знайдено ревʼю: попередній коментар описував цей вибір неправильно.)
-  # Такий .dmg Gatekeeper пустить лише через System Settings — це свідомо,
+  # Такий пакет Gatekeeper пустить лише через System Settings — це свідомо,
   # бо на нічний канал ні README, ні релізні нотатки не посилаються.
   build-macos:
     needs: build-windows
@@ -105,12 +105,11 @@ jobs:
           MAC_CERT_PASSWORD: ${{ secrets.MAC_CERT_PASSWORD }}
         run: |
           bash scripts/mac_sign_and_package.sh \
-            dist/BarhandlerManager.app \
-            "dist/device-handler-${{ matrix.arch }}.dmg" \
+            "dist/Device Handler.app" \
             "dist/device-handler-${{ matrix.arch }}.pkg"
       # Той самий привід, що й у релізному каналі: дві джоби матриці не мають
       # переписувати пререлізний обʼєкт одночасно.
-      - name: Publish .dmg to nightly prerelease
+      - name: Publish .pkg to nightly prerelease
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -118,5 +117,4 @@ jobs:
             gh release create nightly --prerelease \
               --title "nightly (test build — NOT a release)" --notes "nightly build"
           gh release upload nightly \
-            "dist/device-handler-${{ matrix.arch }}.pkg" \
-            "dist/device-handler-${{ matrix.arch }}.dmg" --clobber
+            "dist/device-handler-${{ matrix.arch }}.pkg" --clobber

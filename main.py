@@ -83,8 +83,9 @@ if __name__ == "__main__":
     # on write, so route them to the rotating log file before use.
     import sys
 
-    # Frozen mac .app: register a login autostart LaunchAgent (the .dmg has
-    # no installer script to do it). No-op on Windows/source runs, and it
+    # Frozen mac .app: register a login autostart LaunchAgent. The .pkg
+    # postinstall already does it, but a bundle copied by hand (or left over
+    # from the old .dmg) has nobody to. No-op on Windows/source runs, and it
     # never takes over an autostart that points at a curl|bash install.
     from src.services.mac_autostart import ensure_launch_agent
     ensure_launch_agent()

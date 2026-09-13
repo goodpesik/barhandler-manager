@@ -105,8 +105,10 @@ exe = EXE(
 # Dock icon, no menu bar) — it's a server, not a window. Data lives in
 # ~/.barhandler-manager (see src/config._app_dir), not inside the bundle,
 # because /Applications isn't user-writable. CI signs the .app with a
-# Developer ID, notarizes it and wraps it in a .dmg — scripts/mac_sign_and_
-# package.sh, called from the macos jobs in both workflows (BH-148).
+# Developer ID, notarizes it and wraps it in a signed .pkg installer —
+# scripts/mac_sign_and_package.sh plus scripts/mac_build_pkg.sh, called from
+# the macos jobs in both workflows (BH-148, BH-150). The .dmg flavour is
+# gone: dragging the bundle told nobody whether anything had happened.
 import sys as _sys
 
 if _sys.platform == "darwin":
@@ -116,7 +118,11 @@ if _sys.platform == "darwin":
         _ver = "0.0.0"
     app = BUNDLE(
         exe,
-        name="BarhandlerManager.app",
+        # Імʼя ФАЙЛУ бандла, а не лише CFBundleName: Finder і тека Applications
+        # показують саме його. Доти там стояло «BarhandlerManager» — назва, яку
+        # людина в чужій студії прочитати не може (BH-150, знайдено власником
+        # на живій установці).
+        name="Device Handler.app",
         # BH-150 — без іконки macOS малює типову «виконуваний файл», і в
         # Applications застосунок виглядає як щось випадкове.
         icon="installers/device-handler.icns",

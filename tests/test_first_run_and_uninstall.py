@@ -166,8 +166,19 @@ def test_uninstall_kill_pattern_targets_only_the_app():
     скриптову інсталяцію, якщо людина тримає обидві."""
     cmd = system_routes._build_uninstall_script(purge_data=False)
 
-    assert "BarhandlerManager.app/Contents/MacOS/bhm" in cmd
+    assert "Device Handler.app/Contents/MacOS/bhm" in cmd
     assert 'pkill -f "bhm"' not in cmd
+
+
+def test_uninstall_covers_the_old_bundle_name():
+    """До BH-150 бандл звався BarhandlerManager.app, і такі інсталяції в полі
+    є. Лишити їх означає лишити робочий агент, який підніме менеджер при
+    наступному вході — тобто «видалив, а воно повернулось»."""
+    cmd = system_routes._build_uninstall_script(purge_data=False)
+
+    assert '/Applications/Device Handler.app' in cmd
+    assert '/Applications/BarhandlerManager.app' in cmd
+    assert "BarhandlerManager.app/Contents/MacOS/bhm" in cmd
 
 
 # ── оновлення мак-застосунку ───────────────────────────────────────────────

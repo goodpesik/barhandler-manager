@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# BH-150 — зібрати .pkg-інсталятор із уже підписаного BarhandlerManager.app.
+# BH-150 — зібрати .pkg-інсталятор із уже підписаного «Device Handler.app».
 #
 #   scripts/mac_build_pkg.sh <шлях до .app> <шлях до .pkg на виході>
 #

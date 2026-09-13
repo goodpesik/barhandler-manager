@@ -17,7 +17,22 @@
 set -u
 
 LABEL="com.goodpesik.barhandler-manager"
-APP="/Applications/BarhandlerManager.app/Contents/MacOS/bhm"
+APP="/Applications/Device Handler.app/Contents/MacOS/bhm"
+# Стара назва бандла — з установок до BH-150. Її треба знести, інакше дві
+# копії будуть воювати за порт 9999.
+OLD_APP="/Applications/BarhandlerManager.app"
+
+# Зносимо стару копію ПЕРШИМ ділом — до будь-яких розгалужень. Спершу це
+# стояло нижче, у гілці «за машиною хтось є», і установка по SSH або через
+# MDM (де нижче стоїть exit 0) лишала старий бандл на місці: два агенти,
+# обидва чекають порт 9999, працює випадковий (знайдено ревʼю).
+if [ -d "$OLD_APP" ]; then
+  echo "device-handler: зношу стару копію $OLD_APP"
+  rm -rf "$OLD_APP"
+  # Її агент указує на шлях, якого вже немає. Системний прибираємо тут,
+  # користувацький — нижче, разом із реєстрацією нового.
+  rm -f "/Library/LaunchAgents/$LABEL.plist" 2>/dev/null || true
+fi
 
 # Хто зараз у графічній сесії. `stat /dev/console` — єдиний надійний спосіб:
 # $USER тут root, $SUDO_USER не заданий (пакет ставить installd, не sudo),
