@@ -89,6 +89,12 @@ if __name__ == "__main__":
     from src.services.mac_autostart import ensure_launch_agent
     ensure_launch_agent()
 
+    # BH-150 — перший запуск мак-збірки відкриває дашборд, щоб було видно, що
+    # вона встановилась і працює: іконки в доку немає, вікна немає, і без цього
+    # людина не має жодної ознаки життя. Один раз за життя інсталяції.
+    from src.services.first_run import open_dashboard_once
+    open_dashboard_once(APP_DIR, config["server"]["port"])
+
     if sys.stdout is None or sys.stderr is None:
         _devlog = open(APP_DIR / "bhm.log", "a", encoding="utf-8")
         if sys.stdout is None:

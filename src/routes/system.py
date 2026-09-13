@@ -36,6 +36,9 @@ FROZEN = bool(getattr(sys, "frozen", False))
 
 from src.config import APP_DIR
 
+# Встановлений мак-застосунок (.dmg/.pkg), а не скриптова інсталяція й не вінда.
+IS_MAC_APP_INSTALL = bool(getattr(sys, "frozen", False)) and sys.platform == "darwin"
+
 _INSTALL_DIR = Path.home() / ".barhandler-manager"
 # The exe has no ~/.barhandler-manager; keep its update.log next to the exe
 # (APP_DIR), which the installer leaves in place across upgrades.
@@ -48,7 +51,10 @@ async def get_version() -> dict:
     # _MEIPASS too), not the cwd — the exe's cwd is arbitrary.
     version_file = Path(__file__).resolve().parent.parent.parent / "VERSION"
     version = version_file.read_text().strip() if version_file.exists() else "unknown"
-    return {"version": version}
+    # BH-150 — дашборд має знати, чи це встановлений мак-застосунок: кнопку
+    # видалення показуємо ЛИШЕ там, де вона справді щось знімає. У скриптовій
+    # інсталяції та на вінді за це відповідають їхні власні інсталятори.
+    return {"version": version, "mac_app_install": IS_MAC_APP_INSTALL}
 
 
 def _build_update_argv() -> tuple[list[str], str]:
@@ -219,6 +225,95 @@ async def trigger_update() -> dict:
         "status": "updating",
         "message": "Оновлення запущено — менеджер перезапуститься за ~30 секунд",
         "log": str(_UPDATE_LOG),
+    }
+
+
+# BH-150 — видалення мак-збірки.
+#
+# Власник просив, щоб установка поводилась як установка: інсталятор на
+# повторному запуску каже «вже встановлено», а зняти менеджер можна кнопкою —
+# не через термінал і не перетягуванням у корзину, після якого лишаються
+# агент автозапуску й тека даних.
+_MAC_APP = Path("/Applications/BarhandlerManager.app")
+_MAC_AGENT_LABEL = "com.goodpesik.barhandler-manager"
+_MAC_AGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{_MAC_AGENT_LABEL}.plist"
+_UNINSTALL_LOG = APP_DIR / "uninstall.log"
+
+def _build_uninstall_script(purge_data: bool) -> str:
+    """Команда видалення. Порядок кроків тут — не косметика.
+
+    Спершу знімаємо агент і лише потім зносимо застосунок: `KeepAlive: true`
+    підняв би його заново, якби файл зник раніше за plist, і ми отримали б
+    процес без застосунку, який launchd безкінечно перезапускає.
+
+    Теку даних зносимо ЛИШЕ на явну згоду: там конфіг і зареєстровані
+    принтери, тобто робота, яку людина робила руками.
+    """
+    steps = [
+        "sleep 2",
+        f'launchctl bootout "gui/$(id -u)/{_MAC_AGENT_LABEL}" 2>/dev/null || true',
+        f'rm -f "{_MAC_AGENT_PLIST}"',
+        f'rm -rf "{_MAC_APP}"',
+    ]
+    if purge_data:
+        steps.append(f'rm -rf "{APP_DIR}"')
+    # Себе вбиваємо останнім: доти скрипт має доробити все інше. -f саме по
+    # шляху бінарника в бандлі — щоб не влучити в скриптову інсталяцію, якщо
+    # людина тримає обидві.
+    steps.append(
+        'pkill -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true',
+    )
+    return " && ".join(steps[:-1]) + "; " + steps[-1]
+
+
+@router.post("/uninstall")
+async def trigger_uninstall(purge_data: bool = False) -> dict:
+    """Знести мак-збірку: агент автозапуску, застосунок і (за згодою) дані.
+
+    Тільки для встановленої мак-збірки. Скриптову інсталяцію знімає її власний
+    stop.sh/uninstall у ~/.barhandler-manager, а на вінді це робить Inno, тож
+    підміняти їх звідси — шлях до половинчасто знесених інсталяцій.
+    """
+    if not IS_MAC_APP_INSTALL:
+        raise HTTPException(
+            status_code=400,
+            detail="кнопка видалення працює лише для застосунку macOS з .dmg/.pkg",
+        )
+
+    cmd = _build_uninstall_script(purge_data)
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        with _UNINSTALL_LOG.open("a") as fh:
+            fh.write(
+                f"\n=== uninstall triggered {_dt.datetime.now().isoformat()} "
+                f"(pid={os.getpid()}, purge_data={purge_data}) ===\n",
+            )
+            fh.write(f"cmd: {cmd}\n")
+            fh.flush()
+        log_fh = _UNINSTALL_LOG.open("a")
+        try:
+            # start_new_session — інакше скрипт помре разом із процесом, який
+            # він же й убиває. Той самий прийом, що й в оновленні.
+            subprocess.Popen(
+                ["bash", "-c", cmd],
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+                start_new_session=True,
+            )
+        finally:
+            log_fh.close()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"не вдалось запустити видалення: {exc}") from exc
+
+    return {
+        "status": "uninstalling",
+        "purge_data": purge_data,
+        "message": (
+            "Менеджер знімається — за кілька секунд він зникне з Applications"
+            + (" разом із налаштуваннями" if purge_data else ", налаштування лишаються")
+        ),
+        "log": str(_UNINSTALL_LOG),
     }
 
 
