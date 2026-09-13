@@ -51,11 +51,37 @@ if [ -d "$OLD_APP" ]; then
   rm -f "$TARGET/Library/LaunchAgents/$LABEL.plist" 2>/dev/null || true
 fi
 
-# Ставлять на інший том — отже, зараз із нього ніхто не працює. Реєструвати
-# агент нікуди: launchd керує сесіями ЦІЄЇ системи. Застосунок на місці, при
-# завантаженні з того тома він зареєструє автозапуск сам (mac_autostart).
+# Ставлять на інший том (розгортання образу, MDM). Підняти агент зараз
+# неможливо: launchd керує сесіями ЦІЄЇ системи, а не тієї, що на диску. Тому
+# кладемо агент ДЛЯ ВСІХ на той том — launchd підхопить його при першому вході
+# після завантаження з нього.
+#
+# Доти тут стояв лише exit 0 із приміткою «застосунок зареєструє автозапуск
+# сам». Знайдено ревʼю: це неправда. ensure_launch_agent() у застосунку
+# виконується, лише коли його ХТОСЬ запустив, а в безлюдному розгортанні
+# запускати нікому — автозапуск не налаштувався б узагалі.
+#
+# Шлях у plist — від кореня ТІЄЇ системи (/Applications/...), без $TARGET:
+# після завантаження той том і буде "/".
 if [ -n "$TARGET" ]; then
-  echo "device-handler: установка на том $TARGET — агент зареєструється при завантаженні з нього"
+  SYS_PLIST="$TARGET/Library/LaunchAgents/$LABEL.plist"
+  install -d -m 755 "$TARGET/Library/LaunchAgents"
+  cat > "$SYS_PLIST" <<ALT_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array><string>/Applications/Device Handler.app/Contents/MacOS/bhm</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+</dict>
+</plist>
+ALT_EOF
+  chown root:wheel "$SYS_PLIST" 2>/dev/null || true
+  chmod 644 "$SYS_PLIST"
+  echo "device-handler: том $TARGET — агент для всіх покладено в $SYS_PLIST"
   exit 0
 fi
 
@@ -73,7 +99,7 @@ if [ -z "$CONSOLE_USER" ] || [ "$CONSOLE_USER" = "root" ]; then
   # його при вході будь-якого користувача. Права root у пакета є, а для
   # POS-машини «агент для того, хто сяде за неї» — саме те, що треба.
   echo "device-handler: нікого не залогінено — ставлю агент для всіх користувачів"
-  SYS_PLIST="/Library/LaunchAgents/$LABEL.plist"
+  SYS_PLIST="$TARGET/Library/LaunchAgents/$LABEL.plist"
   cat > "$SYS_PLIST" <<SYS_EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -96,7 +122,7 @@ fi
 # Хтось за машиною є — ставимо агент саме йому, а не всім. І прибираємо
 # агент «для всіх», якщо він лишився з headless-установки: інакше дві копії
 # воювали б за порт 9999.
-rm -f "/Library/LaunchAgents/$LABEL.plist" 2>/dev/null || true
+rm -f "$TARGET/Library/LaunchAgents/$LABEL.plist" 2>/dev/null || true
 CONSOLE_UID="$(id -u "$CONSOLE_USER")"
 HOME_DIR="$(eval echo "~$CONSOLE_USER")"
 PLIST="$HOME_DIR/Library/LaunchAgents/$LABEL.plist"

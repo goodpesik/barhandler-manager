@@ -138,17 +138,27 @@ def test_component_script_clears_both_flags_and_checks_the_result() -> None:
     скрипти тоді відпрацюють, файл на місці, усі перевірки задоволені, а вміст
     із пакета не поставився (знайдено ревʼю).
     """
-    code = "\n".join(_code_lines(REPO / "scripts" / "mac_component_plist.sh"))
+    code = _code_lines(REPO / "scripts" / "mac_component_plist.sh")
 
+    # Дивимось саме на РЯДОК, що перелічує прапорці. Попередня версія шукала
+    # назву будь-де в коді — знайдено другим колом ревʼю: так вона проходила б
+    # і тоді, коли прапорець прибрали з переліку, а назва лишилась у якомусь
+    # повідомленні.
+    listing = [line for line in code if line.startswith("for key in ")]
+    assert len(listing) == 1, "очікуємо один перелік прапорців"
     for key in ("BundleIsRelocatable", "BundleIsVersionChecked"):
-        assert f"Set :0:$key false" in code or f"Set :0:{key} false" in code, key
-        assert key in code
+        assert key in listing[0], f"{key} не знімається"
 
-    assert "Print :0:$key" in code or "Print :0:" in code, (
-        "результат не перечитують — PlistBuddy на помилці часто повертає 0"
+    joined = "\n".join(code)
+    assert "Set :0:$key false" in joined, "прапорці не знімаються в тому переліку"
+    assert "Print :0:$key" in joined, (
+        "результат не перечитують — а PlistBuddy на помилці не завжди падає"
     )
-    assert "Print :1" in code, "ніхто не перевіряє, що бандл у пакеті один"
-    assert "ChildBundles" in code, "вкладені бандли лишились без перевірки"
+    assert "Print :0\"" in joined or 'Print :0"' in joined, (
+        "немає перевірки, що бандл у пакеті взагалі є"
+    )
+    assert "Print :1" in joined, "ніхто не перевіряє, що бандл у пакеті один"
+    assert "ChildBundles" in joined, "вкладені бандли лишились без перевірки"
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="pkgbuild і PlistBuddy є лише на macOS")
@@ -236,3 +246,49 @@ def test_postinstall_respects_the_target_volume() -> None:
     assert 'TARGET="${3:-/}"' in code, "том установки ($3) не читається"
     assert 'APP="$TARGET/Applications' in code, "шлях застосунку не залежить від тома"
     assert 'OLD_APP="$TARGET/Applications' in code, "шлях старої копії не залежить від тома"
+
+
+def test_install_to_another_volume_really_registers_autostart(tmp_path: Path) -> None:
+    """Прогоняємо postinstall із чужим томом і дивимось на результат.
+
+    Знайдено другим колом ревʼю: у цій гілці стояв лише ``exit 0`` з
+    приміткою «застосунок зареєструє автозапуск сам». Неправда:
+    ``ensure_launch_agent()`` виконується лише тоді, коли застосунок ХТОСЬ
+    запустив, а в безлюдному розгортанні запускати нікому. Тепер гілка кладе
+    агент для всіх на той том — і цей тест перевіряє саме файл, а не текст
+    скрипта.
+    """
+    target = tmp_path / "Volumes" / "Macintosh HD 2"
+    app = target / "Applications" / "Device Handler.app" / "Contents" / "MacOS"
+    app.mkdir(parents=True)
+    (app / "bhm").write_text("#!/bin/sh\n")
+    (app / "bhm").chmod(0o755)
+
+    done = subprocess.run(
+        ["bash", str(REPO / "installers" / "mac-postinstall.sh"), "pkg", "dest", str(target)],
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 0, done.stderr
+
+    plist = target / "Library" / "LaunchAgents" / "com.goodpesik.barhandler-manager.plist"
+    assert plist.exists(), f"агент не покладено:\n{done.stdout}\n{done.stderr}"
+
+    body = plist.read_text(encoding="utf-8")
+    # Шлях у plist — від кореня ТІЄЇ системи: після завантаження той том буде "/".
+    assert "<string>/Applications/Device Handler.app/Contents/MacOS/bhm</string>" in body
+    assert str(target) not in body, "шлях із тимчасової точки монтування в plist не годиться"
+
+
+def test_missing_payload_fails_the_install(tmp_path: Path) -> None:
+    """Немає застосунку — postinstall мусить завалити установку, а не звітувати успіх."""
+    target = tmp_path / "empty"
+    (target / "Applications").mkdir(parents=True)
+
+    done = subprocess.run(
+        ["bash", str(REPO / "installers" / "mac-postinstall.sh"), "pkg", "dest", str(target)],
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 1, f"установка мовчки «вдалася»:\n{done.stdout}"
+    assert "установка неповна" in done.stdout + done.stderr
