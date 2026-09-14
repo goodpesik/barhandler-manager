@@ -35,7 +35,12 @@ class SocketIOLogHandler(logging.Handler):
 
     Records emitted while the client is disconnected go into a bounded
     deque (oldest dropped on overflow). On reconnect, `flush_buffer()`
-    drains the queue in order.
+    drains the queue.
+
+    Порядок у черзі — приблизний: запис, що зірвався на відправці, вертається
+    в кінець уже після того, як туди могли лягти новіші. Для читача це не
+    проблема — у payload лежить `ts` самого запису, і сортувати треба по
+    ньому, а не по порядку надходження.
     """
 
     def __init__(self, client: _Emitter, buffer_limit: int = BUFFER_LIMIT) -> None:
@@ -236,32 +241,38 @@ class LogUplinkClient:
             )
 
     async def stop(self) -> None:
-        # Спершу знімаємо відправки, що в дорозі, і ДОЧІКУЄМОСЬ їх, і лише
-        # потім розриваємо зʼєднання. Обидва порядки тут важливі:
+        # Порядок тут — увесь зміст методу.
         #
-        # • `disconnect()` сам має точки await, і поки він працює, наша
-        #   задача може паралельно викликати `emit` — python-socketio прямо
-        #   пише, що одночасні emit ламають порядок пакетів;
-        # • `cancel()` лише ПРОСИТЬ скасування. Без `gather` задача лишається
-        #   pending, і якщо після stop() цикл більше нічого не крутить, Python
-        #   на виході друкує «Task was destroyed but it is pending!». Доти це
-        #   не вилазило тільки тому, що після нас у lifespan ще були await —
-        #   тобто трималось на порядку в чужому файлі (знайдено ревʼю).
-        tasks = list(self._tasks)
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._tasks.clear()
-
+        # 1. Знімаємо відправки, що в дорозі, і ДОЧІКУЄМОСЬ їх. `cancel()` лише
+        #    просить скасування; без `gather` задача лишається pending, і Python
+        #    на виході друкує «Task was destroyed but it is pending!».
+        # 2. Відчіплюємо handler ВІД root-логера — до `disconnect()`, не після.
+        #    Знайдено другим колом ревʼю: `disconnect()` сам кличе наш обробник
+        #    `on("disconnect")`, той пише «uplink disconnected», і поки handler
+        #    ще на місці, цей рядок породжує НОВУ задачу відправки — вже після
+        #    того, як ми зібрали попередні. Вона лишалась без нагляду, а її
+        #    запис падав у буфер уже відчепленого handler-а, тобто зникав
+        #    назавжди. Саме той рядок, заради якого requeue і робився.
+        # 3. Розриваємо зʼєднання — тепер логи вимкнення нікуди не відправляються.
+        # 4. Другий прохід по задачах: якщо щось усе-таки зʼявилось між
+        #    кроками, воно не переживе метод.
+        await self._drain_tasks()
+        self.detach_handler_from_root()
         try:
             await self._sio.disconnect()
         except Exception:
             pass
+        await self._drain_tasks()
 
-        # Handler лишався на root-логері до кінця вимкнення й складав у буфер
-        # усе, що логували наступні кроки — буфер, який уже ніхто не зливе.
-        self.detach_handler_from_root()
+    async def _drain_tasks(self) -> None:
+        """Скасувати відправки в дорозі й дочекатись, поки вони справді стануть."""
+        tasks = list(self._tasks)
+        if not tasks:
+            return
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
 
     async def _safe_emit(self, event: str, data: Any) -> None:
         """Await-версія відправки, яка не перетворює обрив у трейсбек.
