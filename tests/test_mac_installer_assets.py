@@ -419,3 +419,83 @@ def test_install_failure_is_judged_by_version_not_by_anyone_answering() -> None:
         assert "! is_running; then" not in code, (
             f"{name}: невдача все ще визначається через «хтось відповідає на /health»"
         )
+
+
+# ─── BH-155 ──────────────────────────────────────────────────────────────────
+#
+# Оновлення 0.5.3 → 0.5.7 на живій машині лишило її БЕЗ менеджера: postinstall
+# записав агент, а підняти його не зміг («bootstrap не вдався» у
+# /var/log/install.log) — бо працює від root, а агент живе в графічній сесії
+# користувача. Той самий рядок з оболонки користувача проходив із кодом 0.
+
+
+def test_agent_is_started_inside_the_user_session() -> None:
+    """Агент піднімаємо через `launchctl asuser`, а не напряму з root."""
+    code = "\n".join(_code_lines(REPO / "installers" / "mac-postinstall.sh"))
+
+    assert 'launchctl asuser "$CONSOLE_UID" launchctl' in code, (
+        "з root-контексту `launchctl bootstrap gui/<uid>` не проходить — "
+        "саме через це оновлення гасило менеджер"
+    )
+    assert "bootstrap" in code
+
+
+def test_postinstall_waits_for_the_old_agent_to_go() -> None:
+    """Після bootout чекаємо, поки служба справді зникне.
+
+    Без очікування наступний bootstrap ловить «service already loaded» і не
+    робить нічого, а працює далі попередня копія — тобто оновлення не
+    оновлює.
+    """
+    code = _code_lines(REPO / "installers" / "mac-postinstall.sh")
+    bootout = next(i for i, line in enumerate(code) if "bootout" in line)
+    wait = next(
+        (i for i, line in enumerate(code) if line.startswith("as_user print")), None
+    )
+    assert wait is not None, "немає перевірки, чи служба зникла"
+    assert bootout < wait, "очікування мусить стояти ПІСЛЯ bootout"
+
+
+def test_postinstall_verifies_health_before_claiming_success() -> None:
+    """Не звітуємо успіх без перевірки.
+
+    Доти скрипт писав «менеджер стартує при наступному вході» — і це була
+    напівправда: до перезаходу менеджера не було взагалі, а установка
+    виглядала успішною.
+    """
+    code = "\n".join(_code_lines(REPO / "installers" / "mac-postinstall.sh"))
+
+    assert "localhost:9999/health" in code, "успіх не перевіряється жодним запитом"
+    assert "НЕ ВДАЛОСЯ підняти менеджер" in code, (
+        "немає честного повідомлення про невдачу"
+    )
+
+
+def test_installer_compares_versions_instead_of_just_existence() -> None:
+    """Інсталятор мусить казати про версії, а не «вже встановлено».
+
+    Слова власника: «повинен би версії перевіряти і пропонувати оновлення, а
+    не казати шо вже встановлено».
+    """
+    dist = (REPO / "installers" / "mac-distribution.xml").read_text(encoding="utf-8")
+
+    assert "check_not_installed" not in dist, "лишилась стара перевірка на наявність"
+    assert "system.compareVersions" in dist, "версії ніде не порівнюються"
+    assert "CFBundleShortVersionString" in dist, "встановлена версія не читається"
+    assert "__PKG_VERSION__" in dist, "версію пакета нікуди не підставляти"
+    # Три випадки: старіша (пускаємо), та сама, новіша.
+    assert "вже встановлена" in dist
+    assert "новіша версія" in dist
+
+
+def test_build_script_substitutes_the_package_version() -> None:
+    """Номер версії в distribution підставляє збірка, а не людина руками."""
+    script = "\n".join(_code_lines(REPO / "scripts" / "mac_build_pkg.sh"))
+
+    assert "__PKG_VERSION__/$VERSION" in script, "підстановки версії немає"
+    assert "DIST_RENDERED" in script and "--distribution \"$DIST_RENDERED\"" in script, (
+        "productbuild збирає не з підставленого файла"
+    )
+    # І падаємо, якщо підстановка не спрацювала: інакше в інсталяторі
+    # опиниться літерал `__PKG_VERSION__`.
+    assert "версію в distribution не підставлено" in script
