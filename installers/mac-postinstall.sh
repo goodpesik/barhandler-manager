@@ -151,13 +151,119 @@ PLIST_EOF
 chown "$CONSOLE_USER" "$PLIST"
 chmod 644 "$PLIST"
 
-# Спершу знімаємо старий екземпляр — інакше bootstrap віддасть «service already
-# loaded», а працювати далі буде попередня копія з попереднього шляху.
-launchctl bootout "gui/$CONSOLE_UID/$LABEL" 2>/dev/null || true
-if launchctl bootstrap "gui/$CONSOLE_UID" "$PLIST" 2>&1; then
-  echo "device-handler: агент піднято, менеджер працює"
+# ─── підняти агент у сесії КОРИСТУВАЧА ────────────────────────────────────
+#
+# BH-155. Цей скрипт виконує `installd`, тобто ми root. А агент має жити в
+# графічній сесії користувача, і `launchctl` із root-контексту туди не
+# дістає — саме тому оновлення 0.5.3 → 0.5.7 лишило машину власника без
+# менеджера: у лозі «bootstrap не вдався», а той самий рядок з оболонки
+# користувача проходив із кодом 0.
+#
+# `launchctl asuser <uid> launchctl …` виконує команду всередині сесії того
+# користувача. Це НЕ офіційно підтримана дорога — інженери Apple самі радять
+# замість неї SMAppService, — але з postinstall іншої немає, і саме вона
+# працює. Тому нижче ми не віримо жодній «успішній» відповіді на слово, а
+# перевіряємо результат запитом до менеджера.
+as_user() { launchctl asuser "$CONSOLE_UID" launchctl "$@"; }
+
+# Живий процес менеджера — за обома назвами бандла (нова й до BH-150) і ЛИШЕ
+# того користувача, якому ми ставимо. Ми root, тож без `-u` і `pgrep`, і
+# `pkill` бачили б процеси ВСІХ користувачів: при швидкому перемиканні
+# користувачів оновлення для одного вбивало б менеджер іншого. В install.sh
+# цього обмеження немає й воно там не потрібне — той скрипт працює від самого
+# користувача, і система сама не дасть йому чужі процеси (знайдено ревʼю).
+manager_running() {
+  pgrep -u "$CONSOLE_UID" -f "Device Handler.app/Contents/MacOS/bhm" >/dev/null 2>&1 ||
+    pgrep -u "$CONSOLE_UID" -f "BarhandlerManager.app/Contents/MacOS/bhm" >/dev/null 2>&1
+}
+
+# Знімаємо старий екземпляр і ЧЕКАЄМО, поки він справді зникне. Без очікування
+# наступний bootstrap ловить «service already loaded» і нічого не робить, а
+# працює далі попередня копія — тобто оновлення не оновлює.
+as_user bootout "gui/$CONSOLE_UID/$LABEL" >/dev/null 2>&1 || true
+
+# Чекаємо і на службу, і на ПРОЦЕС. Дивитись лише на `launchctl print` мало з
+# двох причин: uvicorn завершується не миттєво (5+ секунд), і сама команда
+# може впасти зі своєї причини — тоді цикл вийшов би одразу й нічого не
+# чекав (знайдено ревʼю). Процес видно незалежно від launchd.
+for _ in $(seq 1 15); do
+  as_user print "gui/$CONSOLE_UID/$LABEL" >/dev/null 2>&1 || manager_running || break
+  sleep 1
+done
+
+# Не пішов сам — знімаємо силою. Інакше він тримає порт 9999, новий екземпляр
+# не може його зайняти, а `bootstrap` при цьому звітує успіх. Так само робить
+# install.sh для скриптової інсталяції.
+if manager_running; then
+  echo "device-handler: старий процес не завершився — знімаю"
+  pkill -9 -u "$CONSOLE_UID" -f "Device Handler.app/Contents/MacOS/bhm" 2>/dev/null || true
+  pkill -9 -u "$CONSOLE_UID" -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true
+  sleep 1
+fi
+
+booted=0
+for attempt in 1 2 3; do
+  if as_user bootstrap "gui/$CONSOLE_UID" "$PLIST" >/dev/null 2>&1; then
+    booted=1
+    break
+  fi
+  echo "device-handler: спроба $attempt підняти агент не вдалася, повторюю"
+  # Перед повтором знімаємо те, що могло зареєструватись напівдорозі: інакше
+  # наступна спроба впаде на «already loaded», а працювати буде стара
+  # реєстрація зі старим шляхом.
+  as_user bootout "gui/$CONSOLE_UID/$LABEL" >/dev/null 2>&1 || true
+  sleep 2
+done
+
+# `kickstart` тут НЕ викликаємо навмисно. Він перезапускає те, що вже
+# завантажене в домен, і НЕ перечитує plist з диска. Якщо ми сюди дійшли з
+# `booted=0`, найімовірніша причина — стара реєстрація, яку не зняв bootout;
+# kickstart підняв би саме її, тобто СТАРУ версію, і звітував успіх. Рівно та
+# вада, проти якої цей тікет (знайдено ревʼю).
+
+# ─── перевірка результату ─────────────────────────────────────────────────
+#
+# Питаємо не «чи хтось відповідає», а «чи відповідає ПОТРІБНА версія». Стара
+# копія, яка ще не добила SIGTERM, теж віддає /health — і тоді успіх був би
+# неправдою. Те саме правило вже діє в install.sh; сюди його не переносили, і
+# це знайшло ревʼю.
+#
+# `__PKG_VERSION__` підставляє scripts/mac_build_pkg.sh із файла VERSION.
+WANT_VERSION="__PKG_VERSION__"
+
+up=0
+served=""       # остання відповідь
+answered=""     # БУДЬ-ЯКА відповідь за весь цикл
+for _ in $(seq 1 30); do
+  served="$(curl -fsS --max-time 1 http://localhost:9999/health 2>/dev/null || true)"
+  if [ -n "$served" ]; then
+    answered="$served"
+    if [ -z "${WANT_VERSION##*_PKG_VERSION_*}" ]; then
+      # Версію не підставили (скрипт запустили поза збіркою) — тоді
+      # задовольняємось самою відповіддю, але кажемо про це прямо.
+      up=1
+      break
+    fi
+    case "$served" in
+      *"\"version\":\"$WANT_VERSION\""*) up=1; break ;;
+    esac
+  fi
+  sleep 1
+done
+
+if [ "$up" -eq 1 ]; then
+  echo "device-handler: менеджер $WANT_VERSION працює на http://localhost:9999"
+elif [ -n "$answered" ]; then
+  # Дивимось на будь-яку відповідь за цикл, а не лише на останню: стара копія
+  # могла відповісти кілька разів і замовкнути перед 30-ю спробою — тоді вирок
+  # «не відповів» ховав би те, що ми насправді бачили (знайдено ревʼю).
+  echo "device-handler: на порті 9999 відповідає ІНША версія — схоже, стара копія не завершилась"
+  echo "device-handler: перевірте $DATA_DIR/bhm.err.log і перезайдіть у систему"
+elif [ "$booted" -eq 1 ]; then
+  echo "device-handler: агент піднято, але менеджер не відповів за 30 с — перевірте $DATA_DIR/bhm.err.log"
 else
-  echo "device-handler: bootstrap не вдався — менеджер стартує при наступному вході"
+  echo "device-handler: НЕ ВДАЛОСЯ підняти менеджер; він стартує при наступному вході в систему"
+  echo "device-handler: підняти зараз: launchctl bootstrap gui/$CONSOLE_UID $PLIST"
 fi
 
 exit 0

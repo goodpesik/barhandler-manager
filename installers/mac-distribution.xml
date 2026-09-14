@@ -30,27 +30,70 @@
 
     <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
 
-    <installation-check script="check_not_installed()"/>
-    <script>
-function check_not_installed() {
-    // Наявність застосунку — єдина ознака, на яку можна спертися до
-    // розпакування: bundle id в системі з'являється лише після першого
-    // запуску, а нам треба відповісти ще на вітальному екрані.
+    <installation-check script="check_before_install()"/>
+    <script><![CDATA[
+/* BH-155 — порівнюємо ВЕРСІЇ, а не просто «є бандл».
+ *
+ * Доти тут стояло «Device Handler вже встановлено» на будь-яку наявну копію,
+ * і людина, яка прийшла саме оновитись, читала це як «нічого робити не
+ * треба». Слова власника: «повинен би версії перевіряти і пропонувати
+ * оновлення, а не казати шо вже встановлено».
+ *
+ * `__PKG_VERSION__` підставляє scripts/mac_build_pkg.sh із файла VERSION:
+ * тримати номер у двох місцях означало б розбіжність із першим релізом.
+ */
+var PKG_VERSION = "__PKG_VERSION__";
+
+function installedVersion() {
     // Дві назви: нова і та, що лишилась від установок до BH-150.
-    if (system.files.fileExistsAtPath("/Applications/Device Handler.app") ||
-        system.files.fileExistsAtPath("/Applications/BarhandlerManager.app")) {
-        my.result.title = "Device Handler вже встановлено";
-        my.result.message = "Продовжити — і наявна копія оновиться до цієї версії.\n\n" +
-            "Видалити менеджер можна кнопкою «Видалити менеджер» на сторінці " +
-            "http://localhost:9999.";
-        // Warn, а не Fatal: заборона тут відрізала б оновлення взагалі — інших
-        // шляхів поставити новішу версію пакета немає.
+    var paths = ["/Applications/Device Handler.app/Contents/Info.plist",
+                 "/Applications/BarhandlerManager.app/Contents/Info.plist"];
+    for (var i = 0; i < paths.length; i++) {
+        if (!system.files.fileExistsAtPath(paths[i])) continue;
+        var info = system.files.plistAtPath(paths[i]);
+        if (info && info.CFBundleShortVersionString) {
+            return String(info.CFBundleShortVersionString);
+        }
+        // Бандл є, а версію не прочитали — хай це буде «щось встановлено».
+        return "";
+    }
+    return null;
+}
+
+function check_before_install() {
+    var installed = installedVersion();
+    if (installed === null) return true;          // чисте встановлення
+
+    // Порожній рядок = бандл є, версія невідома. Не вдаємо, що знаємо її.
+    if (installed === "") {
+        my.result.title = "Device Handler уже встановлено";
+        my.result.message = "Версію наявної копії прочитати не вдалося. "
+            + "Продовжити — і вона буде замінена на " + PKG_VERSION + ".";
         my.result.type = "Warn";
         return false;
     }
-    return true;
+
+    var cmp = system.compareVersions(installed, PKG_VERSION);
+    if (cmp < 0) {
+        // Саме той випадок, по який людина й прийшла: оновлення. Без
+        // попередження — просто йдемо далі.
+        return true;
+    }
+    if (cmp === 0) {
+        my.result.title = "Ця версія вже встановлена";
+        my.result.message = "На компʼютері вже " + installed
+            + ". Продовжити — встановити її заново (це лікує зламану "
+            + "установку).";
+        my.result.type = "Warn";
+        return false;
+    }
+    my.result.title = "На компʼютері новіша версія";
+    my.result.message = "Встановлено " + installed + ", а цей пакет — "
+        + PKG_VERSION + ". Продовжити — відкотитись до " + PKG_VERSION + ".";
+    my.result.type = "Warn";
+    return false;
 }
-    </script>
+]]></script>
 
     <choices-outline>
         <line choice="default">
