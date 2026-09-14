@@ -27,7 +27,7 @@ BUFFER_LIMIT = 2000
 
 class _Emitter(Protocol):
     connected: bool
-    def emit(self, event: str, data: Any) -> Any: ...
+    def emit(self, event: str, data: Any, requeue: Any = None) -> Any: ...
 
 
 class SocketIOLogHandler(logging.Handler):
@@ -41,13 +41,17 @@ class SocketIOLogHandler(logging.Handler):
     def __init__(self, client: _Emitter, buffer_limit: int = BUFFER_LIMIT) -> None:
         super().__init__(level=logging.INFO)
         self._client = client
-        self._buffer: deque[logging.LogRecord] = deque(maxlen=buffer_limit)
+        # LogRecord — не відправлені взагалі; dict — зірвались на відправці й
+        # повернулись через requeue.
+        self._buffer: deque[Any] = deque(maxlen=buffer_limit)
 
     def emit(self, record: logging.LogRecord) -> None:  # noqa: D401
         try:
             payload = self._payload(record)
             if getattr(self._client, "connected", False):
-                self._client.emit("log", payload)
+                # requeue: якщо зʼєднання впаде між цією перевіркою і самою
+                # відправкою, запис повернеться в буфер, а не зникне.
+                self._client.emit("log", payload, requeue=self._requeue_payload)
             else:
                 self._buffer.append(record)
         except RecursionError:
@@ -56,13 +60,23 @@ class SocketIOLogHandler(logging.Handler):
             # Never let logging itself crash the app.
             return
 
+    def _requeue_payload(self, payload: Any) -> None:
+        """Повернути невідправлений запис у чергу.
+
+        У буфері лежать і LogRecord (не відправлені взагалі), і готові
+        payload-и (зірвались на відправці). `_payload()` застосовуємо лише
+        до перших — див. `flush_buffer`.
+        """
+        self._buffer.append(payload)
+
     def flush_buffer(self) -> None:
         while self._buffer and getattr(self._client, "connected", False):
-            rec = self._buffer.popleft()
+            item = self._buffer.popleft()
+            payload = self._payload(item) if isinstance(item, logging.LogRecord) else item
             try:
-                self._client.emit("log", self._payload(rec))
+                self._client.emit("log", payload, requeue=self._requeue_payload)
             except Exception:
-                self._buffer.appendleft(rec)
+                self._buffer.appendleft(item)
                 return
 
     def _payload(self, record: logging.LogRecord) -> dict:
@@ -112,26 +126,28 @@ class LogUplinkClient:
 
     @property
     def connected(self) -> bool:
-        """Чи можна зараз відправляти.
+        """Чи можна відправляти ЗАРАЗ.
 
-        Дивимось не лише на `connected` клієнта, а й на те, чи піднятий
-        НЕЙМСПЕЙС `/managers`. Це різні стани: транспорт уже є, а на
-        неймспейс сервер ще не відповів — і `emit` у цей момент кидає
-        `BadNamespaceError`. Саме так у клієнта в лог сипалися трейсбеки
-        щоразу, коли зʼєднання перепідключалося (а на Android це кожні
-        дві-пʼять хвилин).
+        Питаємо саме про неймспейс `/managers`, а не про прапорець
+        `connected` клієнта. Порядок у python-socketio такий (перевірено на
+        5.16.4, async_client.py): `_handle_connect` наповнює `namespaces` і
+        кличе наш `on("connect")`, і лише ПІСЛЯ повернення з `connect()`
+        ставиться `connected = True`.
+
+        Через це `flush_buffer()`, який кличеться саме з `_on_connect`,
+        бачив `connected = False` НА КОЖНОМУ реконекті — і буфер не
+        зливався ніколи. Записи лежали до межі в 2000 і найстаріші тихо
+        випадали. Знайдено ревʼю, яке прогнало це проти живого сервера.
         """
-        if not self._sio.connected:
-            return False
-        if not hasattr(self._sio, "namespaces"):
-            # Старіші версії python-socketio не тримають цього переліку —
-            # тоді покладаємось на прапорець клієнта, як раніше. Саме
-            # hasattr, а не «порожній перелік»: порожній означає «жоден
-            # неймспейс не піднятий», тобто відправляти НЕ можна.
-            return True
-        return "/managers" in (self._sio.namespaces or {})
+        namespaces = getattr(self._sio, "namespaces", None)
+        if namespaces is None:
+            # Старіші версії python-socketio не тримають цього переліку.
+            return bool(self._sio.connected)
+        return "/managers" in namespaces
 
-    def _spawn_emit(self, event: str, data: Any) -> None:
+    def _spawn_emit(
+        self, event: str, data: Any, requeue: Optional[Callable[[Any], None]] = None,
+    ) -> None:
         """Відправити, не чекаючи — але й не лишаючи виняток без господаря.
 
         Доти тут було `loop.create_task(self._sio.emit(...))`. Якщо зʼєднання
@@ -151,10 +167,19 @@ class LogUplinkClient:
             try:
                 await self._sio.emit(event, data, namespace="/managers")
             except Exception:
-                # Зʼєднання впало між перевіркою і відправкою. Для логів це
-                # не втрата: handler покладе запис у буфер і дошле після
-                # реконекту. Для подій — тим гірше, але не ціною трейсбека.
-                return
+                # Зʼєднання впало між перевіркою і відправкою. Трейсбек тут
+                # нічого не лікує, але й губити запис не треба: для логів
+                # вертаємо його в буфер, звідки він піде після реконекту.
+                #
+                # Знайдено ревʼю: без цього найцінніший рядок — «uplink
+                # disconnected» — зникав завжди. Його пишуть у момент, коли
+                # неймспейс ще числиться живим, тож у буфер він не потрапляв,
+                # а відправка вже не вдавалась.
+                if requeue is not None:
+                    try:
+                        requeue(data)
+                    except Exception:
+                        pass
 
         task = loop.create_task(_send())
         # Тримаємо посилання: без нього збирач смiття може прибрати задачу
@@ -163,7 +188,7 @@ class LogUplinkClient:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    def emit(self, event: str, data: Any) -> None:
+    def emit(self, event: str, data: Any, requeue: Optional[Callable[[Any], None]] = None) -> None:
         """Sync entry point used by SocketIOLogHandler.
 
         We're inside `logging.Handler.emit()` which is a sync call — but
@@ -173,7 +198,7 @@ class LogUplinkClient:
         """
         if not self.connected:
             return
-        self._spawn_emit(event, data)
+        self._spawn_emit(event, data, requeue=requeue)
 
     def attach_handler_to_root(self) -> SocketIOLogHandler:
         h = SocketIOLogHandler(self)
@@ -211,15 +236,32 @@ class LogUplinkClient:
             )
 
     async def stop(self) -> None:
+        # Спершу знімаємо відправки, що в дорозі, і ДОЧІКУЄМОСЬ їх, і лише
+        # потім розриваємо зʼєднання. Обидва порядки тут важливі:
+        #
+        # • `disconnect()` сам має точки await, і поки він працює, наша
+        #   задача може паралельно викликати `emit` — python-socketio прямо
+        #   пише, що одночасні emit ламають порядок пакетів;
+        # • `cancel()` лише ПРОСИТЬ скасування. Без `gather` задача лишається
+        #   pending, і якщо після stop() цикл більше нічого не крутить, Python
+        #   на виході друкує «Task was destroyed but it is pending!». Доти це
+        #   не вилазило тільки тому, що після нас у lifespan ще були await —
+        #   тобто трималось на порядку в чужому файлі (знайдено ревʼю).
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+
         try:
             await self._sio.disconnect()
         except Exception:
             pass
-        # Незавершені відправки скасовуємо: інакше на виході вони спробують
-        # писати в закритий сокет і додадуть той самий шум у лог.
-        for task in list(self._tasks):
-            task.cancel()
-        self._tasks.clear()
+
+        # Handler лишався на root-логері до кінця вимкнення й складав у буфер
+        # усе, що логували наступні кроки — буфер, який уже ніхто не зливе.
+        self.detach_handler_from_root()
 
     async def _safe_emit(self, event: str, data: Any) -> None:
         """Await-версія відправки, яка не перетворює обрив у трейсбек.
