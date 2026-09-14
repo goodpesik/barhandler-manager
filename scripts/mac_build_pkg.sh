@@ -25,6 +25,25 @@ DIST="${MAC_PKG_DISTRIBUTION:-installers/mac-distribution.xml}"
 RESOURCES="${MAC_PKG_RESOURCES:-installers/mac-resources}"
 POSTINSTALL="${MAC_PKG_POSTINSTALL:-installers/mac-postinstall.sh}"
 VERSION="$(tr -d '[:space:]' < VERSION 2>/dev/null || echo 0.0.0)"
+# Порожній (або сміттєвий) VERSION — це не «0.0.0», а зламана збірка: далі він
+# підставився б у distribution як `PKG_VERSION = ""`, і порівняння версій в
+# інсталяторі порівнювало б із порожнім рядком. Перевірка на порожнє й на
+# формат — знайдено ревʼю, бо `|| echo 0.0.0` ловить лише невдале ЧИТАННЯ
+# файла, а не порожній файл.
+# Саме X.Y.Z, а не «щось із цифр і точок»: попередня перевірка пускала «5»,
+# «1.2.3.4» і навіть «1..2», хоч повідомлення обіцяло інше. «1..2» найгірше:
+# у порівнянні версій в інсталяторі порожній компонент дає NaN, а NaN не
+# більший і не менший — тобто вирок про версії тихо плив (знайдено ревʼю).
+case "$VERSION" in
+  [0-9]|[0-9][0-9]) : ;;   # службові збірки з одним числом лишаємо дозволеними
+  *) case "$VERSION" in
+       [0-9]*.[0-9]*.[0-9]*) : ;;
+       *) echo "::error::VERSION має вигляд «$VERSION» — очікую X.Y.Z"; exit 1 ;;
+     esac ;;
+esac
+case "$VERSION" in
+  *[!0-9.]*|*..*|.*|*.) echo "::error::VERSION має вигляд «$VERSION» — очікую X.Y.Z"; exit 1 ;;
+esac
 
 [ -d "$APP" ] || { echo "::error::немає $APP"; exit 1; }
 [ -f "$DIST" ] || { echo "::error::немає $DIST"; exit 1; }
@@ -42,7 +61,13 @@ mkdir -p "$SCRIPTS" "$ROOT"
 # Копіюємо ПІДПИСАНИЙ застосунок як є: перепакування ламає підпис, і далі
 # нотаризація відкидає весь .pkg.
 cp -R "$APP" "$ROOT/"
-install -m 755 "$POSTINSTALL" "$SCRIPTS/postinstall"
+# BH-155 — postinstall перевіряє, що на 9999 відповідає САМЕ ця версія (стара
+# копія, яка ще не завершилась, теж відповідає). Тому підставляємо номер і в
+# нього, тим самим значенням, що й у distribution.
+sed "s/__PKG_VERSION__/$VERSION/g" "$POSTINSTALL" > "$SCRIPTS/postinstall"
+chmod 755 "$SCRIPTS/postinstall"
+grep -q "WANT_VERSION=\"$VERSION\"" "$SCRIPTS/postinstall" \
+  || { echo "::error::версію не підставлено в postinstall"; exit 1; }
 
 # --- заборона переміщення й пропуску установки ----------------------------------
 # Подробиці — у scripts/mac_component_plist.sh: там і причина (пакет поставився
@@ -59,9 +84,20 @@ pkgbuild --root "$WORKDIR/root" \
   --install-location / \
   "$WORKDIR/app.pkg"
 
+# BH-155 — номер версії у distribution підставляємо ТУТ, із файла VERSION.
+# Інсталятор порівнює його з версією вже встановленої копії, щоб казати
+# «оновлення з X до Y», а не «вже встановлено». Тримати номер руками в XML
+# означало б розбіжність із першим же релізом.
+DIST_RENDERED="$WORKDIR/distribution.xml"
+sed "s/__PKG_VERSION__/$VERSION/g" "$DIST" > "$DIST_RENDERED"
+grep -q "__PKG_VERSION__" "$DIST_RENDERED" \
+  && { echo "::error::версію в distribution не підставлено"; exit 1; }
+grep -q "PKG_VERSION = \"$VERSION\"" "$DIST_RENDERED" \
+  || { echo "::error::у distribution немає PKG_VERSION = \"$VERSION\""; exit 1; }
+
 echo "==> productbuild (майстер: вітання, прогрес, фінал)"
 # --package-path: distribution посилається на app.pkg по імені.
-productbuild --distribution "$DIST" \
+productbuild --distribution "$DIST_RENDERED" \
   --resources "$RESOURCES" \
   --package-path "$WORKDIR" \
   "$WORKDIR/unsigned.pkg"

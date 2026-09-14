@@ -91,6 +91,29 @@ case "$OS" in
 esac
 say "platform: $PLATFORM"
 
+# --- на маку цей скрипт не має права бути root ------------------------
+#
+# BH-155, той самий клас вади, що й у mac-postinstall.sh: агент менеджера
+# належить КОРИСТУВАЧЕВІ. Нижче ми реєструємо його в `gui/$(id -u)` і
+# кладемо plist у `$HOME/Library/LaunchAgents`. Під `sudo` це стає
+# `gui/0` і `/var/root/Library/LaunchAgents` — тобто скрипт «успішно»
+# ставить менеджер root-ові, а сесія людини лишається без нього. Рівно
+# те, що сталося при оновленні пакетом, тільки іншою дорогою.
+#
+# Тому: під sudo перезапускаємо себе від того, хто його викликав, а якщо
+# незрозуміло від кого — відмовляємось із прямим текстом.
+if [ "$PLATFORM" = macos ] && [ "$(id -u)" -eq 0 ]; then
+    if [ -n "${BHM_REEXEC:-}" ]; then
+        die "не вдалося перезапуститися від імені користувача; запустіть скрипт БЕЗ sudo"
+    elif [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+        warn "запущено через sudo — перезапускаю від імені $SUDO_USER, бо агент має належати вам"
+        export BHM_REEXEC=1
+        exec sudo -u "$SUDO_USER" -H env "BHM_REEXEC=1" bash "$0" "$@"
+    else
+        die "не запускайте цей скрипт від root: агент має належати вашому користувачеві. Запустіть без sudo"
+    fi
+fi
+
 # --- ensure Python 3.11+ ---------------------------------------------
 # When install.sh is invoked from a launchd / systemd / nohup-spawned
 # parent (e.g. through the dashboard's Update button) the PATH it
