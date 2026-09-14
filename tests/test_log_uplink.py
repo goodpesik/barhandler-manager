@@ -190,6 +190,8 @@ def test_buffer_drains_in_the_state_the_library_actually_gives_us():
     на кожному реконекті. Записи лежали до межі 2000 і найстаріші тихо
     випадали (знайдено ревʼю, перевірено на живому сервері).
     """
+    import asyncio
+
     sio = _NamespaceDropClient(namespaces={"/managers": "sid"}, fail=False)
     sio.connected = False  # саме той стан, що буває всередині on("connect")
     c = _client_with(sio)
@@ -197,8 +199,20 @@ def test_buffer_drains_in_the_state_the_library_actually_gives_us():
     h._buffer.append(_record("while offline"))
 
     assert c.connected is True, "готовність визначається неймспейсом, не прапорцем"
-    h.flush_buffer()
+
+    async def scenario():
+        # Саме в циклі: поза ним відправка тихо відкидається, і тест
+        # проходив би від того, що буфер спорожнів, а не від доставки
+        # (знайдено другим колом ревʼю).
+        h.flush_buffer()
+        for _ in range(5):
+            await asyncio.sleep(0)
+
+    asyncio.run(scenario())
     assert not h._buffer, "буфер не злився в тому стані, у якому його й зливають"
+    assert sio.sent and sio.sent[0][1]["msg"] == "while offline", (
+        "буфер спорожнів, але запис нікуди не пішов"
+    )
 
 
 def test_stop_really_cancels_emits_still_in_flight():
@@ -226,3 +240,47 @@ def test_stop_really_cancels_emits_still_in_flight():
         assert not c._tasks
 
     asyncio.run(scenario())
+
+
+def test_stop_does_not_orphan_the_log_it_writes_itself():
+    """`stop()` не має губити рядок, який сам і породжує.
+
+    Знайдено другим колом ревʼю: `disconnect()` кличе наш обробник
+    `on("disconnect")`, той пише «uplink disconnected», і поки handler ще на
+    root-логері, цей рядок породжує НОВУ задачу відправки — після того, як
+    ми вже зібрали попередні. Вона лишалась без нагляду, а її запис падав у
+    буфер уже відчепленого handler-а. Тобто зникав саме той рядок, заради
+    якого requeue і робився.
+    """
+    import asyncio
+
+    class _DisconnectLogsClient(_NamespaceDropClient):
+        def __init__(self, client_holder, **kw):
+            super().__init__(**kw)
+            self._holder = client_holder
+
+        async def disconnect(self):
+            # Так робить бібліотека: обробник disconnect кличеться, поки
+            # неймспейс ще числиться живим.
+            await self._holder[0]._on_disconnect()
+            self.connected = False
+            self.namespaces = {}
+
+    holder = []
+    sio = _DisconnectLogsClient(holder, namespaces={"/managers": "sid"}, fail=True)
+    c = _client_with(sio)
+    holder.append(c)
+    h = c.attach_handler_to_root()
+    root = logging.getLogger()
+
+    async def scenario():
+        await c.stop()
+        # Після stop() не лишається ні задач у дорозі, ні handler-а на логері.
+        assert not c._tasks, "лишилась відправка без нагляду"
+        assert h not in root.handlers, "handler не відчеплено"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        if h in root.handlers:
+            root.removeHandler(h)
