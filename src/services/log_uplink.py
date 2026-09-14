@@ -27,7 +27,7 @@ BUFFER_LIMIT = 2000
 
 class _Emitter(Protocol):
     connected: bool
-    def emit(self, event: str, data: Any) -> Any: ...
+    def emit(self, event: str, data: Any, requeue: Any = None) -> Any: ...
 
 
 class SocketIOLogHandler(logging.Handler):
@@ -41,13 +41,17 @@ class SocketIOLogHandler(logging.Handler):
     def __init__(self, client: _Emitter, buffer_limit: int = BUFFER_LIMIT) -> None:
         super().__init__(level=logging.INFO)
         self._client = client
-        self._buffer: deque[logging.LogRecord] = deque(maxlen=buffer_limit)
+        # LogRecord — не відправлені взагалі; dict — зірвались на відправці й
+        # повернулись через requeue.
+        self._buffer: deque[Any] = deque(maxlen=buffer_limit)
 
     def emit(self, record: logging.LogRecord) -> None:  # noqa: D401
         try:
             payload = self._payload(record)
             if getattr(self._client, "connected", False):
-                self._client.emit("log", payload)
+                # requeue: якщо зʼєднання впаде між цією перевіркою і самою
+                # відправкою, запис повернеться в буфер, а не зникне.
+                self._client.emit("log", payload, requeue=self._requeue_payload)
             else:
                 self._buffer.append(record)
         except RecursionError:
@@ -56,13 +60,23 @@ class SocketIOLogHandler(logging.Handler):
             # Never let logging itself crash the app.
             return
 
+    def _requeue_payload(self, payload: Any) -> None:
+        """Повернути невідправлений запис у чергу.
+
+        У буфері лежать і LogRecord (не відправлені взагалі), і готові
+        payload-и (зірвались на відправці). `_payload()` застосовуємо лише
+        до перших — див. `flush_buffer`.
+        """
+        self._buffer.append(payload)
+
     def flush_buffer(self) -> None:
         while self._buffer and getattr(self._client, "connected", False):
-            rec = self._buffer.popleft()
+            item = self._buffer.popleft()
+            payload = self._payload(item) if isinstance(item, logging.LogRecord) else item
             try:
-                self._client.emit("log", self._payload(rec))
+                self._client.emit("log", payload, requeue=self._requeue_payload)
             except Exception:
-                self._buffer.appendleft(rec)
+                self._buffer.appendleft(item)
                 return
 
     def _payload(self, record: logging.LogRecord) -> dict:
@@ -105,15 +119,76 @@ class LogUplinkClient:
         self._diagnostics_cb: Optional[Callable[[str, str, dict], Awaitable[dict]]] = None
         self._install_id: str = ""
         self._version: str = ""
+        self._tasks: set[asyncio.Task] = set()
         self._sio.on("connect", self._on_connect, namespace="/managers")
         self._sio.on("disconnect", self._on_disconnect, namespace="/managers")
         self._sio.on("diagnostic", self._on_diagnostic, namespace="/managers")
 
     @property
     def connected(self) -> bool:
-        return bool(self._sio.connected)
+        """Чи можна відправляти ЗАРАЗ.
 
-    def emit(self, event: str, data: Any) -> None:
+        Питаємо саме про неймспейс `/managers`, а не про прапорець
+        `connected` клієнта. Порядок у python-socketio такий (перевірено на
+        5.16.4, async_client.py): `_handle_connect` наповнює `namespaces` і
+        кличе наш `on("connect")`, і лише ПІСЛЯ повернення з `connect()`
+        ставиться `connected = True`.
+
+        Через це `flush_buffer()`, який кличеться саме з `_on_connect`,
+        бачив `connected = False` НА КОЖНОМУ реконекті — і буфер не
+        зливався ніколи. Записи лежали до межі в 2000 і найстаріші тихо
+        випадали. Знайдено ревʼю, яке прогнало це проти живого сервера.
+        """
+        namespaces = getattr(self._sio, "namespaces", None)
+        if namespaces is None:
+            # Старіші версії python-socketio не тримають цього переліку.
+            return bool(self._sio.connected)
+        return "/managers" in namespaces
+
+    def _spawn_emit(
+        self, event: str, data: Any, requeue: Optional[Callable[[Any], None]] = None,
+    ) -> None:
+        """Відправити, не чекаючи — але й не лишаючи виняток без господаря.
+
+        Доти тут було `loop.create_task(self._sio.emit(...))`. Якщо зʼєднання
+        падало між перевіркою вище і виконанням задачі, `emit` кидав
+        `BadNamespaceError`, задачу ніхто не чекав, і asyncio виливав у лог
+        `Task exception was never retrieved` з повним трейсбеком. А цей лог
+        іде через наш же handler — тобто шум ще й намагався себе відправити.
+        За 50 хвилин у клієнта так набралося 17 циклів із трейсбеками, які
+        маскують справжні помилки.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _send() -> None:
+            try:
+                await self._sio.emit(event, data, namespace="/managers")
+            except Exception:
+                # Зʼєднання впало між перевіркою і відправкою. Трейсбек тут
+                # нічого не лікує, але й губити запис не треба: для логів
+                # вертаємо його в буфер, звідки він піде після реконекту.
+                #
+                # Знайдено ревʼю: без цього найцінніший рядок — «uplink
+                # disconnected» — зникав завжди. Його пишуть у момент, коли
+                # неймспейс ще числиться живим, тож у буфер він не потрапляв,
+                # а відправка вже не вдавалась.
+                if requeue is not None:
+                    try:
+                        requeue(data)
+                    except Exception:
+                        pass
+
+        task = loop.create_task(_send())
+        # Тримаємо посилання: без нього збирач смiття може прибрати задачу
+        # на півдорозі, і Python вивалить "Task was destroyed but it is
+        # pending!".
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    def emit(self, event: str, data: Any, requeue: Optional[Callable[[Any], None]] = None) -> None:
         """Sync entry point used by SocketIOLogHandler.
 
         We're inside `logging.Handler.emit()` which is a sync call — but
@@ -121,13 +196,9 @@ class LogUplinkClient:
         the running loop without awaiting; if there's no loop (we're
         being called from a non-async context), silently drop.
         """
-        if not self._sio.connected:
+        if not self.connected:
             return
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._sio.emit(event, data, namespace="/managers"))
-        except RuntimeError:
-            return
+        self._spawn_emit(event, data, requeue=requeue)
 
     def attach_handler_to_root(self) -> SocketIOLogHandler:
         h = SocketIOLogHandler(self)
@@ -165,16 +236,50 @@ class LogUplinkClient:
             )
 
     async def stop(self) -> None:
+        # Спершу знімаємо відправки, що в дорозі, і ДОЧІКУЄМОСЬ їх, і лише
+        # потім розриваємо зʼєднання. Обидва порядки тут важливі:
+        #
+        # • `disconnect()` сам має точки await, і поки він працює, наша
+        #   задача може паралельно викликати `emit` — python-socketio прямо
+        #   пише, що одночасні emit ламають порядок пакетів;
+        # • `cancel()` лише ПРОСИТЬ скасування. Без `gather` задача лишається
+        #   pending, і якщо після stop() цикл більше нічого не крутить, Python
+        #   на виході друкує «Task was destroyed but it is pending!». Доти це
+        #   не вилазило тільки тому, що після нас у lifespan ще були await —
+        #   тобто трималось на порядку в чужому файлі (знайдено ревʼю).
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()
+
         try:
             await self._sio.disconnect()
         except Exception:
             pass
 
+        # Handler лишався на root-логері до кінця вимкнення й складав у буфер
+        # усе, що логували наступні кроки — буфер, який уже ніхто не зливе.
+        self.detach_handler_from_root()
+
+    async def _safe_emit(self, event: str, data: Any) -> None:
+        """Await-версія відправки, яка не перетворює обрив у трейсбек.
+
+        Ці виклики сидять усередині обробників socket.io: виняток звідси
+        друкує стек у лог і нічого не лікує — зʼєднання однаково впало, а
+        після реконекту handshake піде заново.
+        """
+        try:
+            await self._sio.emit(event, data, namespace="/managers")
+        except Exception as e:
+            self._log.debug(f"uplink emit {event} skipped: {e!r}")
+
     async def _on_connect(self) -> None:
         self._log.info(f"uplink connected to {self._cfg['url']}")
         tenant_id = self._cfg.get("tenant_id", "")
         tenant_name = self._cfg.get("tenant_name", "")
-        await self._sio.emit("handshake", {
+        await self._safe_emit("handshake", {
             # install_id is the stable per-install key the logs server
             # groups everything by. tenant_id (appid) + tenant_name say
             # WHO is logged in here; `tenant` is the legacy subdomain
@@ -186,7 +291,7 @@ class LogUplinkClient:
             "version": self._version,
             "platform": _platform.platform(),
             "started_at": datetime.now(timezone.utc).isoformat(),
-        }, namespace="/managers")
+        })
         if self._handler is not None:
             self._handler.flush_buffer()
 
@@ -198,30 +303,26 @@ class LogUplinkClient:
         cmd = data.get("cmd", "")
         args = data.get("args", {}) or {}
         if self._diagnostics_cb is None:
-            await self._sio.emit("diagnostic_result", {
+            await self._safe_emit("diagnostic_result", {
                 "cmd_id": cmd_id, "ok": False, "error": "no diagnostics registered",
-            }, namespace="/managers")
+            })
             return
         try:
             result = await self._diagnostics_cb(cmd_id, cmd, args)
         except Exception as e:
             result = {"cmd_id": cmd_id, "ok": False, "error": f"{type(e).__name__}: {e}"}
-        await self._sio.emit("diagnostic_result", result, namespace="/managers")
+        await self._safe_emit("diagnostic_result", result)
 
     def emit_event(self, event_type: str, **payload: Any) -> None:
         """Fire-and-forget business event. Safe from any async context;
         silently drops if uplink is disabled or offline."""
-        if not self._sio.connected:
+        if not self.connected:
             return
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self._sio.emit("event", {
-                "type": event_type,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                **payload,
-            }, namespace="/managers"))
-        except RuntimeError:
-            return
+        self._spawn_emit("event", {
+            "type": event_type,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            **payload,
+        })
 
 
 def get_or_create_install_id(install_id_path: Path) -> str:
