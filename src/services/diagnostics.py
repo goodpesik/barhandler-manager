@@ -47,6 +47,22 @@ def _bhm_log_path() -> Path:
     return APP_DIR / "bhm.log"
 
 
+def _safe_text(value: object) -> str:
+    """`str()` від чужого обʼєкта може САМ кинути виняток.
+
+    Знайдено другим колом ревʼю. Форматування `f"{value}"` усередині гілки
+    `except` — це рівно та вада, яку ця функція й лікувала: новий виняток
+    народжується вже В обробнику, тож сусідній `except Exception` його не
+    ловить (гілки не вкладені), і він тікає з діагностики назовні. Досить
+    звичайного власного винятку, чий `__str__` звертається до атрибута,
+    якого ще немає.
+    """
+    try:
+        return str(value)
+    except Exception:  # noqa: BLE001 — саме це ми тут і ловимо
+        return f"<{type(value).__name__} без придатного __str__>"
+
+
 def _run_script_inprocess(script: Path) -> tuple[bool, str]:
     """Виконати самодостатній діагностичний скрипт у власному процесі й
     повернути (успіх, те, що він надрукував).
@@ -90,10 +106,10 @@ def _run_script_inprocess(script: Path) -> tuple[bool, str]:
         elif exc.code is None:
             code = 0
         else:
-            buf.write(f"{exc.code}\n")
+            buf.write(_safe_text(exc.code) + "\n")
             code = 1
     except Exception as exc:  # noqa: BLE001 — діагностика не має валити менеджер
-        return False, buf.getvalue() + f"\n{type(exc).__name__}: {exc}"
+        return False, buf.getvalue() + f"\n{type(exc).__name__}: {_safe_text(exc)}"
     return code == 0, buf.getvalue()
 
 
