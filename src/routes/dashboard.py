@@ -387,7 +387,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
     </h2>
     <table>
       <thead>
-        <tr><th data-i18n="th_name">Назва</th><th data-i18n="th_transport">Transport</th><th data-i18n="fp_role">Роль</th><th data-i18n="fp_paper">Папір</th><th data-i18n="th_actions">Дії</th></tr>
+        <tr><th data-i18n="th_name">Назва</th><th data-i18n="th_transport">Transport</th><th data-i18n="fp_role">Роль</th><th data-i18n="fp_paper">Папір</th><th data-i18n="fp_protocol">Мова</th><th data-i18n="th_actions">Дії</th></tr>
       </thead>
       <tbody id="found-printers"></tbody>
     </table>
@@ -559,6 +559,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
       found_terminals_title: "Знайдені термінали — оберіть банк і зареєструйте",
       fp_role: "Роль",
       fp_paper: "Папір",
+      fp_protocol: "Мова",
+      proto_auto: "авто",
       ft_nickname: "Псевдонім",
       btn_register: "✓ Зареєструвати",
       btn_registering: "Реєструємо…",
@@ -686,6 +688,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
       found_terminals_title: "Found terminals — pick a bank and register",
       fp_role: "Role",
       fp_paper: "Paper",
+      fp_protocol: "Language",
+      proto_auto: "auto",
       ft_nickname: "Nickname",
       btn_register: "✓ Register",
       btn_registering: "Registering…",
@@ -944,6 +948,15 @@ _HTML_TEMPLATE = r"""<!doctype html>
         + "<td>" + escHtml(d.transport || "") + "</td>"
         + "<td><select class='fp-role'>" + roleOpts + "</select></td>"
         + "<td><select class='fp-paper'><option value='58'>58</option><option value='80'>80</option></select></td>"
+        // BH-160 — мова, якою говорити з цим залізом. «Авто» = менеджер сам
+        // упізнає модель; вибір руками потрібен лише тоді, коли не впізнав.
+        // Селектор саме тут, а не в застосунку: менеджер один, а продуктів
+        // три, і клієнту треба вміти показати одне місце.
+        + "<td><select class='fp-protocol'>"
+        + "<option value=''>" + escHtml(t("proto_auto")) + "</option>"
+        + "<option value='escpos'>ESC/POS</option>"
+        + "<option value='tspl'>TSPL</option>"
+        + "</select></td>"
         + "<td><button class='btn btn-update' onclick=\"registerFoundPrinter(this)\">" + escHtml(t("btn_register")) + "</button></td>"
         + "</tr>";
     }).join("");
@@ -955,10 +968,15 @@ _HTML_TEMPLATE = r"""<!doctype html>
     const id = tr.getAttribute("data-id");
     const kind = tr.querySelector(".fp-role").value;
     const paper_width = Number(tr.querySelector(".fp-paper").value) || 58;
+    const protocol = tr.querySelector(".fp-protocol").value;
     btn.disabled = true;
     btn.textContent = t("btn_registering");
     try {
-      await api("POST", "/devices/register", true, { id, kind, paper_width });
+      const body = { id, kind, paper_width };
+      // Порожнє значення означає «авто» — не шлемо поле взагалі, щоб сервер
+      // узяв його з таблиці моделей, а не отримав порожній рядок як вибір.
+      if (protocol) body.protocol = protocol;
+      await api("POST", "/devices/register", true, body);
       showToast(t("toast_registered"), "ok");
       tr.remove();
       if (!$("found-printers").children.length) $("found-printers-panel").style.display = "none";
