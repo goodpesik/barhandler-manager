@@ -464,8 +464,51 @@ class PrinterDevice:
         printer.text = text
         printer.set = set_
         printer.cut = cut
+        printer._bh_flush_text = flush
         printer._bh_reset_render_state = reset
         printer._bh_bitmap_patched = True
+
+    def _install_image_emitter(self) -> None:
+        """Дати принтеру `_bh_emit_image` — віддавання готової картинки.
+
+        Ставиться ЗАВЖДИ, окремо від bitmap-шима. Знайдено ревʼю: спершу воно
+        жило всередині `_install_bitmap_patch()`, а той не викликається при
+        `render_mode="native"`. Тобто в дозволеній конфігурації
+        `protocol=tspl` + `render_mode=native` фіскальний QR знову пішов би
+        сирим ESC/POS і зник — та сама вада, яку цей код і закриває. А
+        `render_mode` і `protocol` ніде не звіряються між собою, та й стара
+        авто-міграція вміє перемкнути протокол на TSPL, не чіпаючи режим.
+
+        Як РЕНДЕРИТЬСЯ ТЕКСТ і якою МОВОЮ говорить пристрій — це різні осі, і
+        віддавання картинки залежить лише від другої.
+        """
+        printer = self._printer
+        if printer is None or getattr(printer, "_bh_image_emitter_installed", False):
+            return
+
+        def emit_image(img) -> None:
+            """Віддати картинку тим самим шляхом, що й рядки тексту.
+
+            BH-163. Не весь друк іде через `text()`: QR фіскального чека — це
+            зображення, яке рендерять окремо й писали сирим
+            `_raw(image_to_gs_v_0(...))`. На TSPL-залізі прошивка такий растр
+            мовчки викидає, і чек виходив БЕЗ QR — хоч порожній рядок перед
+            ним (він іде через `text()`) друкувався справно, тому втрату й не
+            було видно.
+            """
+            # Зливаємо недописаний рядок: картинка мусить лягти на своє місце
+            # в потоці, а не поперед того, що ще не встигло вийти. Шима може й
+            # не бути — тоді зливати нічого.
+            flush = getattr(printer, "_bh_flush_text", None)
+            if callable(flush):
+                flush()
+            if self._is_tspl():
+                self._tspl_pages.append(img)
+            else:
+                printer._raw(image_to_gs_v_0(img))
+
+        printer._bh_emit_image = emit_image
+        printer._bh_image_emitter_installed = True
 
     def _install_ua_text_patch(self) -> None:
         """Replace `printer.text` with one that emits raw UA-CP866 bytes.
@@ -532,7 +575,24 @@ class PrinterDevice:
                 #     limited to printers with Ukrainian PC866 overlay).
                 #   - "native" + other code_page: hand off to
                 #     python-escpos magic.force_encoding().
+                        # Віддавання картинок не залежить від режиму рендеру тексту.
+                self._install_image_emitter()
                 mode = (self._config.get("render_mode") or "bitmap").lower()
+                if mode != "bitmap" and self._is_tspl():
+                    # BH-163 — `native` на TSPL-залізі не працює й працювати не
+                    # може: у цьому режимі текст іде нативними ESC/POS-байтами,
+                    # яких TSPL-прошивка не розуміє. Живий прогін у цій парі
+                    # дав чек, де приїхав САМ QR, без жодного рядка тексту.
+                    #
+                    # Комбінація дозволена моделлю й ніде не звіряється, тож
+                    # мовчки лишити її означає лишити конфігурацію, у якій
+                    # принтер друкує пів-чека. Беремо bitmap — єдиний режим,
+                    # який на цьому залізі щось дає.
+                    logger.warning(
+                        "[%s] render_mode=%s несумісний з TSPL — друкую bitmap",
+                        self.name, mode,
+                    )
+                    mode = "bitmap"
                 code_page = (self.code_page or "").lower()
                 if mode == "bitmap":
                     self._install_bitmap_patch()

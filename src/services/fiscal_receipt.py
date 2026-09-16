@@ -281,7 +281,15 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
         top_gap = 8 if narrow else 0
         canvas = Image.new("1", (paper_w, qr_img.height + top_gap + bottom_gap), 1)
         canvas.paste(qr_img, ((paper_w - qr_img.width) // 2, top_gap))
-        printer._raw(image_to_gs_v_0(canvas))
+        # BH-162 — віддаємо картинку пристрою, а не жорстко ESC/POS-растром.
+        # Прямий `_raw(image_to_gs_v_0(...))` на TSPL-принтері означав чек БЕЗ
+        # QR: прошивка приймала байти й викидала. Хук ставить bitmap-шим; якщо
+        # його немає (render_mode="native"), лишається старий шлях.
+        emit = getattr(printer, "_bh_emit_image", None)
+        if callable(emit):
+            emit(canvas)
+        else:
+            printer._raw(image_to_gs_v_0(canvas))
 
     # ---- Pos footer ----
     printer.text(_separator(width) + "\n")

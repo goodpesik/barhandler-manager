@@ -31,8 +31,11 @@ class _FakeEscpos:
     def set(self, **_k) -> None:
         pass
 
-    def text(self, _s: str) -> None:
-        pass
+    def text(self, s: str) -> None:
+        # Записуємо, а не ковтаємо. Заглушка, що мовчки викидає текст, робить
+        # фіктивним будь-який тест про те, ЯК той текст поїхав: «сирих байтів
+        # немає» стає правдою просто тому, що немає нічого.
+        self.raw.append(str(s).encode("utf-8", errors="replace"))
 
 
 def _device(protocol: str, paper_width: int = 80) -> tuple[PrinterDevice, _FakeEscpos]:
@@ -564,3 +567,194 @@ def test_the_split_never_cuts_through_a_line():
     ]
     assert len(rows) == len(expected), "на шві загубились або задвоїлись ряди"
     assert rows == expected, "склеєний назад чек не збігається з поданим"
+
+
+# ---------- BH-162: картинка, що не йде через text() ----------
+
+def test_a_standalone_image_reaches_a_tspl_device():
+    """QR фіскального чека — єдина картинка, яку рендерять окремо й писали
+    сирим `_raw(image_to_gs_v_0(...))`. На TSPL-залізі прошивка такий растр
+    мовчки викидає, і чек виходив БЕЗ QR — а порожній рядок перед ним (він
+    іде через `text()`) друкувався справно, тому втрата була непомітна.
+
+    Моя ж дірка з BH-160: полагодив текстовий шлях і пропустив те, що через
+    текст не йде.
+    """
+    dev, esc = _device("tspl")
+    dev._install_image_emitter()
+    dev._install_bitmap_patch()
+
+    esc.text("Касир: Super Admin\n")
+    esc._bh_emit_image(Image.new("1", (384, 200), 1))
+    dev._finalize_tspl()
+
+    blob = b"".join(esc.raw)
+    assert b"BITMAP" in blob, "картинка не дійшла до TSPL-пристрою"
+    assert b"\x1dv0" not in blob, "картинка пішла ESC/POS-растром повз протокол"
+
+
+def test_the_image_keeps_its_place_in_the_stream():
+    """Картинка мусить лягти ПІСЛЯ рядків, які їй передували, а не поперед
+    недописаного буфера."""
+    dev, esc = _device("tspl")
+    dev._install_image_emitter()
+    dev._install_bitmap_patch()
+
+    esc.text("перший рядок\n")
+    esc.text("другий без переносу")          # осідає в буфері
+    marker = Image.new("1", (384, 200), 1)
+    marker.putpixel((5, 5), 0)
+    esc._bh_emit_image(marker)
+
+    assert len(dev._tspl_pages) == 3, "буфер не злився перед картинкою"
+    assert dev._tspl_pages[-1] is marker, "картинка стала не в кінець"
+
+
+def test_an_escpos_device_still_gets_the_raster():
+    """Зворотний бік: на чековому принтері нічого не змінилось."""
+    dev, esc = _device("escpos")
+    dev._install_image_emitter()
+    dev._install_bitmap_patch()
+    esc._bh_emit_image(Image.new("1", (384, 200), 1))
+    blob = b"".join(esc.raw)
+    assert b"\x1dv0" in blob
+    assert dev._tspl_pages == []
+
+
+def _fiscal_receipt_with_qr():
+    from datetime import datetime
+
+    from src.models.fiscal_receipt import FiscalReceipt, FiscalReceiptItem
+
+    return FiscalReceipt(
+        business_name="ФОП Левинець Максим Сергійович",
+        items=[FiscalReceiptItem(
+            name="Курточка мембранна утеплена",
+            quantity=1, price=3300.0, sum=3300.0, tax_symbol="З",
+        )],
+        paid_sum=3300.0, total_sum=3300.0,
+        fiscal_number="TEST-g9qaC3",
+        fiscal_date=datetime(2026, 9, 16, 15, 47, 2),
+        cashier="Super Admin",
+        qr_url="https://cabinet.tax.gov.ua/cashregs/check?id=TEST-g9qaC3",
+    )
+
+
+@pytest.mark.parametrize("render_mode", ["bitmap", "native"])
+def test_a_real_fiscal_receipt_carries_its_qr_to_a_tspl_printer(render_mode):
+    """НАСКРІЗНО, через справжній `render_fiscal_receipt`.
+
+    Перша редакція цих тестів кликала `_bh_emit_image` напряму й жодного разу
+    не заходила в те місце, де вада й була. Ревʼю показало, що навіть
+    перевернута гілка (`if not callable(emit)`) їх проходила.
+
+    `render_mode` тут обидва навмисне: віддавання картинки не має залежати
+    від того, як рендериться ТЕКСТ. Доти хук жив усередині bitmap-шима, і при
+    `native` фіскальний QR знову йшов сирим ESC/POS — тобто зникав.
+    """
+    from src.services.fiscal_receipt import render_fiscal_receipt
+
+    dev, esc = _device("tspl")
+    dev._install_image_emitter()
+    if render_mode == "bitmap":
+        dev._install_bitmap_patch()
+
+    render_fiscal_receipt(esc, _fiscal_receipt_with_qr(), chars_per_line=32)
+    dev._finalize_tspl()
+
+    blob = b"".join(esc.raw)
+    assert blob, "на принтер не пішло нічого"
+    assert b"BITMAP" in blob, "QR не дійшов до TSPL-пристрою"
+    assert b"\x1dv0" not in blob, "QR пішов ESC/POS-растром повз протокол"
+
+
+def test_a_real_fiscal_receipt_still_prints_its_qr_on_escpos():
+    """Зворотний бік: на чековому принтері байти ті самі, що й до фікса."""
+    from src.services.fiscal_receipt import render_fiscal_receipt
+
+    dev, esc = _device("escpos")
+    dev._install_image_emitter()
+    dev._install_bitmap_patch()
+
+    render_fiscal_receipt(esc, _fiscal_receipt_with_qr(), chars_per_line=32)
+
+    blob = b"".join(esc.raw)
+    assert b"\x1dv0" in blob, "QR не пішов ESC/POS-растром"
+    assert dev._tspl_pages == []
+
+
+def test_the_image_emitter_does_not_depend_on_the_text_render_mode():
+    """Як рендериться ТЕКСТ і якою МОВОЮ говорить пристрій — різні осі.
+    Хук мусить зʼявитись навіть там, де bitmap-шима немає взагалі."""
+    dev, esc = _device("tspl")
+    dev._install_image_emitter()          # БЕЗ _install_bitmap_patch
+    assert callable(getattr(esc, "_bh_emit_image", None))
+
+    esc._bh_emit_image(Image.new("1", (384, 200), 1))
+    dev._finalize_tspl()
+    assert b"BITMAP" in b"".join(esc.raw)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("render_mode", ["bitmap", "native"])
+async def test_a_job_run_through_the_worker_gets_the_image_emitter(render_mode):
+    """Проводка, а не самі деталі.
+
+    Мутація «прибрати `_install_image_emitter()` з воркера» пережила всі
+    попередні тести: кожен ставив емітер руками. Тобто перевірялось, що
+    деталь працює, і НЕ перевірялось, що її взагалі вмикають.
+
+    Тут джоб іде справжньою чергою пристрою — тим самим шляхом, яким ходить
+    `/print/fiscal`. `native` серед параметрів навмисне: саме там раніше й
+    зникав QR.
+    """
+    import asyncio
+
+    from src.services.fiscal_receipt import render_fiscal_receipt
+
+    dev, esc = _device("tspl")
+    dev._config["render_mode"] = render_mode
+    dev._worker_task = asyncio.create_task(dev._worker())
+
+    async def _job(printer):
+        render_fiscal_receipt(printer, _fiscal_receipt_with_qr(), chars_per_line=32)
+
+    await asyncio.wait_for(dev.enqueue(_job), timeout=5)
+    await dev.disconnect()
+
+    blob = b"".join(esc.raw)
+    assert blob, "на принтер не пішло нічого"
+    assert b"BITMAP" in blob, "QR не дійшов: емітер картинок не ввімкнули"
+    assert b"\x1dv0" not in blob, "QR пішов ESC/POS-растром повз протокол"
+
+
+@pytest.mark.asyncio
+async def test_native_render_mode_is_overridden_on_tspl_hardware():
+    """`native` на TSPL не працює й працювати не може: текст іде нативними
+    ESC/POS-байтами, яких прошивка не розуміє. Живий прогін у цій парі дав
+    чек, де приїхав сам QR без жодного рядка тексту.
+
+    Комбінація дозволена моделлю й ніде не звіряється, тож лишити її мовчки
+    означало б лишити конфігурацію, у якій принтер друкує пів-чека.
+    """
+    import asyncio
+
+    from src.services.fiscal_receipt import render_fiscal_receipt
+
+    dev, esc = _device("tspl")
+    dev._config["render_mode"] = "native"
+    dev._worker_task = asyncio.create_task(dev._worker())
+
+    async def _job(printer):
+        render_fiscal_receipt(printer, _fiscal_receipt_with_qr(), chars_per_line=32)
+
+    await asyncio.wait_for(dev.enqueue(_job), timeout=5)
+    await dev.disconnect()
+
+    blob = b"".join(esc.raw)
+    assert b"BITMAP" in blob
+    # Текст мусить бути НА КАРТИНЦІ, а не піти повз протокол сирими байтами.
+    assert b"\x1dv0" not in blob
+    assert b"TEST-g9qaC3" not in blob, (
+        "текст пішов нативними байтами — TSPL-прошивка їх викине"
+    )
