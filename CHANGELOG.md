@@ -31,6 +31,7 @@ block in the same PR that bumps `VERSION`.
 - API key moved from `config.yaml` into a shared constant (`src/constants.py`) — same UUID lives in BarHandler's frontend. The handshake is a magic-string sentinel, not a secret; the config-file override is kept for hosts running multiple isolated POS apps.
 
 ### Fixed
+- Runtime files (`config.yaml`, `install_id.txt`, `bhm.log`, `terminals.json`) are written to the install's data directory instead of a path derived from the code. In the frozen builds — the macOS app and the Windows exe — that code path is PyInstaller's temp directory, wiped on every launch: the remote-diagnostics toggle returned 500, a new install id was generated on every restart, and the remote log / terminal-list commands answered "not found". Source installs are unaffected (both roots are the same directory there). `scripts/usb_probe.py` now ships in the bundle and runs in-process there, so the USB check works in a frozen build too. (BH-158)
 - Cyrillic glyphs no longer print as `?` — bitmap rendering through Noto Sans Mono via `GS v 0` raster bypasses code-page mismatches on cheap ESC/POS clones.
 - CORS preflight 405 from browser-side requests (added `CORSMiddleware` with sensible dev + prod allowlist).
 - `POST /devices/register` response envelope unwrapping — the manager returns `{ "printer": {...} }` but the frontend was reading the registration fields off the top level and crashed silently.
