@@ -32,6 +32,19 @@ def _app_dir() -> Path:
 
 
 APP_DIR = _app_dir()
+# ПРАВИЛО ШЛЯХІВ (BH-158). Дві різні речі, і плутати їх не можна:
+#
+#   * РЕСУРС, спакований у збірку й доступний ТІЛЬКИ на читання — VERSION,
+#     src/assets/fonts, scripts/. Його адресують відносно `__file__`: у
+#     замороженій збірці це `_MEIPASS`, куди PyInstaller і розпаковує datas.
+#   * РОБОЧІ ДАНІ, які треба пережити перезапуск — config.yaml, install_id.txt,
+#     printers.json, terminals.json, bhm.log. Їх адресують ЛИШЕ через APP_DIR.
+#
+# Відносний до `__file__` шлях до робочих даних у замороженій збірці вказує в
+# `_MEIPASS` — тимчасову теку, яку стирають на кожному запуску. Запис туди або
+# падає (теки вже немає), або мовчки зникає при наступному старті. Саме так
+# POST /system/uplink віддавав 500 у мак-застосунку, а install_id.txt
+# народжувався новий на кожен рестарт.
 # On a frozen mac .app APP_DIR is ~/.barhandler-manager, which may not exist
 # on first launch (no prior curl|bash install) — create it so the config /
 # registry writes below don't fail. Best-effort: a read-only location just

@@ -20,10 +20,81 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 
+from src.config import APP_DIR
+
+FROZEN = bool(getattr(sys, "frozen", False))
+
 _HOST_RE = re.compile(r"^[a-zA-Z0-9.\-]{1,253}$")
 _CMD_TIMEOUT = 10
-_INSTALL_ROOT = Path(__file__).resolve().parent.parent.parent
-_BHM_LOG = _INSTALL_ROOT / "bhm.log"
+# BH-158. Два РІЗНІ корені, і плутати їх не можна (див. коментар у config.py):
+#   _BUNDLE_ROOT — спаковані ресурси, тільки на читання (scripts/usb_probe.py).
+#                  У замороженій збірці це `_MEIPASS`, куди PyInstaller кладе
+#                  datas, — саме туди й треба дивитись за скриптом.
+#   APP_DIR      — робочі дані (bhm.log, terminals.json). У мак-застосунку це
+#                  ~/.barhandler-manager, а не `_MEIPASS`, тож доти віддалена
+#                  діагностика читала лог і термінали за неіснуючим шляхом і
+#                  чесно відповідала «не знайдено» на кожен запит підтримки.
+_BUNDLE_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _bhm_log_path() -> Path:
+    """Лог менеджера — робочі дані, тож завжди від APP_DIR.
+
+    Функція, а не константа: у вихідному чекауті APP_DIR збігається з коренем
+    коду, і константа, обчислена на імпорті, ховає, від ЧОГО вона насправді
+    залежить — тест не відрізнив би правильний шлях від помилкового.
+    """
+    return APP_DIR / "bhm.log"
+
+
+def _run_script_inprocess(script: Path) -> tuple[bool, str]:
+    """Виконати самодостатній діагностичний скрипт у власному процесі й
+    повернути (успіх, те, що він надрукував).
+
+    Потрібно лише для замороженої збірки, де окремого інтерпретатора немає.
+    Скрипт кличе `sys.exit(1)` на своїх помилках — це нормальне завершення, а
+    не збій діагностики, тож SystemExit ловимо й читаємо його код. Виконуємо
+    з `__name__ == "__main__"`, інакше блок у кінці файла не запуститься.
+
+    Вивід забираємо ПІДМІНОЮ `print` у власному просторі імен скрипта, а не
+    через `contextlib.redirect_stdout`: той підміняє `sys.stdout` на весь
+    процес, і поки USB-перевірка йде (а це секунди), у наш буфер падали б
+    рядки чужих запитів, які в цей момент теж щось друкують. Пошук імені в
+    модулі спершу дивиться у глобальні змінні й лише потім у builtins, тож
+    підміни в словнику достатньо — і вона не виходить за межі скрипта.
+    """
+    import io
+
+    buf = io.StringIO()
+    code = 0
+    try:
+        source = script.read_text(encoding="utf-8")
+    except OSError as exc:
+        return False, f"can't read {script}: {exc}"
+
+    def _print(*args, sep: str = " ", end: str = "\n", **_kwargs) -> None:
+        buf.write(sep.join(str(a) for a in args) + end)
+
+    namespace = {"__name__": "__main__", "__file__": str(script), "print": _print}
+    try:
+        exec(compile(source, str(script), "exec"), namespace)
+    except SystemExit as exc:
+        # `sys.exit("текст")` — звичайний пітонівський ідіом, і тоді `code` це
+        # рядок. Знайдено ревʼю: `int(...)` на ньому кидав ValueError ПРЯМО В
+        # except-гілці, тобто повз `except Exception` нижче — і виняток тікав
+        # аж у сокет-колбек, валячи те, що ця функція мала б ловити.
+        # Рядок у `code` за угодою означає помилку — і сам текст теж треба
+        # показати, бо саме він пояснює, що не так.
+        if isinstance(exc.code, int):
+            code = exc.code
+        elif exc.code is None:
+            code = 0
+        else:
+            buf.write(f"{exc.code}\n")
+            code = 1
+    except Exception as exc:  # noqa: BLE001 — діагностика не має валити менеджер
+        return False, buf.getvalue() + f"\n{type(exc).__name__}: {exc}"
+    return code == 0, buf.getvalue()
 
 
 async def _run_subprocess(args: list[str], timeout: int = _CMD_TIMEOUT) -> tuple[bool, str]:
@@ -41,10 +112,38 @@ async def _run_subprocess(args: list[str], timeout: int = _CMD_TIMEOUT) -> tuple
         return False, f"binary not found: {e}"
 
 
+def _usb_probe_script() -> Optional[Path]:
+    """Шлях до usb_probe.py — спакованого ресурсу. None, якщо його немає."""
+    script = _BUNDLE_ROOT / "scripts" / "usb_probe.py"
+    return script if script.exists() else None
+
+
 async def _cmd_usb_probe(args: dict) -> dict:
-    script = _INSTALL_ROOT / "scripts" / "usb_probe.py"
-    if not script.exists():
-        return {"ok": False, "error": f"usb_probe.py not found at {script}"}
+    script = _usb_probe_script()
+    if script is None:
+        return {
+            "ok": False,
+            "error": f"usb_probe.py not found at {_BUNDLE_ROOT / 'scripts' / 'usb_probe.py'}",
+        }
+    if FROZEN:
+        # У замороженій збірці `sys.executable` — це САМ менеджер, а не
+        # інтерпретатор: запуск підпроцесом підняв би другий менеджер, який
+        # воює за порт 9999. Тому виконуємо скрипт у себе в процесі й
+        # перехоплюємо його вивід.
+        #
+        # Стеля часу така сама, як у підпроцесного шляху, щоб зависла на
+        # libusb перевірка не тримала HTTP-запит вічно. Чесно: потік ми на
+        # цьому не вбиваємо (нитку в Python не скасувати) — він дорахує сам
+        # і результат нікому не віддасть; це все одно краще, ніж запит,
+        # який не повертається ніколи.
+        try:
+            ok, out = await asyncio.wait_for(
+                asyncio.to_thread(_run_script_inprocess, script),
+                timeout=_CMD_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return {"ok": False, "error": "command timeout"}
+        return {"ok": ok, "output": out}
     ok, out = await _run_subprocess([sys.executable, str(script)])
     return {"ok": ok, "output": out}
 
@@ -97,15 +196,24 @@ async def _cmd_tail_log(args: dict) -> dict:
         n = int(args.get("n", 200))
     except (TypeError, ValueError):
         return {"ok": False, "error": "invalid n"}
-    if not _BHM_LOG.exists():
-        return {"ok": False, "error": f"bhm.log not found at {_BHM_LOG}"}
-    lines = _BHM_LOG.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
+    log_path = _bhm_log_path()
+    if not log_path.exists():
+        return {"ok": False, "error": f"bhm.log not found at {log_path}"}
+    lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-n:]
     return {"ok": True, "output": "\n".join(lines)}
 
 
-async def _cmd_list_terminals(args: dict) -> dict:
+def _terminals_path(config: Optional[dict]) -> Path:
+    """Той САМИЙ файл, який читає TerminalRegistry: шлях із конфіга, а якщо
+    він відносний — від APP_DIR, а не від поточної теки процесу."""
+    raw = ((config or {}).get("server") or {}).get("terminal_registry_path") or "terminals.json"
+    path = Path(raw)
+    return path if path.is_absolute() else APP_DIR / path
+
+
+async def _cmd_list_terminals(args: dict, config: Optional[dict] = None) -> dict:
     """Read terminals.json and return registered terminals."""
-    terminals_path = _INSTALL_ROOT / "terminals.json"
+    terminals_path = _terminals_path(config)
     if not terminals_path.exists():
         return {"ok": True, "output": "[]", "note": f"terminals.json not found at {terminals_path}"}
     try:
@@ -266,12 +374,15 @@ _DIAGNOSTICS: dict[str, Callable[..., Awaitable[dict]]] = {
     "dump_config": _cmd_dump_config,
 }
 
+# Команди, яким потрібен конфіг менеджера — його передає make_callback().
+_NEEDS_CONFIG = {"dump_config", "list_terminals"}
+
 
 async def run_diagnostic(cmd: str, args: dict, config: Optional[dict] = None) -> dict:
     fn = _DIAGNOSTICS.get(cmd)
     if fn is None:
         return {"ok": False, "error": f"unknown cmd: {cmd}"}
-    if cmd == "dump_config":
+    if cmd in _NEEDS_CONFIG:
         return await fn(args, config=config)
     return await fn(args)
 
