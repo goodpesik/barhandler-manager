@@ -207,7 +207,19 @@ async def _cmd_terminal_probe(args: dict) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+_TAIL_LOG_ARGS = {"n"}
+
+
 async def _cmd_tail_log(args: dict) -> dict:
+    # BH-159 — невідомий аргумент це ПОМИЛКА, а не привід мовчки взяти дефолт.
+    # Підтримка передала `lines` замість `n`, отримала дефолтні 200 рядків без
+    # жодної скарги — і зробила висновок про обсяг лога, який був неправдою.
+    unknown = sorted(set(args or {}) - _TAIL_LOG_ARGS)
+    if unknown:
+        return {
+            "ok": False,
+            "error": f"unknown arg(s): {', '.join(unknown)} — tail_log takes only 'n'",
+        }
     try:
         n = int(args.get("n", 200))
     except (TypeError, ValueError):
