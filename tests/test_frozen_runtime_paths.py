@@ -325,3 +325,73 @@ def test_inprocess_script_runner_treats_a_bare_exit_as_success(tmp_path):
     ok, out = _run_script_inprocess(script)
     assert ok is True
     assert "усе добре" in out
+
+
+def test_inprocess_script_runner_survives_an_exit_object_whose_str_raises(tmp_path):
+    """Знайдено ДРУГИМ колом ревʼю — та сама вада, що й `sys.exit("текст")`,
+    лише іншим входом.
+
+    `f"{exc.code}"` усередині `except SystemExit` кликало `str()` на чужому
+    обʼєкті. Якщо той `__str__` кидає, новий виняток народжується вже В
+    обробнику — сусідній `except Exception` його не ловить — і він тікає з
+    діагностики аж у виклик.
+    """
+    from src.services.diagnostics import _run_script_inprocess
+
+    script = tmp_path / "probe.py"
+    script.write_text(
+        "import sys\n"
+        "class Weird:\n"
+        "    def __str__(self):\n"
+        "        raise RuntimeError('bang')\n"
+        "print('до виходу')\n"
+        "sys.exit(Weird())\n",
+        encoding="utf-8",
+    )
+    ok, out = _run_script_inprocess(script)
+    assert ok is False
+    assert "до виходу" in out
+    assert "Weird" in out
+
+
+def test_inprocess_script_runner_survives_an_exception_whose_str_raises(tmp_path):
+    """Те саме на другій гілці — `except Exception`. Цей вхід реалістичніший:
+    досить звичайного власного винятку, чий `__str__` лізе до атрибута,
+    якого ще немає."""
+    from src.services.diagnostics import _run_script_inprocess
+
+    script = tmp_path / "probe.py"
+    script.write_text(
+        "class Broken(Exception):\n"
+        "    def __str__(self):\n"
+        "        raise ValueError('bad repr')\n"
+        "print('до падіння')\n"
+        "raise Broken()\n",
+        encoding="utf-8",
+    )
+    ok, out = _run_script_inprocess(script)
+    assert ok is False
+    assert "до падіння" in out
+    assert "Broken" in out
+
+
+def test_inprocess_script_runner_treats_explicit_exit_zero_as_success(tmp_path):
+    """Межа «успіх/помилка» на гілці int. Перевірка на хибність (`exc.code or 0`)
+    замість `isinstance` пройшла б тест на голий `sys.exit()`, але зламала б
+    саме цей випадок."""
+    from src.services.diagnostics import _run_script_inprocess
+
+    script = tmp_path / "probe.py"
+    script.write_text("import sys\nprint('усе гаразд')\nsys.exit(0)\n", encoding="utf-8")
+    ok, out = _run_script_inprocess(script)
+    assert ok is True
+    assert "усе гаразд" in out
+
+
+def test_inprocess_script_runner_treats_a_nonzero_int_exit_as_failure(tmp_path):
+    from src.services.diagnostics import _run_script_inprocess
+
+    script = tmp_path / "probe.py"
+    script.write_text("import sys\nsys.exit(2)\n", encoding="utf-8")
+    ok, _out = _run_script_inprocess(script)
+    assert ok is False
