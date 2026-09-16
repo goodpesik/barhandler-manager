@@ -51,6 +51,11 @@ datas += [("src/assets", "src/assets")]
 # version into VERSION before building.
 datas += [("VERSION", ".")]
 
+# BH-158 — scripts/usb_probe.py теж їде в бандл. Віддалена діагностика й
+# кнопка «USB-сканування» шукають його поруч із кодом (тобто в `_MEIPASS`),
+# і без цього рядка в замороженій збірці USB-перевірка не працювала ніколи.
+datas += [("scripts/usb_probe.py", "scripts")]
+
 hiddenimports += [
     "uvicorn.loops.auto",
     "uvicorn.protocols.http.auto",

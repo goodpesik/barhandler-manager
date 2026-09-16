@@ -454,33 +454,24 @@ async def usb_probe() -> dict:
     whether it reports the standard USB Printer Class (0x07) we
     filter on. Replaces the curl-and-paste workflow for "manager
     can't find my printer" tickets.
+
+    BH-158 — тіло винесене в `src.services.diagnostics`: та сама перевірка
+    доступна і кнопкою в дашборді, і віддаленою командою з сервера логів, і
+    це має бути ОДИН код. Доти тут була своя копія, яка шукала скрипт та
+    інтерпретатор у `~/.barhandler-manager/.venv` — тобто в мак-застосунку
+    й у вінді не працювала ніколи.
     """
-    import subprocess as _sp
-    script = _INSTALL_DIR / "scripts" / "usb_probe.py"
-    python = _INSTALL_DIR / ".venv" / "bin" / "python"
-    if not script.exists():
+    from src.services.diagnostics import run_diagnostic
+
+    result = await run_diagnostic("usb_probe", {})
+    if not result.get("ok") and not result.get("output"):
         raise HTTPException(
-            status_code=404,
-            detail=(
-                f"{script} not found — run install --force to pull "
-                "the latest scripts."
-            ),
+            status_code=500, detail=result.get("error", "usb probe failed"),
         )
-    if not python.exists():
-        raise HTTPException(
-            status_code=500, detail=f"venv python not found at {python}",
-        )
-    try:
-        proc = _sp.run(
-            [str(python), str(script)],
-            capture_output=True, text=True, timeout=15,
-        )
-    except _sp.TimeoutExpired:
-        raise HTTPException(status_code=504, detail="usb probe timed out (>15s)")
     return {
-        "exit_code": proc.returncode,
-        "stdout": proc.stdout,
-        "stderr": proc.stderr,
+        "exit_code": 0 if result.get("ok") else 1,
+        "stdout": result.get("output", ""),
+        "stderr": result.get("error", "") or "",
     }
 
 
@@ -504,7 +495,11 @@ class UplinkPayload(BaseModel):
     enabled: bool
 
 
-_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config.yaml"
+# BH-158 — РОБОЧІ дані, а не спакований ресурс: лише APP_DIR. Відносний до
+# `__file__` шлях у мак-застосунку вказував у `_MEIPASS`, тож запис падав і
+# перемикач uplink віддавав 500. Для скриптової інсталяції APP_DIR — це той
+# самий корінь, що й раніше, тож поведінка не змінилась.
+_CONFIG_PATH = APP_DIR / "config.yaml"
 
 # Match an `uplink:` block (active or commented out) and consume all
 # subsequent lines that belong to it: indented under `uplink:` (lines
@@ -633,7 +628,15 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
 
     # Persist to config.yaml so the next boot reflects this state.
     try:
-        text = _CONFIG_PATH.read_text(encoding="utf-8")
+        # Файла може не бути: load_config() падає в дефолти в памʼяті, якщо
+        # не змогла його створити. Відсутність — не привід валити перемикач:
+        # блок uplink дописуємо в порожній текст, і файл зʼявляється тут.
+        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        text = (
+            _CONFIG_PATH.read_text(encoding="utf-8")
+            if _CONFIG_PATH.exists()
+            else "server:\n  port: 9999\n"
+        )
         new_text = _replace_uplink_in_config(
             text, payload.enabled, tenant,
             tenant_id=tenant_id, tenant_name=tenant_name,
@@ -668,7 +671,7 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
         if existing is not None:
             await existing.stop()
             existing.detach_handler_from_root()
-        install_id_path = Path(__file__).resolve().parent.parent.parent / "install_id.txt"
+        install_id_path = APP_DIR / "install_id.txt"
         install_id = get_or_create_install_id(install_id_path)
         version_path = Path(__file__).resolve().parent.parent.parent / "VERSION"
         version = version_path.read_text().strip() if version_path.exists() else "0.0.0"

@@ -14,6 +14,7 @@ from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 
+from src.config import APP_DIR
 from src.constants import DEFAULT_API_KEY
 from src.devices.registry import PrinterRegistry
 from src.devices.terminal_registry import TerminalRegistry
@@ -91,7 +92,11 @@ def create_app(config: dict) -> FastAPI:
             from src.services.log_uplink import (
                 LogUplinkClient, get_or_create_install_id, set_active,
             )
-            install_id_path = Path(__file__).resolve().parent.parent / "install_id.txt"
+            # BH-158 — робочі дані живуть в APP_DIR. Відносний до `__file__`
+            # шлях у замороженій збірці вказує в `_MEIPASS`, який стирають на
+            # кожному запуску: install_id народжувався б новий щоразу, і
+            # сервер логів бачив би нову інсталяцію після кожного рестарту.
+            install_id_path = APP_DIR / "install_id.txt"
             install_id = get_or_create_install_id(install_id_path)
             version_path = Path(__file__).resolve().parent.parent / "VERSION"
             version = version_path.read_text().strip() if version_path.exists() else "0.0.0"
