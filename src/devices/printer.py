@@ -42,7 +42,10 @@ class PrinterUnavailable(RuntimeError):
 # Стеля висоти одного TSPL-джоба в точках. 2540 точок = 317 мм при 8 точках/мм
 # — типова межа довжини етикетки в дешевих TSPL-прошивках. Вищий чек ріжеться
 # на кілька послідовних `BITMAP`/`PRINT`, які на суцільній стрічці лягають
-# упритул.
+# упритул. Розріз проходить МІЖ рядками, не крізь них — див. `_finalize_tspl`.
+#
+# Окремий рядок, вищий за стелю, лишається цілим: краще один завеликий джоб,
+# який прошивка, можливо, і подужає, ніж гарантовано розрізана літера.
 _TSPL_MAX_DOTS = 2540
 
 
@@ -89,32 +92,47 @@ class PrinterDevice:
         from PIL import Image
 
         width = max(img.width for img in pages)
-        height = sum(img.height for img in pages)
-        canvas = Image.new("1", (width, height), 1)  # 1 = білий у режимі "1"
-        y = 0
-        for img in pages:
-            canvas.paste(img, (0, y))
-            y += img.height
 
-        # Знайдено ревʼю: стелі висоти не було ВЗАГАЛІ. Довгий чек чи кухонний
-        # квиток на багато позицій дає скільки завгодно високий `SIZE`, а
-        # дешеві TSPL-плати мають межу довжини етикетки й невеликий приймальний
-        # буфер. Вийшло б рівно те, заради чого цей тікет і заведено: 200 OK і
-        # порожній папір, лише на іншому порозі.
+        # Ріжемо по МЕЖАХ РЯДКІВ, а не по сирих точках.
         #
-        # Не падаємо й не мовчимо, а ріжемо на шматки: на суцільній стрічці з
-        # `GAP 0` вони лягають один за одним без жодного шва.
-        for chunk_top in range(0, height, _TSPL_MAX_DOTS):
-            chunk = canvas.crop((0, chunk_top, width, min(chunk_top + _TSPL_MAX_DOTS, height)))
-            # 203 dpi = 8 точок/мм — та сама пітч, з якої рахує `dots_for`.
-            height_mm = max(1, -(-chunk.height // 8))
-            self._printer._raw(image_to_tspl_bitmap(
-                chunk,
-                label_width_mm=self.paper_width,
-                label_height_mm=height_mm,
-                gap_mm=0,
-                copies=1,
-            ))
+        # Знайдено другим колом ревʼю: розріз за кратністю стелі міг лягти
+        # ПОСЕРЕД рядка тексту, і тоді літера виявлялась розділеною між двома
+        # окремими `PRINT`. На ідеально рівній подачі цього не видно, але два
+        # послідовні проходи по суцільній стрічці неминуче мають люфт кроку —
+        # і шов проходить зазубриною просто крізь рядок. Рядок цілий у своєму
+        # шматку — і люфт лягає в міжрядковий проміжок, де його не видно.
+        groups: list[list] = [[]]
+        group_height = 0
+        for img in pages:
+            if group_height and group_height + img.height > _TSPL_MAX_DOTS:
+                groups.append([])
+                group_height = 0
+            groups[-1].append(img)
+            group_height += img.height
+
+        for group in groups:
+            if not group:
+                continue
+            height = sum(img.height for img in group)
+            canvas = Image.new("1", (width, height), 1)  # 1 = білий у режимі "1"
+            y = 0
+            for img in group:
+                canvas.paste(img, (0, y))
+                y += img.height
+            self._emit_tspl_canvas(canvas)
+
+    def _emit_tspl_canvas(self, canvas) -> None:
+        """Віддати один готовий бітмап як `SIZE / GAP / BITMAP / PRINT`."""
+
+        # 203 dpi = 8 точок/мм — та сама пітч, з якої рахує `dots_for`.
+        height_mm = max(1, -(-canvas.height // 8))
+        self._printer._raw(image_to_tspl_bitmap(
+            canvas,
+            label_width_mm=self.paper_width,
+            label_height_mm=height_mm,
+            gap_mm=0,
+            copies=1,
+        ))
 
     @property
     def enabled(self) -> bool:

@@ -475,3 +475,92 @@ async def test_jobs_still_waiting_in_the_queue_are_woken_too():
     for t in (first, queued):
         with pytest.raises(PrinterUnavailable):
             await asyncio.wait_for(t, timeout=2)
+
+
+# ---------- знайдене ТРЕТІМ поглядом (друге коло ревʼю на виправленнях) ----------
+
+def test_windows_hardware_id_in_the_label_does_not_fake_a_model():
+    """Перша редакція вирізала лише форму `0483:410B`. Друге коло показало,
+    що цього мало: Windows Device Manager дає ідентифікатор як
+    `USB\\VID_0483&PID_410B&REV_0100`, і такий рядок цілком може потрапити в
+    поле назви при ручній реєстрації — саме в тому випадку «скан не бачить
+    принтер», заради якого ручна реєстрація й існує."""
+    for label in [
+        r"USB\VID_0483&PID_410B&REV_0100",
+        "Generic USB Printer (VID_0483&PID_410B)",
+        "STM32 Composite Device 0483-410B",
+        "USB printer 0483:410b",
+    ]:
+        assert protocol_for_model(label) is None, label
+    # Справжня модель поруч з ідентифікатором усе одно впізнається.
+    assert protocol_for_model(r"XP-246B USB\VID_0483&PID_410B") == "tspl"
+
+
+def test_style_does_not_leak_from_one_receipt_to_the_next():
+    """Скидати треба не лише буфер, а й стан: інакше жирний підсумок одного
+    чека лишав би жирним перший рядок наступного."""
+    # Еталон — з ОКРЕМОГО пристрою, якому стиль ніколи не ставили. Перша
+    # редакція брала еталон із того самого пристрою після ще одного скидання,
+    # тож із поверненою вадою обидві картинки виходили однаково жирними й
+    # тест зеленів.
+    clean_dev, clean_esc = _device("tspl")
+    clean_dev._install_bitmap_patch()
+    clean_esc.text("звичайний рядок\n")
+    reference = clean_dev._tspl_pages[0]
+
+    dev, esc = _device("tspl")
+    dev._install_bitmap_patch()
+    esc.set(bold=True, align="center", double_height=True)
+    dev._reset_render_state()
+    esc.text("звичайний рядок\n")
+    after_reset = dev._tspl_pages[0]
+
+    assert after_reset.size == reference.size, "стиль пережив скидання стану"
+    assert after_reset.tobytes() == reference.tobytes(), "стиль пережив скидання стану"
+
+
+def test_the_split_never_cuts_through_a_line():
+    """Розріз за кратністю стелі міг лягти ПОСЕРЕД рядка, і літера виявлялась
+    розділеною між двома окремими `PRINT`. Два послідовні проходи по суцільній
+    стрічці мають люфт кроку — шов проходив би зазубриною крізь текст.
+
+    Перевіряємо по-справжньому: розбираємо `BITMAP`-и назад і звіряємо з тим,
+    що подали. Попередні тести дивились лише на кількість `PRINT` і заголовки
+    `SIZE`, тож дублікат чи втрачений ряд на шві лишались невидимими.
+    """
+    from src.devices.printer import _TSPL_MAX_DOTS
+
+    dev, esc = _device("tspl")
+    # Висота рядка НЕ ділить стелю націло — саме тут раніше й падав шов.
+    line_h = 37
+    lines = (_TSPL_MAX_DOTS // line_h) + 3
+    pages = []
+    for i in range(lines):
+        img = Image.new("1", (576, line_h), 1)
+        # Мітка, унікальна для рядка: чорна точка на власній позиції.
+        img.putpixel((i % 576, line_h // 2), 0)
+        pages.append(img)
+    dev._tspl_pages = list(pages)
+    dev._finalize_tspl()
+
+    blob = b"".join(esc.raw)
+    assert blob.count(b"PRINT") >= 2, "чек мав розрізатись"
+
+    # Розбираємо кожен BITMAP і склеюємо назад.
+    rows: list[bytes] = []
+    rest = blob
+    while b"BITMAP " in rest:
+        head = rest.split(b"BITMAP ", 1)[1]
+        params, payload = head.split(b",", 5)[:5], head.split(b",", 5)[5]
+        bpr, h = int(params[2]), int(params[3])
+        data = payload[: bpr * h]
+        rows.extend(data[i * bpr:(i + 1) * bpr] for i in range(h))
+        rest = payload[bpr * h:]
+
+    expected = [
+        img.tobytes()[i * ((576 + 7) // 8):(i + 1) * ((576 + 7) // 8)]
+        for img in pages
+        for i in range(line_h)
+    ]
+    assert len(rows) == len(expected), "на шві загубились або задвоїлись ряди"
+    assert rows == expected, "склеєний назад чек не збігається з поданим"
