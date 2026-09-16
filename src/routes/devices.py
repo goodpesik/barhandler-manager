@@ -355,7 +355,14 @@ async def test_print(printer_id: str, request: Request) -> dict:
     # roll. Send a real TSPL bitmap instead — same handshake the
     # production /print/label uses, but with a self-describing payload.
     protocol = getattr(reg, "protocol", PrintProtocol.escpos)
-    if reg.kind == PrinterKind.label and protocol == PrintProtocol.tspl:
+    # BH-160 — гілка TSPL більше НЕ прив'язана до ролі «лейбл».
+    #
+    # Було `kind == label and protocol == tspl`. Через це чековий тест на
+    # етикетковому залізі йшов ESC/POS-шляхом, повертав 200 і не друкував
+    # нічого: прошивка приймає байти й мовчки їх викидає. Саме ця відповідь
+    # «відправлено на друк» при порожньому ролику коштувала виїзду до
+    # клієнта. Мова пристрою вирішує, чим слати; роль — лише що саме.
+    if protocol == PrintProtocol.tspl:
         label_width = reg.paper_width
         label_height = getattr(reg, "label_height", 25)
         gap = getattr(reg, "label_gap", 2.25)

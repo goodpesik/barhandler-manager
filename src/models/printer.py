@@ -111,6 +111,11 @@ class PrinterRegistration(BaseModel):
     # receipt-style printer; flip to tspl for dedicated label printers
     # (XP-246B / 235B / 237B) shipping in `Print mode: LABEL`.
     protocol: PrintProtocol = PrintProtocol.escpos
+    # BH-160 — звідки взявся протокол: "operator" (вибрав у дашборді),
+    # "model-table" (впізнали модель), "default" (не впізнали, взяли ESC/POS).
+    # Видно в /devices і в dump_config, щоб підтримка не гадала, чому пристрій
+    # говорить саме цією мовою.
+    protocol_source: str = "default"
     # Label-specific layout (used by `/print/label` when protocol=tspl).
     # Default 48×25mm + 2.25mm gap matches the XP-246B factory roll.
     label_height: int = 25                 # mm — physical label length

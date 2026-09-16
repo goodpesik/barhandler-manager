@@ -15,6 +15,7 @@ from typing import Dict, Optional
 
 from src.devices.printer import PrinterDevice
 from src.devices.scan import discover_all
+from src.devices.printer_models import protocol_for_model
 from src.models.printer import (
     NetworkAddress,
     PrintProtocol,
@@ -42,6 +43,9 @@ class PrinterRegistry:
         self._registrations: Dict[str, PrinterRegistration] = {}
         # PrinterDevice instances are reused across prints.
         self._devices: Dict[str, PrinterDevice] = {}
+        # Задачі роз'єднання, які ще не добігли — тримаємо посилання, див.
+        # `_drop_cached_device`.
+        self._pending_disconnects: set = set()
         # Discoveries cached in-memory between a /discover and a /register
         # call so the frontend doesn't have to round-trip the full descriptor.
         self._last_discovery: Dict[str, PrinterDescriptor] = {}
@@ -71,6 +75,9 @@ class PrinterRegistry:
             had_protocol = "protocol" in entry
             if not had_protocol and kind_value == "label":
                 reg.protocol = PrintProtocol.tspl
+                # Це не «дефолт ESC/POS», а міграція старої реєстрації —
+                # хай у підтримки не лишається питання, звідки взявся TSPL.
+                reg.protocol_source = "legacy-upgrade"
                 upgraded = True
             self._registrations[reg.descriptor.id] = reg
         if upgraded:
@@ -124,14 +131,25 @@ class PrinterRegistry:
         # to TSPL (they ship in `Print mode: LABEL` and silently ignore
         # ESC/POS) — everything else defaults to ESC/POS. The operator
         # can override either way via the request.
+        # BH-160 — протокол береться від ПРИСТРОЮ, не від ролі.
+        #
+        # Доти було `kind == label → tspl`, решта → escpos. Тобто оператор,
+        # обравши «чек» на етикетковому залізі, мовчки отримував ESC/POS —
+        # прошивка приймала байти й викидала їх, а ми рапортували успіх.
+        #
+        # Порядок: явний вибір оператора → таблиця моделей → дефолт. Записуємо
+        # ще й ДЖЕРЕЛО, щоб у підтримки не лишалось питання «звідки це взялось».
         if req.protocol is not None:
             protocol = req.protocol
+            protocol_source = "operator"
         else:
-            protocol = (
-                PrintProtocol.tspl
-                if req.kind == PrinterKind.label
-                else PrintProtocol.escpos
-            )
+            detected = protocol_for_model(descriptor.label)
+            if detected is not None:
+                protocol = PrintProtocol(detected)
+                protocol_source = "model-table"
+            else:
+                protocol = PrintProtocol.escpos
+                protocol_source = "default"
         kwargs = dict(
             descriptor=descriptor,
             kind=req.kind,
@@ -141,6 +159,7 @@ class PrinterRegistry:
             code_page=req.code_page,
             drawer_pin=req.drawer_pin,
             protocol=protocol,
+            protocol_source=protocol_source,
         )
         if req.label_height is not None:
             kwargs["label_height"] = req.label_height
@@ -148,8 +167,39 @@ class PrinterRegistry:
             kwargs["label_gap"] = req.label_gap
         reg = PrinterRegistration(**kwargs)
         self._registrations[descriptor.id] = reg
+        # BH-160 — закешований пристрій тримає СТАРИЙ конфіг: ширину паперу,
+        # протокол, режим рендеру, пін каси. Доти `register()` його не чіпав
+        # (на відміну від `unregister()`), тож перереєстрація з іншою роллю чи
+        # мовою не діяла до перезапуску менеджера: оператор міняв налаштування,
+        # тиснув тест — і отримував стару поведінку. Знайдено живим прогоном:
+        # реєстрація на 58 мм лишала джоби 80-мілімитровими.
+        self._drop_cached_device(descriptor.id)
         self.save()
         return reg
+
+    def _drop_cached_device(self, printer_id: str) -> None:
+        """Викинути закешований пристрій, щоб наступний друк зібрав його
+        наново з актуальної реєстрації."""
+        device = self._devices.pop(printer_id, None)
+        if device is None:
+            return
+        import asyncio
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            # Синхронний виклик (тест, CLI) — циклу немає, і роз'єднувати
+            # нічого: пристрій уже викинуто з кешу, а з'єднання підбере
+            # збирач сміття. Головне — не впасти тут.
+            return
+        # Посилання на задачу треба ТРИМАТИ: `create_task` не володіє нею, і
+        # збирач сміття може знести її до завершення — зʼєднання лишиться
+        # відкритим, а в лозі буде «Task was destroyed but it is pending».
+        # Раніше це стосувалось лише видалення принтера, тепер — кожної
+        # перереєстрації, тобто на порядок частіше.
+        task = asyncio.create_task(device.disconnect())
+        self._pending_disconnects.add(task)
+        task.add_done_callback(self._pending_disconnects.discard)
 
     def add_manual_descriptor(
         self,
@@ -211,12 +261,7 @@ class PrinterRegistry:
         if printer_id not in self._registrations:
             raise UnknownPrinter(printer_id)
         self._registrations.pop(printer_id)
-        device = self._devices.pop(printer_id, None)
-        if device is not None:
-            # Fire-and-forget — disconnect runs in the worker task we own,
-            # we never raise inside disconnect.
-            import asyncio
-            asyncio.create_task(device.disconnect())
+        self._drop_cached_device(printer_id)
         self.save()
 
     # ---------- device access ----------
@@ -259,6 +304,14 @@ class PrinterRegistry:
             "render_mode": reg.render_mode,
             "code_page": reg.code_page,
             "drawer_pin": reg.drawer_pin,
+            # BH-160 — пристрою треба знати, якою мовою з ним говорити. Доти
+            # протокол читав ЛИШЕ `/print/label`, тож TSPL-принтер не міг
+            # надрукувати ні чек, ні кухонний квиток: решта маршрутів жорстко
+            # слали ESC/POS, а прошивка їх мовчки ковтала.
+            "protocol": (
+                reg.protocol.value if hasattr(reg.protocol, "value") else reg.protocol
+            ),
+            "label_gap": getattr(reg, "label_gap", 2.25),
         }
         transport = descriptor.transport
         if isinstance(transport, PrinterTransport):

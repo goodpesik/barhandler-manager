@@ -18,6 +18,7 @@ from typing import Awaitable, Callable, Optional
 from escpos.printer import Network, Usb
 
 from src.services.bitmap_render import dots_for, image_to_gs_v_0, render_paragraph
+from src.services.tspl_render import image_to_tspl_bitmap
 from src.services.encoding import encode_ua_cp866
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,13 @@ class PrinterUnavailable(RuntimeError):
         self.code = code
 
 
+# Стеля висоти одного TSPL-джоба в точках. 2540 точок = 317 мм при 8 точках/мм
+# — типова межа довжини етикетки в дешевих TSPL-прошивках. Вищий чек ріжеться
+# на кілька послідовних `BITMAP`/`PRINT`, які на суцільній стрічці лягають
+# упритул.
+_TSPL_MAX_DOTS = 2540
+
+
 class PrinterDevice:
     """A single ESC/POS printer (USB or network) with a FIFO job queue."""
 
@@ -49,8 +57,64 @@ class PrinterDevice:
             asyncio.Queue()
         )
         self._worker_task: Optional[asyncio.Task] = None
+        # BH-160 — зібрані рядки одного TSPL-джоба. Порожньо між джобами.
+        self._tspl_pages: list = []
 
     # ----- lifecycle ---------------------------------------------------
+
+    def _is_tspl(self) -> bool:
+        """Чи говорить цей пристрій мовою TSPL.
+
+        Протокол — властивість ПРИСТРОЮ, не ролі. Доти чековий шлях завжди
+        слав ESC/POS, і на етикетковому залізі це означало тишу: прошивка
+        приймає байти й мовчки їх викидає.
+        """
+        return str(self._config.get("protocol") or "escpos").lower() == "tspl"
+
+    def _finalize_tspl(self) -> None:
+        """Віддати зібрані рядки одним TSPL-джобом і очистити накопичувач.
+
+        Чек — це не етикетка фіксованої висоти: висота рахується з того, що
+        вийшло. `GAP 0 mm, 0 mm` каже «стрічка суцільна» — з ненульовим
+        зазором принтер шукав би проміжок, якого немає, і гнав би порожнє.
+
+        Викликається В БУДЬ-ЯКОМУ разі — і коли джоб відпрацював, і коли
+        впав: інакше рядки впалого джоба лишились би в накопичувачі й
+        вилізли б зверху наступного чека.
+        """
+        pages, self._tspl_pages = self._tspl_pages, []
+        if not pages or self._printer is None:
+            return
+
+        from PIL import Image
+
+        width = max(img.width for img in pages)
+        height = sum(img.height for img in pages)
+        canvas = Image.new("1", (width, height), 1)  # 1 = білий у режимі "1"
+        y = 0
+        for img in pages:
+            canvas.paste(img, (0, y))
+            y += img.height
+
+        # Знайдено ревʼю: стелі висоти не було ВЗАГАЛІ. Довгий чек чи кухонний
+        # квиток на багато позицій дає скільки завгодно високий `SIZE`, а
+        # дешеві TSPL-плати мають межу довжини етикетки й невеликий приймальний
+        # буфер. Вийшло б рівно те, заради чого цей тікет і заведено: 200 OK і
+        # порожній папір, лише на іншому порозі.
+        #
+        # Не падаємо й не мовчимо, а ріжемо на шматки: на суцільній стрічці з
+        # `GAP 0` вони лягають один за одним без жодного шва.
+        for chunk_top in range(0, height, _TSPL_MAX_DOTS):
+            chunk = canvas.crop((0, chunk_top, width, min(chunk_top + _TSPL_MAX_DOTS, height)))
+            # 203 dpi = 8 точок/мм — та сама пітч, з якої рахує `dots_for`.
+            height_mm = max(1, -(-chunk.height // 8))
+            self._printer._raw(image_to_tspl_bitmap(
+                chunk,
+                label_width_mm=self.paper_width,
+                label_height_mm=height_mm,
+                gap_mm=0,
+                copies=1,
+            ))
 
     @property
     def enabled(self) -> bool:
@@ -158,10 +222,40 @@ class PrinterDevice:
             with suppress(asyncio.CancelledError):
                 await self._worker_task
             self._worker_task = None
+        self._fail_queued_jobs()
         if self._printer is not None:
             with suppress(Exception):
                 self._printer.close()
             self._printer = None
+
+    def _reset_render_state(self) -> None:
+        """Прибрати за джобом: зібрані TSPL-сторінки і недописаний рядок."""
+        self._tspl_pages.clear()
+        reset = getattr(self._printer, "_bh_reset_render_state", None)
+        if callable(reset):
+            with suppress(Exception):
+                reset()
+
+    def _fail_queued_jobs(self) -> None:
+        """Розбудити всіх, хто чекає на джоби, які вже не виконаються.
+
+        Знайдено ревʼю: скасований воркер лишав черзі невиконані елементи, а
+        кожен із них — це HTTP-запит, що `await`-ить свій `done`. Без цього
+        вони висять до таймауту клієнта й не бачать жодної помилки.
+        """
+        while True:
+            try:
+                _job, done = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if not done.done():
+                done.set_exception(
+                    PrinterUnavailable(
+                        f"{self.name}: друк скасовано — принтер перенастроюють",
+                        code="cancelled",
+                    ),
+                )
+            self._queue.task_done()
 
     # ----- queue interface ---------------------------------------------
 
@@ -288,7 +382,14 @@ class PrinterDevice:
                 # render already carries per-line padding, so consecutive
                 # rasters stack tight on every printer. (Bottom margin is
                 # handled by cut()'s print-and-feed, which is unaffected.)
-                printer._raw(image_to_gs_v_0(img))
+                if self._is_tspl():
+                    # BH-160 — TSPL друкує не рядками, а ЕТИКЕТКАМИ: `PRINT`
+                    # на кожен рядок виплюнув би окрему етикетку на рядок.
+                    # Тому копичимо рядки й віддаємо один високий бітмап у
+                    # кінці джоба — див. `_finalize_tspl`.
+                    self._tspl_pages.append(img)
+                else:
+                    printer._raw(image_to_gs_v_0(img))
 
         def text(s: str) -> None:
             if not s:
@@ -317,11 +418,35 @@ class PrinterDevice:
 
         def cut(*args, **kwargs):
             flush()
+            if self._is_tspl():
+                # Етикеткові принтери не мають ножа; команда розрізу для них
+                # у кращому разі нічого не значить, у гіршому — заклинить
+                # механізм. Стрічка відривається руками.
+                return None
             return original_cut(*args, **kwargs)
+
+        def reset() -> None:
+            """Викинути недописаний рядок і повернути стан до типового.
+
+            Знайдено ревʼю: `buffer` і `state` живуть у замиканні, яке
+            ставиться ОДИН раз на пристрій, тож пережовують усі джоби. Якщо
+            джоб упав після `text("Разом")` і до `\n`, цей хвіст мовчки
+            приклеювався до першого рядка НАСТУПНОГО чека. На TSPL це гірше,
+            ніж було: між джобами немає розрізу, тож чужий уламок стає
+            частиною того самого документа.
+            """
+            buffer.clear()
+            state.update({
+                "bold": False,
+                "align": "left",
+                "double_height": False,
+                "double_width": False,
+            })
 
         printer.text = text
         printer.set = set_
         printer.cut = cut
+        printer._bh_reset_render_state = reset
         printer._bh_bitmap_patched = True
 
     def _install_ua_text_patch(self) -> None:
@@ -406,11 +531,20 @@ class PrinterDevice:
                     self._printer.open(job_name="barhandler", raise_not_found=True)
                     try:
                         await job(self._printer)
+                        # Зібраний TSPL мусить лягти В ТОЙ САМИЙ спул-документ,
+                        # тобто до close() — інакше він поїде окремим джобом
+                        # або не поїде взагалі.
+                        self._finalize_tspl()
                     finally:
+                        self._reset_render_state()
                         with suppress(Exception):
                             self._printer.close()
                 else:
-                    await job(self._printer)
+                    try:
+                        await job(self._printer)
+                        self._finalize_tspl()
+                    finally:
+                        self._reset_render_state()
                 if not done.done():
                     done.set_result(None)
             except OSError as exc:
@@ -425,6 +559,22 @@ class PrinterDevice:
                 if not done.done():
                     done.set_exception(PrinterUnavailable(str(exc), code="unreachable"))
                 return  # worker exits; registry.get_device() rebuilds on next print
+            except asyncio.CancelledError:
+                # Знайдено ревʼю. Воркер скасовують, коли пристрій викидають
+                # із кеша — а це тепер трапляється на КОЖНІЙ перереєстрації,
+                # не лише на видаленні. `CancelledError` — це BaseException,
+                # тож повз `except OSError` і `except Exception` нижче він
+                # летів мовчки, і `done` не отримував НІЧОГО: HTTP-запит, що
+                # чекав на цей друк, висів до таймауту клієнта без жодної
+                # помилки. Розбудити того, хто чекає, і лише тоді падати далі.
+                if not done.done():
+                    done.set_exception(
+                        PrinterUnavailable(
+                            f"{self.name}: друк перервано — принтер перенастроюють",
+                            code="cancelled",
+                        ),
+                    )
+                raise
             except Exception as exc:  # noqa: BLE001
                 logger.exception("[%s] print job failed", self.name)
                 if not done.done():
