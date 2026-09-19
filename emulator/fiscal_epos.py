@@ -77,6 +77,10 @@ class FiscalState:
         self.x_number = 0  # X-report (lettura) counter
         self.last_z_at: datetime | None = None
         self.docs: list[dict] = []  # rendered documents, newest last
+        # BH-171 — денна звірка по способах оплати. Живе окремо від `docs`
+        # НАВМИСНО: той журнал обрізається до `_keep` записів, і рахувати Z по
+        # ньому означало б занижувати суму на жвавому дні.
+        self.day_totals: dict[str, float] = {}
         self._id = 0
         self.on_notify = None  # optional callback(label:str)
 
@@ -103,7 +107,7 @@ class FiscalState:
 
     # -- fiscal operations -----------------------------------------------
     def record_sale(self, *, items: list[dict], total: str, is_refund: bool,
-                    payment_type: str) -> dict:
+                    payment_type: str, payments: list[dict] | None = None) -> dict:
         """Returns the addInfo `fields` dict, or raises _Rejected(code)."""
         with self._lock:
             if self.require_first_z and not self.first_z_done:
@@ -124,8 +128,16 @@ class FiscalState:
                 "items": items,
                 "total": total,
                 "payment_type": payment_type,
+                # BH-171 — розбивка оплат; із неї рахується денний Z по способах.
+                "payments": payments or [
+                    {"type": "", "payment_type": payment_type, "amount": total}
+                ],
                 "is_refund": is_refund,
             })
+            self._accrue(
+                payments or [{"payment_type": payment_type, "amount": total}],
+                is_refund=is_refund,
+            )
             return {
                 "fiscalReceiptNumber": str(self.receipt_number),
                 "fiscalReceiptAmount": _money_comma(_to_float(total)),
@@ -134,13 +146,36 @@ class FiscalState:
                 "zRepNumber": f"{self.z_number:04d}",
             }
 
+    def _accrue(self, payments: list[dict], *, is_refund: bool) -> None:
+        """Долічити документ до денної звірки по способах оплати.
+
+        Знайдено ревʼю: спершу Z рахувався ІТЕРАЦІЄЮ по `self.docs`, а той
+        журнал обрізається до останніх `_keep` записів (50 за замовчуванням).
+        Тобто на жвавому дні — понад 50 чеків до Z — звірка тихо занижувала
+        суму: 60 продажів по 1.00 давали Z на 50.00. Саме ця функція мала
+        доводити, що готівка в касі сходиться з Z, і сама ж брехала.
+        Тому накопичуємо на місці, а не перечитуємо обрізаний журнал.
+        """
+        sign = -1 if is_refund else 1
+        for row in payments or []:
+            key = str(row.get("payment_type") or "")
+            self.day_totals[key] = round(
+                self.day_totals.get(key, 0.0) + sign * float(row.get("amount") or 0), 2
+            )
+
     def run_z(self) -> dict:
         with self._lock:
+            by_type = dict(self.day_totals)
+            self.day_totals = {}
             self.z_number += 1
             self.first_z_done = True
             self.last_z_at = self._now()
             self.receipt_number = 0  # a Z closes the day; receipts reset
-            self._record_doc({"kind": "CHIUSURA (Z)", "number": self.z_number})
+            self._record_doc({
+                "kind": "CHIUSURA (Z)",
+                "number": self.z_number,
+                "totals_by_payment_type": by_type,
+            })
             return {
                 "zRepNumber": f"{self.z_number:04d}",
                 "fiscalReceiptDate": self.last_z_at.strftime("%d/%m/%Y"),
@@ -251,18 +286,27 @@ def parse_fiscal_request(body: str) -> dict:
                 "unitPrice": el.get("unitPrice", ""),
                 "department": el.get("department", ""),
             })
-        total = ""
-        payment_type = ""
+        # BH-171 — чек закривають РЯДКОМ НА КОЖЕН спосіб оплати. Доти тут брався
+        # лише `totals[-1]`, тож розбивка «30 карткою + 70 готівкою» показувалась
+        # як чек на 70: і сума неправдива, і перевірити денний Z по способах було
+        # нічим. Тримаємо всі рядки, а `total` — їхня сума.
         totals = by_name.get("printRecTotal", [])
-        if totals:
-            total = totals[-1].get("payment", "")
-            payment_type = totals[-1].get("paymentType", "")
+        payments = [
+            {
+                "type": t.get("description", ""),
+                "payment_type": t.get("paymentType", ""),
+                "amount": t.get("payment", ""),
+            }
+            for t in totals
+        ]
+        total = f"{sum(float(p['amount'] or 0) for p in payments):.2f}" if payments else ""
         return {
             "command": "sale",
             "items": items,
             "total": total,
             "is_refund": is_refund,
-            "payment_type": payment_type,
+            "payment_type": payments[-1]["payment_type"] if payments else "",
+            "payments": payments,
         }
     return {"command": "unknown"}
 
@@ -312,6 +356,7 @@ def handle_request(state: FiscalState, body: str) -> str:
                 total=cmd["total"],
                 is_refund=cmd["is_refund"],
                 payment_type=cmd["payment_type"],
+                payments=cmd.get("payments"),
             )
         except _Rejected as rej:
             return build_response({}, success=False, code=rej.code, status="12345")
@@ -373,8 +418,14 @@ function receipt(d){
          '<td class="rr mut">'+pct+'%</td><td class="rr">'+eur(lt)+'</td></tr>';
  }).join('');
  var total=(d.total!=null&&d.total!=='')?num(d.total):sum;
- var pay=(String(d.payment_type)==='0')?'Pagamento contante':
-         (String(d.payment_type)==='2')?'Pagamento elettronico':'Pagamento';
+ /* BH-171 — чек можуть закрити КІЛЬКОМА способами, і саме цей перегляд людина
+    відкриває, щоб на око перевірити, що документ чесний. Доти тут читалось лише
+    `d.payment_type` (один спосіб на весь чек), тож розбивка виглядала точно так
+    само, як до фіксу, — тобто інструмент перевірки фікс не показував. */
+ function payName(t){return String(t)==='0'?'Pagamento contante':
+                            String(t)==='2'?'Pagamento elettronico':'Pagamento';}
+ var tenders=(d.payments&&d.payments.length)?d.payments
+             :[{payment_type:d.payment_type,amount:d.total}];
  var cls='r'+(reso?' reso':'')+(copia?' copia':'');
  var title=reso?'DOCUMENTO COMMERCIALE<br><span class="sub">emesso per RESO MERCE</span>'
                 :'DOCUMENTO COMMERCIALE<br><span class="sub">di vendita o prestazione</span>';
@@ -390,7 +441,11 @@ function receipt(d){
   '<div class="row big"><span>TOTALE COMPLESSIVO</span><span>'+eur(total)+'</span></div>'+
   '<div class="row mut"><span>di cui IVA</span><span>'+eur(ivaTot)+'</span></div>'+
   '<div class="sep"></div>'+
-  '<div class="row"><span>'+pay+'</span><span>'+eur(reso?-total:total)+'</span></div>'+
+  tenders.map(function(t){
+    var a=num(t.amount);
+    return '<div class="row"><span>'+payName(t.payment_type)+'</span><span>'+
+           eur(reso?-a:a)+'</span></div>';
+  }).join('')+
   '<div class="row mut"><span>Non riscosso</span><span>0,00</span></div>'+
   '<div class="sep"></div>'+
   '<div class="c foot b">DOCUMENTO N. '+docNo(d)+'</div>'+
