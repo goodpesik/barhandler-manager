@@ -54,6 +54,10 @@ class ItPaymentBody(BaseModel):
 class ItDocumentPayload(BaseModel):
     items: list[ItDocumentItem] = Field(min_length=1)
     payment: ItPaymentBody
+    # BH-171 — правдива розбивка оплат (частина карткою, решта готівкою). Старе
+    # поле `payment` лишається обовʼязковим: сервер надсилає обидва, і менеджер
+    # старішої версії далі друкує одним рядком.
+    payments: Optional[list[ItPaymentBody]] = None
     payment_type_map: Optional[dict[str, int]] = None
     is_refund: bool = False
 
@@ -143,12 +147,29 @@ async def fiscal_it_document(
             for i in payload.items
         ],
         payment=fiscal_it.ItPayment(type=payload.payment.type, amount=payload.payment.amount),
+        payments=(
+            [
+                fiscal_it.ItPayment(type=p.type, amount=p.amount)
+                for p in payload.payments
+            ]
+            if payload.payments
+            else None
+        ),
         payment_type_map=payload.payment_type_map,
         is_refund=payload.is_refund,
     )
     try:
         return await asyncio.to_thread(
             fiscal_it.print_commercial_document, host, document, port=port
+        )
+    except fiscal_it.FiscalItPayloadError as exc:
+        # Крива розбивка оплат — це вада ЗАПИТУ, не принтера, тож 400, а не 5xx.
+        # Знайдено ревʼю: без цієї перевірки RT або дорахував би решту, або
+        # відмовився б закривати документ, і в обох випадках каса отримала б
+        # незрозумілий код замість «сума оплат не дорівнює сумі чека».
+        raise HTTPException(
+            status_code=400,
+            detail={"code": exc.code, "message": str(exc)},
         )
     except fiscal_it.FiscalItError as exc:
         _raise_from_fiscal_error(exc)

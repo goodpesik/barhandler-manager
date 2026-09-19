@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import suppress
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, suppress
 from typing import Awaitable, Callable, Optional
 
 from escpos.printer import Network, Usb
@@ -48,6 +50,48 @@ class PrinterUnavailable(RuntimeError):
 # який прошивка, можливо, і подужає, ніж гарантовано розрізана літера.
 _TSPL_MAX_DOTS = 2540
 
+# BH-168 — стелі на роботу із залізом. Доти їх не було ЖОДНОЇ: USB-ручка
+# створювалась як `Usb(...)` без `timeout`, а в python-escpos це буквально
+# «чекати вічно» (`timeout=0` → `device.write(..., 0)`).
+#
+# Числа великі навмисно. Один `write` — це не «надіслати команду», а «дочекатись,
+# поки принтер звільнить буфер»: чек із картинками на повільному термопринтері
+# законно пише десятки секунд, і зарізати це малим таймаутом означало б рвати
+# справні чеки навпіл. Тут потрібна саме СТЕЛЯ проти зависання, а не швидка
+# відмова.
+_USB_TIMEOUT_MS = 60_000
+_NETWORK_TIMEOUT_S = 60
+
+# Скільки ждати саме на ВІДКРИТТЯ ручки. Пошук і захоплення USB-пристрою
+# `timeout` вище не обмежує (він стосується передач), а відкриття кличе кожні
+# 15 с вартовий `_printer_connect_watcher` — тобто зависання тут
+# накопичувалось би потоками.
+_CONNECT_TIMEOUT_S = 10.0
+
+# Скільки `disconnect()` чекає на закриття ручки. Закриття стоїть у черзі
+# пристрою ПІСЛЯ запису, що йде, тож на великому чеку воно законно чекає
+# десятки секунд. Не дочекались — закриття все одно відбудеться, щойно запис
+# скінчиться; ми лише перестаємо на нього чекати.
+_CLOSE_WAIT_S = 5.0
+
+
+def _settle_from(source: asyncio.Future, target: asyncio.Future) -> None:
+    """Коли `source` завершиться — віддати його результат у `target`."""
+
+    def _copy(src: asyncio.Future) -> None:
+        if target.done():
+            return
+        if src.cancelled():
+            target.set_exception(PrinterUnavailable("друк скасовано", code="cancelled"))
+        elif src.exception() is not None:
+            target.set_exception(
+                PrinterUnavailable(str(src.exception()), code="unreachable"),
+            )
+        else:
+            target.set_result(None)
+
+    source.add_done_callback(_copy)
+
 
 class PrinterDevice:
     """A single ESC/POS printer (USB or network) with a FIFO job queue."""
@@ -66,6 +110,30 @@ class PrinterDevice:
         self._job_in_flight = False
         # BH-160 — зібрані рядки одного TSPL-джоба. Порожньо між джобами.
         self._tspl_pages: list = []
+        # BH-168 — уся робота з ручкою йде в ОДНОМУ потоці цього пристрою.
+        #
+        # Перша версія мала `asyncio.to_thread` (спільний пул) і замок, і ревʼю
+        # знайшло в ній три вади одного кореня — потік, запущений через
+        # `to_thread`, скасувати неможливо, скасовується лише очікування:
+        #   * `disconnect()` не дочікувався замка за 5 с і закривав ручку ПРЯМО
+        #     посеред запису, що тривав у «скасованому» потоці;
+        #   * завислий `Usb(...)` займав потік спільного пулу назавжди, а вартовий
+        #     пробує кожні 15 с — за кілька хвилин пул вичерпувався, і ставали
+        #     фіскальні звіти й пошук терміналів, тобто весь менеджер;
+        #   * відкриття ручки отримало `await`, і два одночасні `connect()`
+        #     відкривали дві ручки, одна з яких губилась незакритою.
+        # Один потік на пристрій робить черговість властивістю, а не домовленістю:
+        # закриття фізично стоїть ЗА записом, а завислий пристрій тримає лише
+        # свій потік.
+        self._executor: Optional[ThreadPoolExecutor] = None
+        self._connect_lock = asyncio.Lock()
+        # Відкриття, яке ще не повернулось (завислий USB). Поки воно висить,
+        # нове не ставимо в чергу — інакше вартовий складав би їх туди кожні 15 с.
+        self._pending_build: Optional[asyncio.Future] = None
+        # Пристрій списано (`disconnect()`): реєстр уже викинув його з кешу й
+        # більше до нього не звернеться. Відкрити на ньому ручку означало б
+        # ручку й воркер, яких не закриє вже ніхто (третє коло ревʼю).
+        self._retired = False
 
     # ----- lifecycle ---------------------------------------------------
 
@@ -161,6 +229,14 @@ class PrinterDevice:
     def is_connected(self) -> bool:
         return self._printer is not None
 
+    def _io(self, fn, *args) -> asyncio.Future:
+        """Виконати `fn` у потоці ЦЬОГО пристрою (BH-168), по черзі з рештою."""
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix=f"printer-{self.name}",
+            )
+        return asyncio.get_running_loop().run_in_executor(self._executor, fn, *args)
+
     async def async_probe(self) -> bool:
         """Non-destructive liveness check. Returns False if the physical
         device is unreachable so the heartbeat can clear the stale handle.
@@ -185,8 +261,18 @@ class PrinterDevice:
             except Exception:
                 return False
         else:
+            if self._job_in_flight:
+                # Принтер зараз друкує — він живий за визначенням, а смикати
+                # ту саму ручку з другого потоку посеред запису pyusb не
+                # пробачає (BH-168).
+                return True
             try:
-                return bool(self._printer.is_online())
+                return bool(
+                    await asyncio.wait_for(
+                        asyncio.shield(self._io(self._printer.is_online)),
+                        timeout=_CONNECT_TIMEOUT_S,
+                    ),
+                )
             except Exception:
                 return False
 
@@ -227,28 +313,122 @@ class PrinterDevice:
         """
         if not self.enabled:
             return False
-        try:
-            self._printer = self._build_printer()
-        except Exception as exc:  # noqa: BLE001 — pyusb/escpos can throw anything
-            logger.warning("[%s] connect failed: %s", self.name, exc)
-            self._printer = None
-            return False
+        # BH-168 — відкриття тепер має `await`, тож вартовий і запит на друк
+        # можуть прийти сюди одночасно. Без замка обидва бачили «не відкрито» й
+        # відкривали по ручці; одна з них губилась незакритою (знайдено ревʼю).
+        async with self._connect_lock:
+            if self._retired:
+                return False
+            if self._printer is not None:
+                return True
+            if self._pending_build is not None and not self._pending_build.done():
+                # Попереднє відкриття досі висить у потоці пристрою. Ставити
+                # ще одне за ним — лише множити черги до завислого USB.
+                return False
+            # Відкриття ручки теж блокує: `Usb(...)` шукає й захоплює пристрій,
+            # `Network(...)` тягне TCP-зʼєднання. Стеля окрема від `timeout`
+            # передач: той на відкриття не діє.
+            build = self._io(self._build_printer)
+            self._pending_build = build
+            try:
+                self._printer = await asyncio.wait_for(
+                    asyncio.shield(build), timeout=_CONNECT_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[%s] connect не вклався в %.0f с — вважаю недоступним",
+                    self.name, _CONNECT_TIMEOUT_S,
+                )
+                # Відкриття може ще повернутись — тоді ручку треба закрити,
+                # а не лишити захопленим USB, про який ніхто не знає.
+                executor = self._executor
+                build.add_done_callback(
+                    lambda fut: self._close_late_handle(fut, executor),
+                )
+                return False
+            except Exception as exc:  # noqa: BLE001 — pyusb/escpos can throw anything
+                logger.warning("[%s] connect failed: %s", self.name, exc)
+                return False
         if self._worker_task is None or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._worker(), name=f"printer-{self.name}")
         logger.info("[%s] connected (%s)", self.name, self._config.get("connection"))
         return True
 
+    def _job_finished(self, _flush: asyncio.Future) -> None:
+        self._job_in_flight = False
+
+    def _close_late_handle(
+        self, build: asyncio.Future, executor: Optional[ThreadPoolExecutor],
+    ) -> None:
+        """Ручка, відкрита вже ПІСЛЯ того, як `connect()` здався, — закрити.
+
+        Тим самим виконавцем, що її відкривав: `disconnect()` міг уже прибрати
+        `self._executor`, а зачинений виконавець нових завдань не бере — тоді
+        закриваємо окремим потоком, бо ручка без власника гірша за зайвий потік.
+        """
+        if build.cancelled() or build.exception() is not None:
+            return
+        late = build.result()
+        if late is None or late is self._printer:
+            return
+        try:
+            if executor is None:
+                raise RuntimeError("no executor")
+            executor.submit(self._close_handle, late)
+        except RuntimeError:
+            # Друге коло ревʼю: тут був прямий виклик — а цей колбек виконується
+            # В ЦИКЛІ ПОДІЙ, тобто `close()` завислого USB спинив би оплату.
+            threading.Thread(
+                target=self._close_handle, args=(late,),
+                name=f"printer-{self.name}-late-close", daemon=True,
+            ).start()
+
     async def disconnect(self) -> None:
+        # Третє коло ревʼю BH-168: `connect()` має `await` посередині, і реєстр
+        # кличе `disconnect()` на перереєстрації саме тоді, коли вартовий може
+        # відкривати ручку. Без замка `disconnect()` проходив повз, а `connect()`
+        # потім ставив ручку й запускав воркер на вже викинутому пристрої —
+        # захоплений USB, який не закриє вже ніхто, і новий пристрій на тому
+        # самому порту не відкривався до перезапуску. Тепер `disconnect()` чекає,
+        # поки відкриття скінчиться, і закриває те, що воно відкрило.
+        self._retired = True
+        async with self._connect_lock:
+            await self._disconnect_locked()
+
+    async def _disconnect_locked(self) -> None:
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._worker_task
             self._worker_task = None
         self._fail_queued_jobs()
-        if self._printer is not None:
-            with suppress(Exception):
-                self._printer.close()
-            self._printer = None
+        printer, self._printer = self._printer, None
+        executor = self._executor
+        if printer is not None and executor is not None:
+            # BH-168 — закриття стоїть у черзі пристрою ЗА записом, що, можливо,
+            # ще йде: ручку ніколи не закривають посеред запису. Чекаємо
+            # обмежено; не дочекались — закриття відбудеться саме, щойно запис
+            # скінчиться.
+            closing = self._io(self._close_handle, printer)
+            try:
+                await asyncio.wait_for(asyncio.shield(closing), timeout=_CLOSE_WAIT_S)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[%s] запис іще триває — ручку закрию, щойно він скінчиться",
+                    self.name,
+                )
+        if executor is not None:
+            # Потік пристрою доробить те, що вже стоїть у черзі (запис, закриття),
+            # і завершиться. Новий `connect()` створить новий.
+            if self._pending_build is not None and not self._pending_build.done():
+                # Відкриття досі висить — цей потік не звільниться, доки не
+                # повернеться USB. Видно в лозі, а не накопичується мовчки.
+                logger.warning(
+                    "[%s] відкриття ручки досі висить — потік пристрою лишається зайнятим",
+                    self.name,
+                )
+            executor.shutdown(wait=False)
+            self._executor = None
 
     def _reset_render_state(self) -> None:
         """Прибрати за джобом: зібрані TSPL-сторінки і недописаний рядок."""
@@ -323,6 +503,81 @@ class PrinterDevice:
 
         await self.enqueue(_job)
 
+    # ----- off-loop I/O (BH-168) ---------------------------------------
+
+    @contextmanager
+    def _buffered(self, printer):
+        """Зібрати байти джоба в памʼять, замість писати їх у залізо одразу.
+
+        BH-168. Доти друк ішов ПРЯМО з циклу подій: `_raw()` у python-escpos —
+        це `self.device.write(self.out_ep, msg, self.timeout)`, а ручка
+        створювалась без таймауту, тобто «ждати вічно». Поки принтер жував чек
+        (або поки він висів), процес не робив більше НІЧОГО:
+
+          * той самий цикл веде SSI-обмін із платіжним терміналом — оплата
+            зависала разом із друком;
+          * власні стелі на кшталт `STATUS_POLL_MAX_S = 180` зроблені через
+            `asyncio.wait_for`, а йому потрібен живий цикл, щоб спрацювати:
+            «оплата обмежена трьома хвилинами» переставало бути правдою саме
+            тоді, коли це найважливіше;
+          * `GET /busy` не відповідало — а з BH-164 його питають три
+            інсталятори перед тим, як убити менеджер, і «не відповів»
+            вінда-інсталятор трактує як «можна ставити».
+
+        Чому перехоплення саме на `_raw`, а не «виконати весь джоб у потоці»:
+        через `_raw` проходять УСІ байти в усіх режимах (растровий рендер,
+        `ua_cp866`, віддавання картинок, TSPL-фінал, `cut`, `cashdraw` —
+        escpos кличе його всередині). Тобто на дріт іде та сама послідовність
+        тих самих кусків, що й доти, лише з іншого потоку. А джоб лишається в
+        циклі подій, тож нічого не змінюється ні в скасуванні, ні в
+        `asyncio`-примітивах, якими джоб міг би користуватись.
+
+        Побічний виграш: скасування ДО зливу тепер не лишає надрукованим
+        пів-чека — не надрукованим нічого.
+        """
+        chunks: list[bytes] = []
+        had_own = "_raw" in getattr(printer, "__dict__", {})
+        original = printer._raw
+
+        def _collect(data) -> None:
+            chunks.append(bytes(data))
+
+        printer._raw = _collect
+        try:
+            yield chunks
+        finally:
+            # Відновити навіть якщо джоб упав: інакше наступний друк писав би
+            # у список, якого вже ніхто не зливає, і чек зникав би безслідно.
+            if had_own:
+                printer._raw = original
+            else:
+                with suppress(Exception):
+                    del printer.__dict__["_raw"]
+
+    def _flush_blocking(self, printer, chunks: list, spooler: bool) -> None:
+        """Записати зібрані куски в залізо. Виконується В ПОТОЦІ (BH-168).
+
+        Замка немає й не треба: усе, що торкається ручки, іде в потоці
+        пристрою по черзі (див. `_executor`).
+        """
+        if spooler:
+            # Windows-спулер: один документ на весь чек, інакше кожен
+            # кусок поїхав би окремим завданням друку.
+            printer.open(job_name="barhandler", raise_not_found=True)
+        try:
+            for chunk in chunks:
+                printer._raw(chunk)
+        finally:
+            if spooler:
+                with suppress(Exception):
+                    printer.close()
+
+    @staticmethod
+    def _close_handle(printer) -> None:
+        """Закрити ручку. Виконується в потоці пристрою, тобто ПІСЛЯ запису."""
+        with suppress(Exception):
+            printer.close()
+
     # ----- internals ---------------------------------------------------
 
     def _is_spooler(self) -> bool:
@@ -335,7 +590,12 @@ class PrinterDevice:
             port = int(self._config.get("port") or 9100)
             if not host:
                 raise ValueError("network printer requires host")
-            return Network(host=host, port=port, profile=self._config.get("profile"))
+            return Network(
+                host=host,
+                port=port,
+                profile=self._config.get("profile"),
+                timeout=self._config.get("network_timeout_s") or _NETWORK_TIMEOUT_S,
+            )
 
         if connection == "windows_spooler":
             # Windows print spooler (win32print RAW). The printer is a normal
@@ -365,6 +625,12 @@ class PrinterDevice:
             in_ep=in_ep,
             out_ep=out_ep,
             profile=self._config.get("profile"),
+            # BH-168 — БЕЗ цього рядка python-escpos пише `device.write(ep, msg, 0)`,
+            # а нуль у pyusb означає «ждати вічно». Тобто принтер, який
+            # перестав забирати байти (закінчився папір на моделі без
+            # реального статусу, зависла прошивка, хтось висмикнув кабель
+            # наполовину), тримав менеджер до перезапуску.
+            timeout=self._config.get("usb_timeout_ms") or _USB_TIMEOUT_MS,
         )
 
     def _install_bitmap_patch(self) -> None:
@@ -562,8 +828,18 @@ class PrinterDevice:
         while True:
             job, done = await self._queue.get()
             spooler = self._is_spooler()
+            flush: Optional[asyncio.Future] = None
             self._job_in_flight = True
             try:
+                # Знімок ручки: `connect()` може підмінити `self._printer`
+                # посеред джоба, і дописати рештки чека в НОВУ ручку було б
+                # гірше за помилку (BH-168).
+                printer = self._printer
+                if printer is None:
+                    raise PrinterUnavailable(
+                        f"{self.name}: printer handle is gone", code="unreachable",
+                    )
+
                 # Pre-flight status — bail out before sending bytes so a
                 # paper-empty printer doesn't swallow an entire receipt
                 # silently. The check is best-effort: cheap clones just
@@ -571,8 +847,12 @@ class PrinterDevice:
                 # (the operator hears the printer click and notices).
                 # Skipped for the Windows spooler: it's write-only, real-time
                 # status (DLE EOT) doesn't apply — the OS owns paper state.
+                #
+                # BH-168 — саме опитування теж іде в потік: це два запити до
+                # заліза (`paper_status`, `is_online`), кожен із власним
+                # шансом зависнути.
                 if not spooler:
-                    status = self.check_status()
+                    status = await self._io(self.check_status)
                     if status["supported"]:
                         if status["paper"] == "empty":
                             raise PrinterUnavailable(
@@ -597,7 +877,7 @@ class PrinterDevice:
                 #     limited to printers with Ukrainian PC866 overlay).
                 #   - "native" + other code_page: hand off to
                 #     python-escpos magic.force_encoding().
-                        # Віддавання картинок не залежить від режиму рендеру тексту.
+                # Віддавання картинок не залежить від режиму рендеру тексту.
                 self._install_image_emitter()
                 mode = (self._config.get("render_mode") or "bitmap").lower()
                 if mode != "bitmap" and self._is_tspl():
@@ -616,35 +896,34 @@ class PrinterDevice:
                     )
                     mode = "bitmap"
                 code_page = (self.code_page or "").lower()
-                if mode == "bitmap":
-                    self._install_bitmap_patch()
-                elif code_page == "ua_cp866":
-                    with suppress(Exception):
-                        self._printer._raw(b"\x1bt\x11")  # ESC t 17 = CP866
-                    self._install_ua_text_patch()
-                elif code_page:
-                    with suppress(Exception):
-                        self._printer.magic.force_encoding(self.code_page)
-                if spooler:
-                    # Open one spool document, run the whole receipt into it,
-                    # then close so it flushes as a single Windows print job.
-                    self._printer.open(job_name="barhandler", raise_not_found=True)
-                    try:
-                        await job(self._printer)
-                        # Зібраний TSPL мусить лягти В ТОЙ САМИЙ спул-документ,
-                        # тобто до close() — інакше він поїде окремим джобом
-                        # або не поїде взагалі.
-                        self._finalize_tspl()
-                    finally:
-                        self._reset_render_state()
+
+                # BH-168 — джоб рендерить і складає байти в памʼять, заліза не
+                # торкаючись. Це та сама послідовність тих самих кусків, що
+                # йшла доти, лише зібрана наперед.
+                with self._buffered(printer) as chunks:
+                    if mode == "bitmap":
+                        self._install_bitmap_patch()
+                    elif code_page == "ua_cp866":
                         with suppress(Exception):
-                            self._printer.close()
-                else:
+                            printer._raw(b"\x1bt\x11")  # ESC t 17 = CP866
+                        self._install_ua_text_patch()
+                    elif code_page:
+                        with suppress(Exception):
+                            printer.magic.force_encoding(self.code_page)
                     try:
-                        await job(self._printer)
+                        await job(printer)
+                        # Зібраний TSPL мусить лягти В ТОЙ САМИЙ документ, тобто
+                        # до зливу — інакше він поїде окремим джобом або не
+                        # поїде взагалі.
                         self._finalize_tspl()
                     finally:
                         self._reset_render_state()
+
+                # І лише тепер — залізо, у робочому потоці. Доти цей запис
+                # спиняв цикл подій, а разом із ним оплату карткою, власні
+                # таймаути й `GET /busy`, яке питають інсталятори.
+                flush = self._io(self._flush_blocking, printer, chunks, spooler)
+                await asyncio.shield(flush)
                 if not done.done():
                     done.set_result(None)
             except OSError as exc:
@@ -652,10 +931,11 @@ class PrinterDevice:
                 # Clear the handle so health() reports "unavailable" and
                 # the next print attempt triggers a fresh connect().
                 logger.warning("[%s] socket error — marking disconnected: %s", self.name, exc)
-                with suppress(Exception):
-                    if self._printer is not None:
-                        self._printer.close()
-                self._printer = None
+                # BH-168 — `close()` теж робота з залізом: у потоці пристрою,
+                # а не в циклі подій (доти саме тут він кликався з циклу).
+                dead, self._printer = self._printer, None
+                if dead is not None and self._executor is not None:
+                    self._executor.submit(self._close_handle, dead)
                 if not done.done():
                     done.set_exception(PrinterUnavailable(str(exc), code="unreachable"))
                 # Воркер зараз вийде, і джоби, що ЩЕ СТОЯТЬ у черзі, не
@@ -676,17 +956,32 @@ class PrinterDevice:
                 # чекав на цей друк, висів до таймауту клієнта без жодної
                 # помилки. Розбудити того, хто чекає, і лише тоді падати далі.
                 if not done.done():
-                    done.set_exception(
-                        PrinterUnavailable(
-                            f"{self.name}: друк перервано — принтер перенастроюють",
-                            code="cancelled",
-                        ),
-                    )
+                    if flush is not None and not flush.done():
+                        # BH-168, знайдено ревʼю: запис у потоці пристрою
+                        # скасувати неможливо — він доїде до кінця сам. Казати
+                        # касиру «друк перервано», коли чек зараз вийде,
+                        # неправда. Відповідь дасть сам запис.
+                        _settle_from(flush, done)
+                    else:
+                        done.set_exception(
+                            PrinterUnavailable(
+                                f"{self.name}: друк перервано — принтер перенастроюють",
+                                code="cancelled",
+                            ),
+                        )
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.exception("[%s] print job failed", self.name)
                 if not done.done():
                     done.set_exception(exc)
             finally:
-                self._job_in_flight = False
+                if flush is not None and not flush.done():
+                    # BH-168, друге коло ревʼю: воркер скасували, а запис у
+                    # потоці пристрою ще йде. Зняти прапорець тут означало б,
+                    # що `/busy` каже «вільно», поки принтер пише, — і
+                    # інсталятор убив би процес посеред чека (BH-164).
+                    # Прапорець гасить сам запис, коли скінчиться.
+                    flush.add_done_callback(self._job_finished)
+                else:
+                    self._job_in_flight = False
                 self._queue.task_done()

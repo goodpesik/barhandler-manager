@@ -46,6 +46,7 @@ class PrinterRegistry:
         # Задачі роз'єднання, які ще не добігли — тримаємо посилання, див.
         # `_drop_cached_device`.
         self._pending_disconnects: set = set()
+        self._draining: set = set()
         # Discoveries cached in-memory between a /discover and a /register
         # call so the frontend doesn't have to round-trip the full descriptor.
         self._last_discovery: Dict[str, PrinterDescriptor] = {}
@@ -200,6 +201,20 @@ class PrinterRegistry:
         task = asyncio.create_task(device.disconnect())
         self._pending_disconnects.add(task)
         task.add_done_callback(self._pending_disconnects.discard)
+        # BH-168, друге коло ревʼю: пристрій зникає з кешу ДО того, як
+        # `disconnect()` хоча б почався, а запис, що вже йде в потоці пристрою,
+        # доїде лише за десятки секунд. Для `/busy` (BH-164) такий пристрій
+        # мусить лишатись видимим, доки не допише.
+        self._draining.add(device)
+
+    def devices_for_busy(self) -> list:
+        """Пристрої, про чиї джоби треба питати перед тим, як убити процес:
+        живі в кеші плюс викинуті, що ще дописують."""
+        self._draining = {
+            d for d in self._draining
+            if callable(getattr(d, "pending_jobs", None)) and d.pending_jobs() > 0
+        }
+        return [*self._devices.values(), *self._draining]
 
     def add_manual_descriptor(
         self,
