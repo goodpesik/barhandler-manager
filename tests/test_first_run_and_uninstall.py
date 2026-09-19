@@ -115,10 +115,17 @@ def test_first_run_survives_dead_server(tmp_path, monkeypatch):
 
 
 class _Req:
-    """Мінімальний Request: маршрут читає з нього лише заголовок Origin."""
+    """Мінімальний Request: маршрут читає з нього Origin і app.state.
+
+    BH-164 додав до видалення перевірку зайнятості (видалення робить той самий
+    незворотний `pkill`, що й оновлення), і вона дивиться в `app.state`.
+    """
 
     def __init__(self, origin=None):
+        from types import SimpleNamespace
+
         self.headers = {"origin": origin} if origin else {}
+        self.app = SimpleNamespace(state=SimpleNamespace())
 
 
 @pytest.mark.asyncio
@@ -260,10 +267,16 @@ async def test_mac_update_message_does_not_promise_a_restart(monkeypatch, tmp_pa
         lambda argv, **kw: type("P", (), {"pid": 1})(),
     )
 
-    res = await system_routes.trigger_update()
+    # BH-164 — endpoint тепер питає, чи менеджер не посеред оплати/друку, і
+    # для цього йому потрібен request.
+    from types import SimpleNamespace
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+
+    res = await system_routes.trigger_update(request)
 
     assert "30 секунд" not in res["message"]
     assert "інсталятор" in res["message"].lower()
+    assert res["interactive"] is True
 
 
 # ── захист деструктивної ручки ─────────────────────────────────────────────

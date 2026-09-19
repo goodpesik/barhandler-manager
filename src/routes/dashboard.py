@@ -581,12 +581,15 @@ _HTML_TEMPLATE = r"""<!doctype html>
       btn_starting: "Запускаємо…",
       update_started: "Оновлення запущено!",
       btn_restarting: "Перезапуск…",
+      btn_wizard_open: "Пройдіть майстер…",
       update_error: "Помилка оновлення: {err}",
       update_no_recover: "Менеджер не піднявся після оновлення. Останній лог:",
       update_success: "Оновлено до v{cur} ✓",
       update_not_applied: "Оновлення не застосувалось — версія не змінилась (v{cur}). Лог:",
       update_still_going: "Оновлення ще йде, останні рядки логу:",
+      update_wizard_waiting: "Інсталятор відкрито — пройдіть його, щоб оновлення застосувалось.",
       update_timeout: "Оновлення не завершилось за {s}с. Лог:",
+      update_wizard_timeout: "Майстер установки так і не пройдено за {s}с — версія не змінилась. Лог:",
       uplink_connected: "підключено",
       uplink_disabled_socket: "вимкнено сокетом",
       uplink_disabled: "вимкнено",
@@ -710,12 +713,15 @@ _HTML_TEMPLATE = r"""<!doctype html>
       btn_starting: "Starting…",
       update_started: "Update started!",
       btn_restarting: "Restarting…",
+      btn_wizard_open: "Finish the wizard…",
       update_error: "Update error: {err}",
       update_no_recover: "The manager didn't come back up after the update. Last log:",
       update_success: "Updated to v{cur} ✓",
       update_not_applied: "The update wasn't applied — the version didn't change (v{cur}). Log:",
       update_still_going: "Update still in progress, last log lines:",
+      update_wizard_waiting: "The installer is open — walk through it to apply the update.",
       update_timeout: "The update didn't finish within {s}s. Log:",
+      update_wizard_timeout: "The installer wizard was never completed within {s}s — the version didn't change. Log:",
       uplink_connected: "connected",
       uplink_disabled_socket: "disabled by socket",
       uplink_disabled: "disabled",
@@ -778,7 +784,20 @@ _HTML_TEMPLATE = r"""<!doctype html>
       opts.body = JSON.stringify(body);
     }
     const res = await fetch(path, opts);
-    if (!res.ok) throw new Error(path + " → " + res.status);
+    if (!res.ok) {
+      // BH-164 — сервер відповідає відмовами, написаними для ЛЮДИНИ
+      // («зараз іде оплата карткою, спробуйте за хвилину»). Доти ми їх
+      // викидали й показували «/system/update → 409», тобто людина бачила
+      // номер замість причини. Текст беремо з `detail.message`, а на
+      // відповідях без нього лишається старий вигляд.
+      let detail = null;
+      try {
+        const body = await res.json();
+        detail = body && body.detail;
+      } catch (_) {}
+      const text = detail && (detail.message || (typeof detail === "string" ? detail : null));
+      throw new Error(text || path + " → " + res.status);
+    }
     return res.json();
   }
 
@@ -1286,8 +1305,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
     try {
       const res = await api("POST", "/system/update", true);
       showToast(res.message || t("update_started"), "ok", 10000);
-      btn.textContent = t("btn_restarting");
-      watchUpdate(beforeVer);
+      // `interactive` = менеджер лише ВІДКРИВ інсталятор (мак-застосунок,
+      // вінда-збірка). Доти й кнопка, і дедлайн брехали: «Перезапуск…» і
+      // 5 хвилин на те, що насправді чекає на людину з майстром.
+      btn.textContent = t(res.interactive ? "btn_wizard_open" : "btn_restarting");
+      watchUpdate(beforeVer, !!res.interactive);
     } catch (e) {
       showToast(t("update_error", { err: e.message }), "err");
       btn.disabled = false;
@@ -1302,14 +1324,19 @@ _HTML_TEMPLATE = r"""<!doctype html>
   //                               operator sees WHY (download failed,
   //                               old process still holding the port…)
   //   • never recovered in time → timeout, surface update.log
-  async function watchUpdate(beforeVer) {
+  async function watchUpdate(beforeVer, interactive) {
     const POLL_MS = 3000;
     // 5 хв. Було 2.5 — і це замало для Android: там інсталятор сам чекає до
     // 30 с на підняття плюс до 120 с на потрібну версію, а перед тим ще ставить
     // залежності (rust-збірки — це хвилини). Знайдено ревʼю: успішне, але
     // повільне оновлення на планшеті встигало впасти в «менеджер не піднявся»,
     // хоча скрипт у цей момент спокійно доробляв.
-    const DEADLINE_MS = 300000;
+    // Там, де відкрився майстер, годинник іде не по установці, а по людині:
+    // знайти вікно, натиснути «Виконати в будь-якому разі» в SmartScreen,
+    // пройти кроки. 5 хвилин на це — саме той фальшивий провал, через який
+    // успішне оновлення виглядало як зламане. Дедлайн лишається, бо без нього
+    // кнопка крутилась би вічно, але 20 хвилин — це вже справді «не пройшли».
+    const DEADLINE_MS = interactive ? 1200000 : 300000;
     const started = Date.now();
     let sawDown = false;              // did the manager actually restart?
     let progressShown = false;
@@ -1355,14 +1382,21 @@ _HTML_TEMPLATE = r"""<!doctype html>
       }
       if (elapsed > 60000 && !progressShown) {
         progressShown = true;
-        try {
-          const log = await api("GET", "/system/update-log?tail=30", true);
-          const last = (log.lines || []).slice(-6).join("\n");
-          showToast(t("update_still_going") + "\n" + last, "ok", 15000);
-        } catch (_) {}
+        if (interactive) {
+          // Лог тут нічого не додасть — у ньому «installer opened» і все.
+          // Людині треба сказати, що чекають саме на неї.
+          showToast(t("update_wizard_waiting"), "ok", 15000);
+        } else {
+          try {
+            const log = await api("GET", "/system/update-log?tail=30", true);
+            const last = (log.lines || []).slice(-6).join("\n");
+            showToast(t("update_still_going") + "\n" + last, "ok", 15000);
+          } catch (_) {}
+        }
       }
       if (elapsed < DEADLINE_MS) return setTimeout(tick, POLL_MS);
-      return finishFail(t("update_timeout", { s: Math.round(DEADLINE_MS / 1000) }));
+      return finishFail(t(interactive ? "update_wizard_timeout" : "update_timeout",
+                         { s: Math.round(DEADLINE_MS / 1000) }));
     };
     setTimeout(tick, POLL_MS);
   }

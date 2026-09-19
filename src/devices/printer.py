@@ -60,6 +60,10 @@ class PrinterDevice:
             asyncio.Queue()
         )
         self._worker_task: Optional[asyncio.Task] = None
+        # BH-164 — чи воркер саме зараз виконує джоб. Черга його вже
+        # віддала, тож `qsize()` без цього прапорця бреше «вільно» рівно на
+        # той час, коли принтер друкує.
+        self._job_in_flight = False
         # BH-160 — зібрані рядки одного TSPL-джоба. Порожньо між джобами.
         self._tspl_pages: list = []
 
@@ -276,6 +280,23 @@ class PrinterDevice:
             self._queue.task_done()
 
     # ----- queue interface ---------------------------------------------
+
+    def pending_jobs(self) -> int:
+        """Скільки друків іще не доведено до кінця — у черзі плюс той, що йде.
+
+        BH-164: оновлення менеджера вбиває процес, і джоб, що лишився в
+        черзі, зникає разом із ним.
+
+        Черга рахується ЛИШЕ поки живий воркер. Знайдено ревʼю: воркер уміє
+        померти сам (`OSError` виходить із циклу), і покладені після цього
+        джоби лежали б у черзі до перестворення пристрою. Для друку це нічого
+        не міняло й раніше, але тепер на цей лічильник дивиться оновлення — і
+        мертвий воркер зробив би оновлення неможливим НАЗАВЖДИ. «Зайнятий
+        вічно» гірше за вихідну ваду: там хоч можна було оновитись.
+        """
+        worker = self._worker_task
+        queued = self._queue.qsize() if worker is not None and not worker.done() else 0
+        return queued + (1 if self._job_in_flight else 0)
 
     async def enqueue(self, job: Callable[[object], Awaitable[None]]):
         """Submit a job and wait until it has been executed by the worker.
@@ -541,6 +562,7 @@ class PrinterDevice:
         while True:
             job, done = await self._queue.get()
             spooler = self._is_spooler()
+            self._job_in_flight = True
             try:
                 # Pre-flight status — bail out before sending bytes so a
                 # paper-empty printer doesn't swallow an entire receipt
@@ -636,6 +658,14 @@ class PrinterDevice:
                 self._printer = None
                 if not done.done():
                     done.set_exception(PrinterUnavailable(str(exc), code="unreachable"))
+                # Воркер зараз вийде, і джоби, що ЩЕ СТОЯТЬ у черзі, не
+                # виконає вже ніхто: кожен із них — HTTP-запит, який `await`-ить
+                # свій `done`. Доти вони висли до таймауту клієнта без жодної
+                # помилки; те саме вже полікували для скасування воркера, а цей
+                # шлях лишився. З BH-164 ціна виросла: запит, що висить, тримає
+                # менеджер «зайнятим», тобто оновитись стало б неможливо аж до
+                # перезапуску — гірше за ваду, яку BH-164 і лікує.
+                self._fail_queued_jobs()
                 return  # worker exits; registry.get_device() rebuilds on next print
             except asyncio.CancelledError:
                 # Знайдено ревʼю. Воркер скасовують, коли пристрій викидають
@@ -658,4 +688,5 @@ class PrinterDevice:
                 if not done.done():
                     done.set_exception(exc)
             finally:
+                self._job_in_flight = False
                 self._queue.task_done()
