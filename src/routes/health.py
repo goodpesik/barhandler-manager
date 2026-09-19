@@ -14,7 +14,33 @@ show an "update available" modal.
 
 from fastapi import APIRouter, Request
 
+from src.services.busy import busy_refusal
+
 router = APIRouter()
+
+
+@router.get("/busy")
+async def busy(request: Request) -> dict:
+    """Чи менеджер посеред незворотної роботи — БЕЗ ключа, як і /health.
+
+    BH-164. `POST /system/update` питає це саме в собі, але цього мало:
+    інсталятори вбивають процес не тоді, коли натиснули кнопку, а тоді, коли
+    ЛЮДИНА дійде до кроку установки в майстрі. Між цими двома моментами тепер
+    офіційно до 20 хвилин — за них цілком може початись оплата карткою.
+
+    Тому питати мусять і самі інсталятори, безпосередньо перед тим, як убивати:
+    `installers/barhandler-setup.iss` (PrepareToInstall), `mac-postinstall.sh`
+    та `install.sh`. Ключа в них немає, а відповідь не розкриває нічого, крім
+    «зайнятий/вільний» — рівно як /health і /version.
+    """
+    refusal = busy_refusal(request)
+    if refusal is None:
+        return {"busy": False, "message": "", "reasons": []}
+    return {
+        "busy": True,
+        "message": refusal["message"],
+        "reasons": refusal["busy"],
+    }
 
 
 @router.get("/health")

@@ -36,6 +36,7 @@ IS_WIN = os.name == "nt"
 FROZEN = bool(getattr(sys, "frozen", False))
 
 from src.config import APP_DIR
+from src.services.busy import busy_refusal
 
 # Встановлений мак-застосунок (.dmg/.pkg), а не скриптова інсталяція й не вінда.
 IS_MAC_APP_INSTALL = bool(getattr(sys, "frozen", False)) and sys.platform == "darwin"
@@ -94,27 +95,50 @@ def _build_update_argv() -> tuple[list[str], str]:
     before the manager restarts out from under it.
     """
     if IS_WIN and FROZEN:
-        # Standalone .exe: download the latest installer and run it silently.
-        # device-handler-setup.exe (Inno, PrivilegesRequired=lowest → no UAC)
-        # stops+cleans the running exe, installs fresh, and relaunches the
-        # manager itself. We just fetch it and hand off. -Wait keeps this
-        # detached PowerShell alive until the installer is done (the manager
-        # it kills is a different process, so this survives the restart).
+        # Standalone .exe: завантажити інсталятор і ВІДКРИТИ його — так само,
+        # як це робить мак-збірка зі своїм .pkg.
+        #
+        # BH-161. Доти ми запускали його з `/VERYSILENT /SUPPRESSMSGBOXES`, і
+        # саме тиша все й зіпсувала. Наш інсталятор не підписаний, а файл,
+        # завантажений через `Invoke-WebRequest`, несе мітку Mark-of-the-Web —
+        # SmartScreen таку пару блокує діалогом. У беззвучному режимі той
+        # діалог невидимий: `-Wait` висить, у лозі ані рядка, менеджер живий зі
+        # старим pid. Рівно те, що ми бачили в клієнта, і розібрати це було
+        # нічим. Репутація SmartScreen рахується за хешем файлу, тож черговий
+        # реліз може почати блокуватись, хоч ми в цьому шляху нічого не міняли.
+        #
+        # Відкритий інсталятор робить помилку видимою людині: майстер показує
+        # і попередження SmartScreen, і запит прав. Вона натискає — і воно йде.
+        # Мінус у тому, що оновлення перестало бути автоматичним; плюс — воно
+        # перестало мовчки не відбуватись.
         #
         # Ім'я активу нове (BH-148/BH-149), і саме тому реліз публікує ще й
         # КОПІЮ під старим ім'ям barhandler-setup.exe: копії, вже встановлені
         # в полі, тягнуть старе ім'я цим самим кодом зі СВОЄЇ версії. Прибрати
         # старий актив можна буде тоді, коли таких інсталяцій не лишиться.
         inner = (
+            "$ErrorActionPreference = 'Stop'; "
             "Start-Sleep -Seconds 2; "
             "$u = 'https://github.com/goodpesik/barhandler-manager"
             "/releases/latest/download/device-handler-setup.exe'; "
             "$tmp = Join-Path $env:TEMP 'device-handler-setup.exe'; "
+            "try { "
+            "Write-Host \"update: downloading $u\"; "
             "Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 -Uri $u -OutFile $tmp; "
-            "if ((Get-Item $tmp).Length -lt 100000) { "
-            "Write-Host 'update: installer download too small — nothing changed'; exit 1 }; "
-            "Start-Process -FilePath $tmp "
-            "-ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait"
+            "$len = (Get-Item $tmp).Length; "
+            "Write-Host \"update: downloaded $len bytes to $tmp\"; "
+            "if ($len -lt 100000) { "
+            "Write-Host 'update: installer download too small - nothing changed'; exit 1 }; "
+            # Мітку знімаємо все одно: менше причин для зайвого попередження.
+            "Unblock-File -Path $tmp -ErrorAction SilentlyContinue; "
+            "Write-Host 'update: opening installer for the operator'; "
+            # БЕЗ -Wait і без беззвучних прапорців: майстер відкривається перед
+            # людиною, а ця команда на нього не чекає — інакше вона висіла б
+            # рівно стільки, скільки людина його не бачить.
+            "Start-Process -FilePath $tmp; "
+            "Write-Host 'update: installer opened' "
+            "} catch { "
+            "Write-Host \"update: FAILED - $($_.Exception.Message)\"; exit 1 }"
         )
         argv = [
             "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -189,10 +213,41 @@ def _build_update_argv() -> tuple[list[str], str]:
     return ["bash", "-c", cmd], cmd
 
 
+def _update_is_interactive() -> bool:
+    """Чи оновлення чекає на ЛЮДИНУ, а не ставиться саме.
+
+    Там, де ми ВІДКРИВАЄМО інсталятор (мак-застосунок із BH-150, вінда-збірка
+    з BH-161), нічого не станеться доти, доки людина не пройде майстер і не
+    дасть права. Скриптова інсталяція справді ставить усе сама.
+
+    Це ознака для ТИХ, ХТО ВИКЛИКАЄ endpoint, а не текст для читання: і каса,
+    і дашборд мусять вести себе по-різному в цих двох випадках, і розбирати
+    для цього український рядок — те саме, що не мати ознаки взагалі.
+    """
+    return IS_MAC_APP_INSTALL or (IS_WIN and FROZEN)
+
+
+def _update_started_message() -> str:
+    """Що сказати людині, яка щойно натиснула «Оновити».
+
+    Обіцяти «перезапуститься за ~30 секунд» там, де відкривається майстер, —
+    неправда, і саме через таку неправду людина йде, а оновлення не
+    відбувається.
+    """
+    if _update_is_interactive():
+        return "Відкрився інсталятор — пройдіть його, і менеджер оновиться"
+    return "Оновлення запущено — менеджер перезапуститься за ~30 секунд"
+
+
 @router.post("/update")
-async def trigger_update() -> dict:
+async def trigger_update(request: Request) -> dict:
     """Spawn the platform updater fully detached from the manager so it
     survives the restart it triggers, and return immediately.
+
+    Відмовляє з 409, поки менеджер посеред незворотної роботи — див.
+    `busy_refusal`. Ця перевірка НЕ єдина: інсталятори питають те саме через
+    `GET /busy` безпосередньо перед тим, як убивати процес, бо між натисканням
+    кнопки й реальним `taskkill` може пройти скільки завгодно часу.
 
     Detachment differs per OS:
       * POSIX  — `start_new_session=True` (own session, survives the
@@ -208,6 +263,10 @@ async def trigger_update() -> dict:
     dep — leaves the operator something to read instead of a frozen
     "Перезапуск…" button. Append-mode preserves earlier attempts.
     """
+    busy = busy_refusal(request)
+    if busy is not None:
+        raise HTTPException(status_code=409, detail=busy)
+
     argv, desc = _build_update_argv()
 
     try:
@@ -270,18 +329,14 @@ async def trigger_update() -> dict:
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"не вдалось запустити оновлення: {exc}") from exc
 
-    # Знайдено ревʼю: для мак-застосунку загальний текст брехав. Там нічого не
-    # «перезапуститься за ~30 секунд» саме собою — відкривається майстер
-    # установки, і поки людина не пройде його та не введе пароль адміністратора,
-    # не зміниться нічого.
-    message = (
-        "Відкрився інсталятор — пройдіть його, і менеджер оновиться"
-        if IS_MAC_APP_INSTALL
-        else "Оновлення запущено — менеджер перезапуститься за ~30 секунд"
-    )
+    message = _update_started_message()
     return {
         "status": "updating",
         "message": message,
+        # `interactive: true` = відкрився майстер, і поки людина його не
+        # пройде, версія не зміниться. Каса й дашборд читають саме це поле:
+        # інакше кожен із них мусив би вгадувати стан за текстом повідомлення.
+        "interactive": _update_is_interactive(),
         "log": str(_UPDATE_LOG),
     }
 
@@ -367,6 +422,16 @@ async def trigger_uninstall(request: Request, purge_data: bool = False) -> dict:
             status_code=403,
             detail="видалення можна запустити лише зі сторінки менеджера",
         )
+
+    # BH-164, знайдено другим колом ревʼю: видалення робить той самий `pkill`,
+    # що й оновлення, і так само незворотне — а перевірки зайнятості тут не було
+    # взагалі. Кнопка видалення живе в дашборді й доступна посеред зміни: зняти
+    # менеджер посеред оплати карткою означає списану картку, про яку каса не
+    # дізнається ніколи. Ціна помилки тут навіть вища за оновлення, бо після
+    # видалення менеджер не повернеться сам.
+    busy = busy_refusal(request)
+    if busy is not None:
+        raise HTTPException(status_code=409, detail=busy)
 
     cmd = _build_uninstall_script(purge_data)
     try:

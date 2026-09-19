@@ -21,6 +21,7 @@ from src.devices.terminal_registry import TerminalRegistry
 from src.routes import (
     dashboard, devices, drawer, fiscal_it, health, print_routes, system, terminal, version,
 )
+from src.services.busy import BusyTracker, guard_critical
 from src.services.update_check import UpdateChecker
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,9 @@ def create_app(config: dict) -> FastAPI:
         app.state.config = config
         app.state.registry = registry
         app.state.terminal_registry = terminal_registry
+        # BH-164 — що зараз не доведено до кінця. `/system/update` питає це
+        # перед тим, як запустити інсталятор, який уб'є процес.
+        app.state.busy = BusyTracker()
         registry.load()
         terminal_registry.load()
         connect_watcher = asyncio.create_task(
@@ -328,10 +332,10 @@ def create_app(config: dict) -> FastAPI:
     app.include_router(version.router)
     app.include_router(dashboard.router)
     app.include_router(devices.router, prefix="/devices", dependencies=[Depends(verify_key)])
-    app.include_router(print_routes.router, prefix="/print", dependencies=[Depends(verify_key)])
-    app.include_router(fiscal_it.router, prefix="/fiscal/it", dependencies=[Depends(verify_key)])
-    app.include_router(drawer.router, prefix="/drawer", dependencies=[Depends(verify_key)])
-    app.include_router(terminal.router, prefix="/terminal", dependencies=[Depends(verify_key)])
+    app.include_router(print_routes.router, prefix="/print", dependencies=[Depends(verify_key), Depends(guard_critical("/print"))])
+    app.include_router(fiscal_it.router, prefix="/fiscal/it", dependencies=[Depends(verify_key), Depends(guard_critical("/fiscal/it"))])
+    app.include_router(drawer.router, prefix="/drawer", dependencies=[Depends(verify_key), Depends(guard_critical("/drawer"))])
+    app.include_router(terminal.router, prefix="/terminal", dependencies=[Depends(verify_key), Depends(guard_critical("/terminal"))])
     app.include_router(system.router, prefix="/system", dependencies=[Depends(verify_key)])
 
     return app
