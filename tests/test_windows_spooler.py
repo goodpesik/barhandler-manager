@@ -67,13 +67,24 @@ def test_build_device_maps_spooler_cfg():
 
 
 class _FakeSpooler:
-    """Stand-in for escpos.printer.Win32Raw — records the doc lifecycle."""
+    """Stand-in for escpos.printer.Win32Raw — records the doc lifecycle.
+
+    `_raw` тут не для повноти: саме ним escpos пише БАЙТИ, і питання тесту —
+    чи вони лягли ВСЕРЕДИНУ спул-документа. Доти джоб у тесті дописував
+    «print» у перелік сам, тобто перевіряв власну заглушку, а не те, куди
+    поїхав чек (BH-168).
+    """
 
     def __init__(self):
         self.events: list[str] = []
+        self.written: list[bytes] = []
 
     def open(self, job_name="python-escpos", raise_not_found=True):
         self.events.append("open")
+
+    def _raw(self, data):
+        self.events.append("print")
+        self.written.append(bytes(data))
 
     def close(self):
         self.events.append("close")
@@ -97,7 +108,7 @@ def test_worker_opens_and_closes_a_spool_doc_per_receipt():
         dev._worker_task = asyncio.create_task(dev._worker())
 
         async def job(printer):
-            printer.events.append("print")
+            printer._raw(b"RECEIPT")
 
         await dev.enqueue(job)
         snapshot = list(fake.events)   # per-job lifecycle, before disconnect
@@ -108,7 +119,15 @@ def test_worker_opens_and_closes_a_spool_doc_per_receipt():
     assert events == ["open", "print", "close"]
 
 
-def test_worker_closes_doc_even_when_job_raises():
+def test_worker_never_opens_a_doc_for_a_job_that_failed():
+    """Джоб упав — спул-документа не має бути взагалі.
+
+    Доти перевірялось слабше: «документ закрито, попри помилку». З BH-168 байти
+    складаються в памʼять і зливаються одним заходом ПІСЛЯ джоба, тож джоб, що
+    впав, до заліза не доходить — порожнього завдання друку в черзі Windows не
+    зʼявляється зовсім. Важливе тут те саме: після падіння не лишається
+    відкритого документа.
+    """
     async def body():
         dev = PrinterDevice("spool", {
             "enabled": True, "paper_width": 58, "render_mode": "native",
@@ -120,7 +139,7 @@ def test_worker_closes_doc_even_when_job_raises():
         dev._worker_task = asyncio.create_task(dev._worker())
 
         async def bad_job(printer):
-            printer.events.append("print")
+            printer._raw(b"HALF")
             raise RuntimeError("boom")
 
         with pytest.raises(RuntimeError):
@@ -130,4 +149,5 @@ def test_worker_closes_doc_even_when_job_raises():
         return snapshot
 
     events = asyncio.run(asyncio.wait_for(body(), timeout=5))
-    assert events == ["open", "print", "close"]  # closed despite the error
+    assert "open" not in events, "напівчек поїхав у спулер"
+    assert events.count("close") <= 1, "документ відкрили й не закрили"

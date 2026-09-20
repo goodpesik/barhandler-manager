@@ -124,3 +124,90 @@ def test_handler_unknown_command_is_error() -> None:
     resp = fiscal_epos.handle_request(state, "<foo/>")
     with pytest.raises(fiscal_it.FiscalItError):
         fiscal_it.parse_response(resp)
+
+
+# ---------------------------------------------------------------------------
+# BH-171 — денний Z по способах оплати
+# ---------------------------------------------------------------------------
+#
+# Справжній RT рахує Z саме з рядків `printRecTotal`. Емулятор мусить робити те
+# саме, інакше перевірити «Z показує обидва способи» немає чим — а це єдина
+# наша заміна фіскальному принтеру.
+
+
+def _sale(state, payments: list[tuple[str, float]], *, is_refund: bool = False) -> None:
+    """Проводить документ через емулятор тим самим шляхом, що й менеджер."""
+    body = fiscal_it._soap_wrap(  # noqa: SLF001
+        fiscal_it.build_commercial_document_xml(
+            [
+                fiscal_it.ItItem(
+                    name="Menu",
+                    quantity=1,
+                    unit_price=sum(a for _t, a in payments),
+                    total_price=sum(a for _t, a in payments),
+                    iva_rate=22.0,
+                    department=1,
+                )
+            ],
+            fiscal_it.ItPayment(type=payments[0][0], amount=sum(a for _t, a in payments)),
+            payments=[fiscal_it.ItPayment(type=t, amount=a) for t, a in payments],
+            payment_type_map={"card": 2, "cash": 0},
+            is_refund=is_refund,
+        )
+    )
+    parsed = fiscal_it.parse_response(fiscal_epos.handle_request(state, body))
+    assert parsed["success"] is True
+
+
+def _z_breakdown(state) -> dict:
+    state.run_z()
+    z_doc = next(d for d in state.snapshot() if d["kind"] == "CHIUSURA (Z)")
+    return z_doc["totals_by_payment_type"]
+
+
+def test_z_adds_up_each_payment_type_separately() -> None:
+    state = fiscal_epos.FiscalState(require_first_z=False)
+
+    _sale(state, [("card", 30.0), ("cash", 70.0)])
+    _sale(state, [("cash", 10.0)])
+
+    assert _z_breakdown(state) == {"2": 30.0, "0": 80.0}
+
+
+def test_a_refund_reduces_the_total_of_its_own_payment_type() -> None:
+    """Інакше звірка показувала б більше грошей, ніж у касі є."""
+    state = fiscal_epos.FiscalState(require_first_z=False)
+
+    _sale(state, [("cash", 100.0)])
+    _sale(state, [("cash", 30.0)], is_refund=True)
+
+    assert _z_breakdown(state) == {"0": 70.0}
+
+
+def test_z_counts_only_the_documents_of_its_own_day() -> None:
+    """Після Z лічильники дня починаються з нуля — інакше другий Z показав би
+    гроші, які вже здані."""
+    state = fiscal_epos.FiscalState(require_first_z=False)
+
+    _sale(state, [("cash", 40.0)])
+    assert _z_breakdown(state) == {"0": 40.0}
+
+    _sale(state, [("card", 25.0)])
+
+    # `snapshot()` віддає найновіше першим — беремо саме його. (Знайдено ревʼю:
+    # тут стояв вибір «найбільшого номера», який завжди давав той самий
+    # елемент, тобто мертвий код, що вдавав непевність у структурі даних.)
+    assert _z_breakdown(state) == {"2": 25.0}
+
+
+def test_z_does_not_lose_money_on_a_busy_day() -> None:
+    """Знайдено ревʼю: Z рахувався ітерацією по журналу документів, а той
+    обрізається до останніх 50. Тобто понад 50 чеків до Z — і звірка тихо
+    занижувала суму: 60 продажів по 1.00 давали Z на 50.00. Саме ця функція
+    мала доводити, що готівка в касі сходиться з Z, і сама ж брехала."""
+    state = fiscal_epos.FiscalState(require_first_z=False)
+
+    for _ in range(60):
+        _sale(state, [("cash", 1.0)])
+
+    assert _z_breakdown(state) == {"0": 60.0}

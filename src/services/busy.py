@@ -175,7 +175,14 @@ def printers_with_pending_jobs(request: Request) -> list[str]:
     if registry is None:
         return []
     busy: list[str] = []
-    for device in getattr(registry, "_devices", {}).values():
+    # Разом із викинутими з кешу, що ще дописують (BH-168): перереєстрація
+    # принтера посеред друку інакше робила його невидимим для цієї перевірки.
+    devices = (
+        registry.devices_for_busy()
+        if callable(getattr(registry, "devices_for_busy", None))
+        else list(getattr(registry, "_devices", {}).values())
+    )
+    for device in devices:
         pending = getattr(device, "pending_jobs", None)
         if callable(pending) and pending() > 0:
             busy.append(device.name)

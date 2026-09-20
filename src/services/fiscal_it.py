@@ -28,8 +28,13 @@ real-hardware-verified Italian FPMate bridge (`tecnosiel/OfficinaPro`
 `FPmateXmlBuilder.java`, "Verificato sul registratore reale FP-81II"), and the
 efsta EPSON error-code table. Epson's own PDF guides sit behind an Akamai block
 (403 to curl AND real headless Chrome), so those primary PDFs were unreachable —
-but every literal below is cross-checked against the working sources above, so
-there are no remaining guesses.
+but every literal below is cross-checked against the working sources above.
+
+The one exception is marked `# SPEC:` in the code (repo convention, same as the
+partner-gated terminal adapters): BH-171 emits one `printRecTotal` per tender to
+split a receipt across payment methods. None of the sources above shows a
+multi-tender document, so the repetition and the `index` numbering are a MODEL,
+not a verified fact, and must be confirmed on real hardware before it is trusted.
 """
 
 from __future__ import annotations
@@ -76,6 +81,22 @@ DEFAULT_OPERATOR = "1"
 # are rounded to 5 cents ("arrotondamento") before being tendered.
 CASH_PAYMENT_TYPE = 0
 CARD_PAYMENT_TYPE = 2
+
+# Що друкувати в рядку оплати. BH-171, знайдено ревʼю: там стояв СИРИЙ ключ від
+# каси («card», «cash»), тобто на італійському чеку, який читає клієнт і
+# податкова, було англійське слово. Поки спосіб був один, це була одна дивна
+# назва; з розбивкою вона множиться на кожен рядок. Невідомий ключ лишаємо як є —
+# це краще за порожній рядок, і видно, що саме прийшло від каси.
+PAYMENT_TYPE_LABELS = {
+    CASH_PAYMENT_TYPE: "Contanti",
+    1: "Assegno",
+    CARD_PAYMENT_TYPE: "Carta",
+}
+# Невідомий тип (RT приймає й інші — тікети, buoni pasto) друкуємо нейтральним
+# італійським словом. Знайдено другим колом ревʼю: фолбек на `tender.type`
+# повертав сирий ключ каси («buoni_pasto») на італійський фіскальний чек —
+# та сама вада, тільки перенесена з невідомого РЯДКА на невідоме ЧИСЛО.
+UNKNOWN_PAYMENT_LABEL = "Pagamento"
 
 # Fallback IVA-rate → department (reparto) map. The VAT rate is configured on
 # the printer *per department*; the line only carries `department="N"`. These
@@ -160,6 +181,10 @@ class ItPayment:
 class ItDocument:
     items: list[ItItem]
     payment: ItPayment
+    # BH-171 — чек можна оплатити кількома способами одразу (частина карткою,
+    # решта готівкою). Сервер віддає правдиву розбивку тут; `payment` лишається
+    # на місці, щоб старіший сервер друкував як раніше.
+    payments: Optional[list[ItPayment]] = field(default=None)
     payment_type_map: Optional[dict] = field(default=None)
     is_refund: bool = False
     # Optional "RESO MERCE N.<z>-<doc> del <date>" reference tying a refund to
@@ -170,6 +195,21 @@ class ItDocument:
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
+
+
+class FiscalItPayloadError(ValueError):
+    """Розбивка оплат, яку не можна віддати принтеру.
+
+    BH-171, знайдено ревʼю: сума рядків оплати ніде не звірялась із сумою чека.
+    RT на такому документі поведеться непередбачувано — або дорахує решту, або
+    відмовиться закривати, — тож обидва варіанти неприйнятні для каси. Краще
+    відмовити тут, з чітким текстом, ніж друкувати неправду або ловити
+    незрозумілий код принтера.
+    """
+
+    def __init__(self, message: str, *, code: str = "bad_payments"):
+        super().__init__(message)
+        self.code = code
 
 
 class FiscalItError(Exception):
@@ -200,20 +240,134 @@ def department_for_iva(iva_rate: float) -> int:
     return DEFAULT_IVA_TO_DEPARTMENT.get(float(iva_rate), 1)
 
 
+def validate_tenders(
+    items: list[ItItem],
+    payment: ItPayment,
+    payments: Optional[list[ItPayment]],
+    payment_type_map: Optional[dict] = None,
+) -> None:
+    """Перевірити розбивку оплат ДО того, як документ поїде на принтер.
+
+    Дві речі, які RT робить непередбачувано:
+
+    1. Сума рядків оплати мусить дорівнювати сумі чека. Менше — RT чекатиме
+       доплати, більше — видасть решту; і те, і те на фіскальному документі
+       неправда.
+    2. Готівкова частина РОЗБИВКИ мусить бути кратна 5 копійкам. На одному
+       способі ми округлюємо самі, а в розбивці округлення зсунуло б суму від
+       суми чека — тож кратність має забезпечити той, хто розбивку склав.
+       Інакше касир фізично віддасть не ту суму, що в документі, і звірка
+       готівки знову не зійдеться — тобто вада, яку BH-171 лікує, лишилась би,
+       просто меншого розміру.
+    """
+    tenders = _tenders(payment, payments)
+    if len(tenders) < 2:
+        return
+
+    for tender in tenders:
+        # Знайдено третім колом ревʼю, дві діри до перевірки суми.
+        #
+        # Сума частин може зійтись і з НЕМОЖЛИВИМИ частинами: 150 готівкою
+        # плюс -50 карткою дають ті самі 100. Від'ємний чи нульовий рядок
+        # оплати RT обробить непередбачувано — саме те, чого ця функція
+        # мала не пускати.
+        if not tender.amount > 0:
+            raise FiscalItPayloadError(
+                f"частина оплати «{tender.type}» має бути більшою за нуль, а не {tender.amount:.2f}",
+                code="invalid_tender_amount",
+            )
+        # На ОДНОМУ способі невідомий ключ законно деградує в готівку: чек
+        # закривається однією сумою, і RT її приймає. У РОЗБИВЦІ це вже
+        # неправда на фіскальному документі — ваучер друкується як «Contanti»
+        # і рахується в готівку при звірці, тобто вада, яку BH-171 лікує. До
+        # того ж така «готівка» потрапляла під кратність 5 копійкам і
+        # відхиляла законний чек з оманливим текстом.
+        if not is_known_payment_type(tender, payment_type_map):
+            raise FiscalItPayloadError(
+                f"невідомий спосіб оплати «{tender.type}» — додайте його в payment_type_map",
+                code="unknown_payment_type",
+            )
+
+    expected = round(sum(item.total_price for item in items), 2)
+    got = round(sum(t.amount for t in tenders), 2)
+    # Допуск — КОПІЙКА, не півкопійки.  # SPEC:
+    # Знайдено другим колом ревʼю: IVA рахується по рядку, а сума документа — на
+    # агрегаті, і розбіжність в одну копійку («arrotondamento IVA riga vs
+    # documento») там законна. Вужчий допуск відхиляв би правильний чек, тобто
+    # робив би гірше за саму ваду. Точного правила самого RT ми не знаємо — це
+    # модель, і вона лишається свідомо ЛІБЕРАЛЬНОЮ: краще пропустити копійку,
+    # ніж не дати касиру провести оплату.
+    if abs(expected - got) > 0.011:
+        raise FiscalItPayloadError(
+            f"сума оплат {got:.2f} не дорівнює сумі чека {expected:.2f}",
+            code="payments_sum_mismatch",
+        )
+
+    for tender in tenders:
+        # Тип резолвиться ТІЄЮ САМОЮ мапою, що й у білдері. Знайдено другим колом
+        # ревʼю: без мапи перевірка дивилась на сирий ключ, і виходило в обидві
+        # сторони неправильно — кастомний ключ каси, замапений у готівку,
+        # проходив із некратною сумою (тобто вада, яку лікуємо, лишалась), а
+        # замапений у картку відхилявся 400-кою як «некратна готівка».
+        if resolve_payment_type(tender, payment_type_map) != CASH_PAYMENT_TYPE:
+            continue
+        if abs(round_to_5_cents(tender.amount) - round(tender.amount, 2)) > 0.005:
+            raise FiscalItPayloadError(
+                f"готівкова частина {tender.amount:.2f} не кратна 5 копійкам",
+                code="cash_not_rounded",
+            )
+
+
+def _tenders(
+    payment: ItPayment, payments: Optional[list[ItPayment]]
+) -> list[ItPayment]:
+    """Способи оплати, якими закривається документ.
+
+    BH-171: сервер надсилає розбивку в `payments`. Порожній перелік або його
+    відсутність означає старіший сервер — там єдиний `payment`, і поводимось як
+    раніше. Порожній список окремо: `payments: []` це «розбивки немає», а не
+    «оплат немає», і закрити документ без жодного рядка оплати неможливо.
+    """
+    return list(payments) if payments else [payment]
+
+
+def _is_single_tender(
+    payment: ItPayment, payments: Optional[list[ItPayment]]
+) -> bool:
+    return len(_tenders(payment, payments)) == 1
+
+
+_LITERAL_CASH = {"cash", "contante", "contanti"}
+_LITERAL_CARD = {"card", "carta", "electronic", "pos"}
+
+
+def is_known_payment_type(payment: ItPayment, payment_type_map: Optional[dict]) -> bool:
+    """Чи резолвиться ключ ЯВНО — мапою каси або одним із літеральних імен.
+
+    Та сама логіка, що в `resolve_payment_type`, мінус запасна готівка: тримати
+    дві копії правила означало б, що вони розійдуться.
+    """
+    if payment_type_map and payment_type_map.get(payment.type) is not None:
+        return True
+    key = (payment.type or "").strip().lower()
+    return key in _LITERAL_CASH or key in _LITERAL_CARD
+
+
 def resolve_payment_type(payment: ItPayment, payment_type_map: Optional[dict]) -> int:
     """Map the caller's tender key to an RT payment-type integer.
 
     Unknown / missing keys fall back to cash (0) — the RT printer always
     accepts a cash total, so an unmapped tender degrades to cash rather than
-    failing the whole receipt."""
+    failing the whole receipt. Only for a SINGLE tender: in a split an unknown
+    key is rejected up front (`validate_tenders`, BH-171)."""
     if payment_type_map:
         mapped = payment_type_map.get(payment.type)
         if mapped is not None:
             return int(mapped)
     key = (payment.type or "").strip().lower()
-    if key in {"cash", "contante", "contanti"}:
+    if key in _LITERAL_CASH:
         return CASH_PAYMENT_TYPE
-    if key in {"card", "carta", "electronic", "pos"}:
+    if key in _LITERAL_CARD:
         return CARD_PAYMENT_TYPE
     return CASH_PAYMENT_TYPE
 
@@ -237,6 +391,7 @@ def build_commercial_document_xml(
     items: list[ItItem],
     payment: ItPayment,
     *,
+    payments: Optional[list[ItPayment]] = None,
     payment_type_map: Optional[dict] = None,
     is_refund: bool = False,
     refund_reference: Optional[str] = None,
@@ -251,6 +406,8 @@ def build_commercial_document_xml(
     Returns the inner `<printerFiscalReceipt>…` XML (SOAP wrapping happens in
     `_soap_wrap`).
     """
+    validate_tenders(items, payment, payments, payment_type_map)
+
     root = ET.Element("printerFiscalReceipt")
 
     # A refund is a normal fiscal receipt preceded by the "RESO MERCE" header
@@ -287,25 +444,45 @@ def build_commercial_document_xml(
             },
         )
 
-    payment_type = resolve_payment_type(payment, payment_type_map)
-    total = payment.amount
-    if payment_type == CASH_PAYMENT_TYPE:
-        total = round_to_5_cents(total)
-
     # printRecTotal carries the tender + amount; reaching the total settles and
-    # closes the fiscal receipt.
-    ET.SubElement(
-        root,
-        "printRecTotal",
-        {
-            "operator": DEFAULT_OPERATOR,
-            "description": "RIMBORSO" if is_refund else (payment.type or "Contante"),
-            "payment": _fmt_money(total),
-            "paymentType": str(payment_type),
-            "index": "1",
-            "justification": "1",
-        },
-    )
+    # closes the fiscal receipt. Один рядок на КОЖЕН спосіб оплати: RT рахує з
+    # них денний Z, тож коли чек оплачено і карткою, і готівкою, а в документі
+    # стоїть один спосіб на всю суму — готівка в касі не сходиться зі звіркою.
+    # Це фіскальний документ, тобто там неправда, а не лише незручність.
+    #
+    # Повторення `printRecTotal` і нумерація `index` 1..N — МОДЕЛЬ.  # SPEC:
+    # Жодне з джерел у докстрінгу модуля не показує документа з кількома
+    # способами оплати, тож поведінку реального RT тут не підтверджено:
+    # він може або прийняти всі рядки (як ми припускаємо), або закрити
+    # документ на першому — і тоді сума в чеку буде НЕПРАВИЛЬНА без жодної
+    # помилки. Перевірити на живому пристрої перед тим, як довіряти.
+    for index, tender in enumerate(_tenders(payment, payments), start=1):
+        payment_type = resolve_payment_type(tender, payment_type_map)
+        amount = tender.amount
+        # Італійське округлення готівки до 5 копійок застосовуємо ЛИШЕ коли
+        # готівка закриває весь документ. На розбивці округлення кожного рядка
+        # зсунуло б їхню суму від суми чека — і RT або дорахував би решту, або
+        # відмовив би в закритті.
+        if payment_type == CASH_PAYMENT_TYPE and _is_single_tender(payment, payments):
+            amount = round_to_5_cents(amount)
+        ET.SubElement(
+            root,
+            "printRecTotal",
+            {
+                "operator": DEFAULT_OPERATOR,
+                "description": (
+                    "RIMBORSO"
+                    if is_refund
+                    else PAYMENT_TYPE_LABELS.get(
+                        payment_type, UNKNOWN_PAYMENT_LABEL
+                    )
+                ),
+                "payment": _fmt_money(amount),
+                "paymentType": str(payment_type),
+                "index": str(index),
+                "justification": "1",
+            },
+        )
 
     ET.SubElement(root, "endFiscalReceipt", {"operator": DEFAULT_OPERATOR})
 
@@ -552,6 +729,7 @@ def print_commercial_document(
     inner = build_commercial_document_xml(
         document.items,
         document.payment,
+        payments=document.payments,
         payment_type_map=document.payment_type_map,
         is_refund=document.is_refund,
         refund_reference=document.refund_reference,
