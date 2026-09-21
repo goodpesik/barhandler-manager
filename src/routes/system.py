@@ -37,6 +37,7 @@ IS_WIN = os.name == "nt"
 FROZEN = bool(getattr(sys, "frozen", False))
 
 from src.config import APP_DIR
+from src.version import installed_version
 from src.services.busy import busy_refusal
 
 # Встановлений мак-застосунок (.dmg/.pkg), а не скриптова інсталяція й не вінда.
@@ -61,10 +62,7 @@ WIN_DETACHED_PROCESS = 0x00000008
 
 @router.get("/version")
 async def get_version() -> dict:
-    # Resolve VERSION relative to the code (bundled at the root of the exe's
-    # _MEIPASS too), not the cwd — the exe's cwd is arbitrary.
-    version_file = Path(__file__).resolve().parent.parent.parent / "VERSION"
-    version = version_file.read_text().strip() if version_file.exists() else "unknown"
+    version = installed_version("unknown")
     # BH-150 — дашборд має знати, чи це встановлений мак-застосунок: кнопку
     # видалення показуємо ЛИШЕ там, де вона справді щось знімає. У скриптовій
     # інсталяції та на вінді за це відповідають їхні власні інсталятори.
@@ -326,7 +324,7 @@ async def trigger_update(request: Request) -> dict:
         with _UPDATE_LOG.open("a") as fh:
             fh.write(
                 f"\n=== update triggered {_dt.datetime.now().isoformat()} "
-                f"(pid={os.getpid()}) ===\n",
+                f"(pid={os.getpid()}, version={installed_version()}) ===\n",
             )
             fh.write(f"cmd: {desc}\n")
             fh.flush()
@@ -818,8 +816,7 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
             existing.detach_handler_from_root()
         install_id_path = APP_DIR / "install_id.txt"
         install_id = get_or_create_install_id(install_id_path)
-        version_path = Path(__file__).resolve().parent.parent.parent / "VERSION"
-        version = version_path.read_text().strip() if version_path.exists() else "0.0.0"
+        version = installed_version()
         client = LogUplinkClient({
             "url": _DEFAULT_UPLINK_URL,
             "tenant": tenant,

@@ -23,6 +23,7 @@ from src.routes import (
 )
 from src.services.busy import BusyTracker, guard_critical
 from src.services.update_check import UpdateChecker
+from src.version import installed_version
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +63,7 @@ def create_app(config: dict) -> FastAPI:
     # operator's `update.sh` writes after a release. Don't re-read on
     # every request; if the file changes mid-flight the process is about
     # to restart anyway.
-    version_path = Path(__file__).resolve().parent.parent / "VERSION"
-    current_version = version_path.read_text().strip() if version_path.exists() else "0.0.0"
+    current_version = installed_version()
     # Expose so health/version routes can fall back when the checker
     # hasn't started yet.
     config["version"] = current_version
@@ -102,8 +102,7 @@ def create_app(config: dict) -> FastAPI:
             # сервер логів бачив би нову інсталяцію після кожного рестарту.
             install_id_path = APP_DIR / "install_id.txt"
             install_id = get_or_create_install_id(install_id_path)
-            version_path = Path(__file__).resolve().parent.parent / "VERSION"
-            version = version_path.read_text().strip() if version_path.exists() else "0.0.0"
+            version = installed_version()
             uplink = LogUplinkClient(uplink_cfg)
             uplink.attach_handler_to_root()
             from src.services.diagnostics import make_callback
