@@ -264,7 +264,9 @@ async def test_mac_update_message_does_not_promise_a_restart(monkeypatch, tmp_pa
     monkeypatch.setattr(system_routes, "_UPDATE_LOG", tmp_path / "update.log")
     monkeypatch.setattr(
         system_routes.subprocess, "Popen",
-        lambda argv, **kw: type("P", (), {"pid": 1})(),
+        # BH-174 — `poll()` теж: маршрут питає код повернення, щоб мовчазна
+        # смерть дитини не виглядала успішним стартом.
+        lambda argv, **kw: type("P", (), {"pid": 1, "poll": lambda self: None})(),
     )
 
     # BH-164 — endpoint тепер питає, чи менеджер не посеред оплати/друку, і
