@@ -7,6 +7,8 @@ update.log містив лише наші власні заголовки. Це 
 все вийшло, і коли інсталятор не запустився.
 """
 
+import asyncio
+
 from unittest.mock import patch
 
 import pytest
@@ -172,6 +174,10 @@ def test_the_endpoint_returns_the_flag(monkeypatch, tmp_path):
             return self
         def __exit__(self, *exc):
             return False
+        def poll(self):
+            # BH-174 — жива дитина: маршрут питає код повернення, щоб не
+            # звітувати «запущено» про процес, який уже помер.
+            return None
 
     spawned: list = []
     # Патчимо ТІЛЬКИ Popen у модулі subprocess — і саме тому підміняємо
@@ -193,3 +199,186 @@ def test_the_endpoint_returns_the_flag(monkeypatch, tmp_path):
     monkeypatch.setattr(system_routes, "FROZEN", False)
     body = asyncio.run(system_routes.trigger_update(request))
     assert body["interactive"] is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BH-174 — оновлення на вінді не робило НІЧОГО й не лишало сліду.
+#
+# У полі `update.log` містив самі наші заголовки: ні `update: downloading`, ні
+# `update: FAILED` — тобто PowerShell не доживав навіть до першого `Write-Host`.
+# Причина не в SmartScreen (його ж лікували в BH-161, а мовчання лишилось), а в
+# парі «`DETACHED_PROCESS` + консольний хост»: дитина лишалась зовсім без
+# консолі. Плюс вивід і не міг дійти до лога — він тримався на успадкованому
+# дескрипторі.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_the_update_runs_through_cmd_and_writes_the_log_itself(tmp_path, monkeypatch):
+    """Запуск іде через `cmd`, і саме `cmd` пише в лог (`>> "лог" 2>&1`)."""
+    log = tmp_path / "Program Files" / "update.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(system_routes, "_UPDATE_LOG", log)
+
+    cmdline, _desc = _win_argv()
+
+    assert isinstance(cmdline, str), (
+        "на вінді команда мусить бути РЯДКОМ: список Python серіалізує через "
+        "list2cmdline, яка екранує лапки бекслешем, а cmd такого не розуміє"
+    )
+    assert cmdline.startswith('cmd.exe /c "'), f"запуск не через cmd: {cmdline!r}"
+    assert cmdline.endswith('"'), "немає зовнішньої пари лапок, яку знімає cmd /c"
+    assert "-File" in cmdline, "тіло має йти файлом, а не рядком через -Command"
+    assert f'>> "{log}" 2>&1' in cmdline, "перенаправлення в лог робить не cmd"
+    # Найголовніше: жодного бекслеш-екранування лапок — саме воно й ламало шляхи.
+    assert '\\"' not in cmdline, "лапки екрановані бекслешем — cmd їх не зрозуміє"
+
+
+def test_paths_with_spaces_survive_the_command_line(tmp_path, monkeypatch):
+    """«Program Files» і кирилиця в TEMP — звичайні шляхи на касі."""
+    log = tmp_path / "Program Files" / "Device Handler" / "update.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    script = tmp_path / "Користувач Каса" / "update-cmd.ps1"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(system_routes, "_UPDATE_LOG", log)
+    monkeypatch.setattr(system_routes, "_win_script_path", lambda: script)
+
+    cmdline, _desc = _win_argv()
+
+    # Кожен шлях — у своїй парі лапок, інакше пробіл розріже аргумент.
+    assert f'-File "{script}"' in cmdline
+    assert f'>> "{log}"' in cmdline
+
+
+def test_the_body_lands_in_a_file_the_launcher_points_at(tmp_path, monkeypatch):
+    """Те, що запускають, і те, що написали, — той самий файл."""
+    monkeypatch.setattr(system_routes, "_UPDATE_LOG", tmp_path / "update.log")
+    monkeypatch.setattr(
+        system_routes, "_win_script_path", lambda: tmp_path / "update-cmd.ps1"
+    )
+
+    cmdline, desc = _win_argv()
+
+    script = tmp_path / "update-cmd.ps1"
+    assert script.exists(), "тіло оновлення не записалось у файл"
+    assert str(script) in cmdline, "запускають не той файл, який написали"
+    assert "device-handler-setup.exe" in script.read_text(encoding="utf-8")
+    assert desc.startswith("$ErrorActionPreference"), "опис має лишитись тілом команди"
+
+
+def test_the_child_keeps_a_console_so_powershell_survives(tmp_path, monkeypatch):
+    """`DETACHED_PROCESS` забирає консоль, і `powershell.exe` без неї гине
+    мовчки. Ховаємо вікно `CREATE_NO_WINDOW`, консоль лишаємо."""
+    seen: dict = {}
+
+    class _FakePopen:
+        def __init__(self, *a, **kw):
+            seen.update(kw)
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(system_routes.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(system_routes, "_UPDATE_LOG", tmp_path / "update.log")
+    monkeypatch.setattr(
+        system_routes, "_win_script_path", lambda: tmp_path / "update-cmd.ps1"
+    )
+    monkeypatch.setattr(system_routes, "IS_WIN", True)
+    monkeypatch.setattr(system_routes, "FROZEN", True)
+    monkeypatch.setattr(system_routes, "IS_MAC_APP_INSTALL", False)
+
+    from types import SimpleNamespace
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+    asyncio.run(system_routes.trigger_update(request))
+
+    flags = seen.get("creationflags", 0)
+    assert flags & system_routes.WIN_CREATE_NO_WINDOW, "вікно не приховане"
+    assert not (flags & system_routes.WIN_DETACHED_PROCESS), (
+        "DETACHED_PROCESS повернувся — саме він і вбивав PowerShell"
+    )
+
+
+def test_a_launcher_that_dies_at_once_is_not_reported_as_started(tmp_path, monkeypatch):
+    """Мовчазна смерть виглядала точно як успішний старт: `Popen` не падає, а на
+    процес ніхто не дивився. Тепер це помилка, і код повернення — у лозі."""
+    log = tmp_path / "update.log"
+
+    class _DeadPopen:
+        def __init__(self, *a, **kw):
+            pass
+
+        def poll(self):
+            return 9009  # «команду не знайдено» у cmd
+
+    monkeypatch.setattr(system_routes.subprocess, "Popen", _DeadPopen)
+    monkeypatch.setattr(system_routes, "_UPDATE_LOG", log)
+    monkeypatch.setattr(
+        system_routes, "_win_script_path", lambda: tmp_path / "update-cmd.ps1"
+    )
+    monkeypatch.setattr(system_routes, "IS_WIN", True)
+    monkeypatch.setattr(system_routes, "FROZEN", True)
+    monkeypatch.setattr(system_routes, "IS_MAC_APP_INSTALL", False)
+
+    from types import SimpleNamespace
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+    with pytest.raises(Exception) as err:
+        asyncio.run(system_routes.trigger_update(request))
+
+    assert "9009" in str(getattr(err.value, "detail", err.value))
+    assert "rc=9009" in log.read_text(), "код повернення не потрапив у лог"
+
+
+def test_each_attempt_writes_its_own_script(monkeypatch, tmp_path):
+    """Кнопку тиснуть по кілька разів підряд (у полі було три за хвилину).
+    Спільний файл означав би, що новий запис лягає під ноги тому PowerShell,
+    який його ще читає."""
+    monkeypatch.setattr(system_routes, "_UPDATE_LOG", tmp_path / "update.log")
+    monkeypatch.setattr(
+        system_routes.tempfile, "gettempdir", lambda: str(tmp_path)
+    )
+
+    first = system_routes._win_script_path()
+    second = system_routes._win_script_path()
+
+    assert first != second, "дві спроби пишуть в один файл"
+    assert first.suffix == ".ps1" and second.suffix == ".ps1"
+
+
+def test_the_log_handle_is_not_handed_to_the_child_on_windows(tmp_path, monkeypatch):
+    """Вивід у лог пише сам `cmd`. Дескриптор дитині віддавати не можна: на
+    вінді відкритий дескриптор не дає лог ні перейменувати, ні видалити."""
+    seen: dict = {}
+
+    class _FakePopen:
+        def __init__(self, *a, **kw):
+            seen.update(kw)
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(system_routes.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(system_routes, "_UPDATE_LOG", tmp_path / "update.log")
+    monkeypatch.setattr(
+        system_routes, "_win_script_path", lambda: tmp_path / "update-cmd.ps1"
+    )
+    monkeypatch.setattr(system_routes, "IS_WIN", True)
+    monkeypatch.setattr(system_routes, "FROZEN", True)
+    monkeypatch.setattr(system_routes, "IS_MAC_APP_INSTALL", False)
+    monkeypatch.setattr(system_routes, "_DEAD_CHILD_GRACE_SECONDS", 0)
+
+    from types import SimpleNamespace
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace()))
+    asyncio.run(system_routes.trigger_update(request))
+
+    import subprocess as sp
+
+    assert seen.get("stdout") == sp.DEVNULL, "дитині віддали дескриптор лога"
+    assert seen.get("stderr") == sp.DEVNULL
+
+
+def test_the_grace_is_short_enough_not_to_hold_the_button(tmp_path):
+    """Пауза перед перевіркою «чи жива дитина» стоїть у відповіді користувачу:
+    завелика — кнопка висне, нульова — не відрізнить старт від смерті."""
+    assert 0 < system_routes._DEAD_CHILD_GRACE_SECONDS <= 1

@@ -21,6 +21,7 @@ import platform
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -45,6 +46,17 @@ _INSTALL_DIR = Path.home() / ".barhandler-manager"
 # The exe has no ~/.barhandler-manager; keep its update.log next to the exe
 # (APP_DIR), which the installer leaves in place across upgrades.
 _UPDATE_LOG = (APP_DIR if FROZEN else _INSTALL_DIR) / "update.log"
+# Скільки чекати, перш ніж питати, чи дитина ще жива. Команда оновлення
+# починається з двосекундної паузи, тож цього досить, щоб відрізнити
+# «стартувала» від «померла одразу», і замало, щоб людина помітила.
+_DEAD_CHILD_GRACE_SECONDS = 0.4
+
+# Прапорці запуску вінди — ЧИСЛАМИ: у `subprocess` їх немає на posix, тож
+# навіть згадка `subprocess.CREATE_NO_WINDOW` падає на маку (і в тестах теж).
+WIN_CREATE_NO_WINDOW = 0x08000000
+WIN_CREATE_NEW_PROCESS_GROUP = 0x00000200
+WIN_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+WIN_DETACHED_PROCESS = 0x00000008
 
 
 @router.get("/version")
@@ -82,6 +94,52 @@ def _mac_host_arch() -> str:
     if translated == "1":
         return "silicon"
     return "silicon" if platform.machine() == "arm64" else "intel"
+
+
+def _win_script_path() -> Path:
+    """Куди кладемо тіло оновлення. У TEMP, а не поруч із exe: там пише будь-хто
+    без прав адміністратора.
+
+    Імʼя унікальне на кожен запуск: кнопку тиснуть по кілька разів підряд (у
+    полі так і було — три спроби за хвилину), і спільний файл означав би, що
+    новий запис лягає під ноги тому PowerShell, який ще його читає.
+    """
+    stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return Path(tempfile.gettempdir()) / f"device-handler-update-{stamp}.ps1"
+
+
+def _win_launcher(body: str) -> str:
+    """BH-174 — як саме запускати PowerShell на вінді, щоб він дожив і лишив слід.
+
+    Доти ми передавали все тіло через `-Command` і чекали, що вивід сам потрапить
+    у `update.log` через успадкований дескриптор. У полі не потрапляло НІЧОГО:
+    у лозі стояли самі наші заголовки, без жодного рядка PowerShell — навіть без
+    першого `Write-Host`, тобто процес помирав раніше, ніж щось написав. Причина
+    в парі «`DETACHED_PROCESS` + консольний хост»: дитина лишається зовсім без
+    консолі, а `powershell.exe` без неї просто гине, і подивитись на це нікому —
+    на процес ніхто не чекає.
+
+    Тому: тіло пишемо у файл, а запускаємо його через `cmd`, і перенаправлення
+    в лог робить САМ `cmd` (`>> "лог" 2>&1`). Тоді вивід лягає в лог незалежно
+    від того, що там успадкувалось, а вікно ховає `CREATE_NO_WINDOW` (див.
+    `trigger_update`) — замість `DETACHED_PROCESS`, який консоль і забирав.
+    """
+    script = _win_script_path()
+    script.write_text(body, encoding="utf-8")
+    inner = (
+        f'powershell -NoProfile -ExecutionPolicy Bypass -File "{script}"'
+        f' >> "{_UPDATE_LOG}" 2>&1'
+    )
+    # РЯДКОМ, а не списком. Список Python серіалізує через `list2cmdline`, і та
+    # екранує внутрішні лапки бекслешем (`\"`) — за конвенцією C-рантайму. Але
+    # `cmd.exe` бекслеш як екранування НЕ розуміє: він побачив би шлях
+    # `\C:\…\update.ps1\` і не відкрив би ні скрипта, ні лога. Саме так фікс
+    # і зламався б непоміченим (знайшло ревʼю).
+    #
+    # Зовнішня пара лапок потрібна: `cmd /c` за своїм правилом знімає ПЕРШУ й
+    # ОСТАННЮ лапку рядка, і далі команда читається з нормальними парними
+    # лапками навколо шляхів — тобто пробіли в «Program Files» переживають.
+    return f'cmd.exe /c "{inner}"' 
 
 
 def _build_update_argv() -> tuple[list[str], str]:
@@ -140,11 +198,7 @@ def _build_update_argv() -> tuple[list[str], str]:
             "} catch { "
             "Write-Host \"update: FAILED - $($_.Exception.Message)\"; exit 1 }"
         )
-        argv = [
-            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-            "-Command", inner,
-        ]
-        return argv, inner
+        return _win_launcher(inner), inner
 
     if IS_WIN:
         script = _INSTALL_DIR / "update.ps1"
@@ -163,11 +217,7 @@ def _build_update_argv() -> tuple[list[str], str]:
                 "Write-Host 'update: empty installer downloaded — nothing changed'; exit 1 }; "
                 'Invoke-Expression "& { $($r.Content) } -Force"'
             )
-        argv = [
-            "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
-            "-Command", inner,
-        ]
-        return argv, inner
+        return _win_launcher(inner), inner
 
     if IS_MAC_APP_INSTALL:
         # BH-150 — мак-застосунок оновлюється СВОЇМ інсталятором, а не
@@ -282,16 +332,24 @@ async def trigger_update(request: Request) -> dict:
             fh.flush()
 
         popen_kwargs: dict = dict(
-            stdout=None,  # set below to the dup'd log fd
+            stdout=None,  # POSIX: нижче стає дескриптором лога
             stderr=subprocess.STDOUT,
             close_fds=True,
         )
         if IS_WIN:
+            # BH-174 — БЕЗ `DETACHED_PROCESS`: він лишає дитину зовсім без
+            # консолі, а `powershell.exe` без неї гине мовчки, не написавши
+            # жодного рядка. `CREATE_NO_WINDOW` так само не показує вікна, але
+            # консоль у процесу є.
             popen_kwargs["creationflags"] = (
-                subprocess.DETACHED_PROCESS
-                | subprocess.CREATE_NEW_PROCESS_GROUP
-                | 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
+                WIN_CREATE_NO_WINDOW
+                | WIN_CREATE_NEW_PROCESS_GROUP
+                | WIN_CREATE_BREAKAWAY_FROM_JOB
             )
+            # Вивід у лог пише сам `cmd` (`>>` у команді): через успадкований
+            # дескриптор він до лога не доходив.
+            popen_kwargs["stdout"] = subprocess.DEVNULL
+            popen_kwargs["stderr"] = subprocess.DEVNULL
         else:
             popen_kwargs["start_new_session"] = True
             # When the manager runs under launchd / systemd the inherited
@@ -308,19 +366,23 @@ async def trigger_update(request: Request) -> dict:
                 ),
             }
 
+        # BH-174 — на вінді дескриптор лога дитині НЕ віддаємо (вище стоїть
+        # DEVNULL, а пише в лог сам `cmd`); цей рядок доти перекривав його
+        # назад, скасовуючи те, що зробили трьома рядками вище.
         log_fh = _UPDATE_LOG.open("a")
-        popen_kwargs["stdout"] = log_fh
+        if not IS_WIN:
+            popen_kwargs["stdout"] = log_fh
+        proc: subprocess.Popen | None = None
         try:
-            subprocess.Popen(argv, **popen_kwargs)
+            proc = subprocess.Popen(argv, **popen_kwargs)
         except OSError:
             # Breakaway can be refused by the job object — retry without
             # it rather than failing the whole update.
             if IS_WIN:
                 popen_kwargs["creationflags"] = (
-                    subprocess.DETACHED_PROCESS
-                    | subprocess.CREATE_NEW_PROCESS_GROUP
+                    WIN_CREATE_NO_WINDOW | WIN_CREATE_NEW_PROCESS_GROUP
                 )
-                subprocess.Popen(argv, **popen_kwargs)
+                proc = subprocess.Popen(argv, **popen_kwargs)
             else:
                 raise
         finally:
@@ -328,6 +390,24 @@ async def trigger_update(request: Request) -> dict:
             log_fh.close()
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"не вдалось запустити оновлення: {exc}") from exc
+
+    # BH-174 — «запущено» не має бути здогадом. Дитина, що вмирає одразу
+    # (немає `powershell`, політика, відмова job-обʼєкта), виглядала точно так
+    # само, як успішний старт: `Popen` не падає, а на процес ніхто не дивиться.
+    # Тож даємо їй мить і питаємо код повернення: команда починається з
+    # двосекундної паузи, тож жива дитина тут ще працює.
+    await asyncio.sleep(_DEAD_CHILD_GRACE_SECONDS)
+    rc = proc.poll() if proc is not None else None
+    if rc is not None:
+        try:
+            with _UPDATE_LOG.open("a") as fh:
+                fh.write(f"update: launcher exited immediately rc={rc}\n")
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=500,
+            detail=f"оновлення не запустилось (код {rc}) — подивіться {_UPDATE_LOG}",
+        )
 
     message = _update_started_message()
     return {

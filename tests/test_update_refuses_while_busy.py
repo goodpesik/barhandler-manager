@@ -47,6 +47,10 @@ def test_an_idle_manager_updates(monkeypatch, tmp_path):
             return self
         def __exit__(self, *exc):
             return False
+        def poll(self):
+            # BH-174 — маршрут питає код повернення: мовчазна смерть дитини
+            # більше не виглядає як успішний старт. Жива дитина — `None`.
+            return None
 
     monkeypatch.setattr(system_routes.subprocess, "Popen", _FakePopen)
     monkeypatch.setattr(system_routes, "_UPDATE_LOG", tmp_path / "update.log")
@@ -727,6 +731,10 @@ def test_uninstall_works_when_the_manager_is_idle(monkeypatch, tmp_path) -> None
             return self
         def __exit__(self, *exc):
             return False
+        def poll(self):
+            # BH-174 — маршрут питає код повернення: мовчазна смерть дитини
+            # більше не виглядає як успішний старт. Жива дитина — `None`.
+            return None
 
     monkeypatch.setattr(system_routes.subprocess, "Popen", _FakePopen)
     monkeypatch.setattr(system_routes, "IS_MAC_APP_INSTALL", True)
