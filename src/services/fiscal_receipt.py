@@ -2,11 +2,12 @@
 
 Visual reference: docs/samples/vchasno-kasa-test.pdf (a real fiscal receipt
 printed by Vchasno Kasa). We try to match that layout as closely as a
-58mm thermal printer allows:
+58mm thermal printer allows.
 
-  ************************************************
-                  ФІСКАЛЬНИЙ ЧЕК                       (bold, double-size)
-  ************************************************
+BH-173 — назву документа друкуємо ОДИН раз і саме внизу, у фіскальному блоці:
+верхній банер у зірочках повторював її й з'їдав три рядки паперу на кожному
+чеку. Чек починається з назви закладу:
+
               ФОП ЛЕВИНЕЦЬ МАКСИМ                      (bold, centered)
                 Тестова торгова точка                  (centered)
             Україна, м.Київ, вул. ...                  (centered)
@@ -147,13 +148,12 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
     """Drive `printer` (python-escpos instance) to print `receipt`."""
     width = chars_per_line
 
-    # ---- Header banner ----
+    # ---- Header ----
+    # BH-173 — назву документа друкуємо ОДИН раз, і саме внизу, у фіскальному
+    # блоці (там вона стоїть і в стандартній формі українського чека). Верхній
+    # банер у зірочках повторював її втретє на кожному чеку й з'їдав три рядки
+    # паперу. Чек починається з назви закладу.
     printer.set(align="center", bold=True, double_height=False, double_width=False)
-    printer.text("*" * width + "\n")
-    printer.set(align="center", bold=True, double_height=True, double_width=False)
-    printer.text(receipt.receipt_type + "\n")
-    printer.set(align="center", bold=True, double_height=False, double_width=False)
-    printer.text("*" * width + "\n")
     if receipt.business_name:
         for line in _wrap_lines(receipt.business_name, width):
             printer.text(line + "\n")
