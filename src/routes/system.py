@@ -60,13 +60,35 @@ WIN_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 WIN_DETACHED_PROCESS = 0x00000008
 
 
+# BH-176 — на вінді оновлення качає БРАУЗЕР, а не ми.
+#
+# Ми пробували зробити це самі: завантажити інсталятор і відкрити його з
+# нашого процесу. Цей шлях щоразу ламався по-різному — то беззвучний режим і
+# невидимий діалог SmartScreen (BH-161), то дитина, що вмирала разом із нами
+# (BH-174), то новий процес не міг зайняти порт, бо старий ще тримав його, і
+# дашборд далі показував стару версію.
+#
+# Той самий інсталятор, завантажений людиною з браузера й запущений руками,
+# ставиться без жодної з цих пригод. Тож кнопка «Оновити» тепер просто віддає
+# браузеру адресу файла: далі все робить сама людина, як вона й робила б.
+WIN_INSTALLER_URL = (
+    "https://github.com/goodpesik/barhandler-manager"
+    "/releases/latest/download/device-handler-setup.exe"
+)
+
+
 @router.get("/version")
 async def get_version() -> dict:
     version = installed_version("unknown")
     # BH-150 — дашборд має знати, чи це встановлений мак-застосунок: кнопку
     # видалення показуємо ЛИШЕ там, де вона справді щось знімає. У скриптовій
     # інсталяції та на вінді за це відповідають їхні власні інсталятори.
-    return {"version": version, "mac_app_install": IS_MAC_APP_INSTALL}
+    return {
+        "version": version,
+        "mac_app_install": IS_MAC_APP_INSTALL,
+        # Порожньо — оновлення робимо самі (мак, скриптова інсталяція).
+        "update_download_url": WIN_INSTALLER_URL if (IS_WIN and FROZEN) else None,
+    }
 
 
 def _mac_host_arch() -> str:
@@ -314,6 +336,18 @@ async def trigger_update(request: Request) -> dict:
     busy = busy_refusal(request)
     if busy is not None:
         raise HTTPException(status_code=409, detail=busy)
+
+    # BH-176 — на вінді ми інсталятор НЕ запускаємо: браузер качає файл, людина
+    # запускає його сама (див. WIN_INSTALLER_URL). Дашборд сюди вже не
+    # звертається, але стара відкрита вкладка може — тоді відповідаємо
+    # адресою, а не мовчазною спробою, яка однаково не спрацює.
+    if IS_WIN and FROZEN:
+        return {
+            "started": False,
+            "interactive": True,
+            "download_url": WIN_INSTALLER_URL,
+            "message": "Завантажте інсталятор і запустіть його — менеджер оновиться",
+        }
 
     argv, desc = _build_update_argv()
 
