@@ -52,6 +52,19 @@ class AcquirerInfo(BaseModel):
     payment_date: Optional[datetime] = None  # timestamp from the physical terminal
 
 
+class FiscalReceiptPayment(BaseModel):
+    """Одна частина оплати чека: спосіб і скільки ним заплатили.
+
+    Чек можуть закрити кількома способами — частину готівкою, решту карткою.
+    Доти модель мала рівно одне поле способу й одну суму, тож на папері
+    друкувався ОДИН спосіб і ВЕСЬ підсумок: «Готівка 300.00» там, де готівкою
+    дали 200, а карткою 100. Екранний чек показував правду, друкований — ні.
+    """
+
+    name: str                               # "Готівка" / "Картка" / "IBAN"
+    sum: float = Field(ge=0)
+
+
 class FiscalReceipt(BaseModel):
     # ---- Header ----
     receipt_type: str = "ФІСКАЛЬНИЙ ЧЕК"   # "ТЕСТОВИЙ ЧЕК" for test mode
@@ -69,6 +82,9 @@ class FiscalReceipt(BaseModel):
     operation: str = "Оплата"              # "Оплата" / "Повернення"
     paid_sum: float = Field(ge=0)          # фактично сплачено
     total_sum: float = Field(ge=0)         # до сплати (зазвичай == paid_sum)
+    # Розбивка оплати. Порожньо — звичайний чек одним способом, і тоді
+    # друкується пара `payment_name` + `paid_sum`, як і раніше.
+    payments: list[FiscalReceiptPayment] = Field(default_factory=list)
 
     # ---- Taxes ----
     taxes: list[FiscalReceiptTax] = Field(default_factory=list)
