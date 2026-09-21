@@ -582,6 +582,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       update_started: "Оновлення запущено!",
       btn_restarting: "Перезапуск…",
       btn_wizard_open: "Пройдіть майстер…",
+      update_downloading: "Завантажуємо інсталятор. Коли скачається — запустіть його; менеджер оновиться сам.",
       update_error: "Помилка оновлення: {err}",
       update_no_recover: "Менеджер не піднявся після оновлення. Останній лог:",
       update_success: "Оновлено до v{cur} ✓",
@@ -714,6 +715,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       update_started: "Update started!",
       btn_restarting: "Restarting…",
       btn_wizard_open: "Finish the wizard…",
+      update_downloading: "Downloading the installer. Run it once it lands — the manager updates itself from there.",
       update_error: "Update error: {err}",
       update_no_recover: "The manager didn't come back up after the update. Last log:",
       update_success: "Updated to v{cur} ✓",
@@ -1298,10 +1300,23 @@ _HTML_TEMPLATE = r"""<!doctype html>
     // (version changed) from a silent no-op (came back on the same
     // version — failed download, port conflict, never restarted).
     let beforeVer = null;
+    let downloadUrl = null;
     try {
       const v = await api("GET", "/version", false);
       beforeVer = v.version || null;
+      downloadUrl = v.update_download_url || null;
     } catch (_) {}
+    // BH-176 — на вінді оновлення качає БРАУЗЕР. Ми пробували завантажувати й
+    // запускати інсталятор самі, і цей шлях ламався щоразу по-новому; той
+    // самий файл, завантажений людиною й запущений руками, ставиться без
+    // пригод. Тож просто віддаємо адресу браузеру.
+    if (downloadUrl) {
+      window.location.href = downloadUrl;
+      showToast(t("update_downloading"), "ok", 12000);
+      btn.disabled = false;
+      btn.textContent = t("btn_update");
+      return;
+    }
     try {
       const res = await api("POST", "/system/update", true);
       showToast(res.message || t("update_started"), "ok", 10000);
