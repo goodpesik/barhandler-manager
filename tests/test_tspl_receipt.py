@@ -21,6 +21,10 @@ class _FakeEscpos:
     def __init__(self) -> None:
         self.raw: list[bytes] = []
         self.cuts = 0
+        # Стан друку (жирність, вирівнювання) — окремим переліком, щоб тести
+        # могли перевіряти не лише ЩО надруковано, а і ЯК. У `raw` його класти
+        # не можна: там байти, які читають інші тести.
+        self.ops: list[tuple[str, object]] = []
 
     def _raw(self, data: bytes) -> None:
         self.raw.append(data)
@@ -28,10 +32,11 @@ class _FakeEscpos:
     def cut(self, *_a, **_k) -> None:
         self.cuts += 1
 
-    def set(self, **_k) -> None:
-        pass
+    def set(self, **kw) -> None:
+        self.ops.append(("set", dict(kw)))
 
     def text(self, s: str) -> None:
+        self.ops.append(("text", str(s)))
         # Записуємо, а не ковтаємо. Заглушка, що мовчки викидає текст, робить
         # фіктивним будь-який тест про те, ЯК той текст поїхав: «сирих байтів
         # немає» стає правдою просто тому, що немає нічого.
@@ -758,3 +763,63 @@ async def test_native_render_mode_is_overridden_on_tspl_hardware():
     assert b"TEST-g9qaC3" not in blob, (
         "текст пішов нативними байтами — TSPL-прошивка їх викине"
     )
+
+
+def test_the_document_name_is_printed_once_and_at_the_bottom():
+    """BH-173 — «ФІСКАЛЬНИЙ ЧЕК» стояв і вгорі банером у зірочках, і внизу.
+
+    Власник: «треба прибрати фіскальний чек - блок повністю з чека бо він
+    місце займає а по факту там внизу ми вже пишемо що він фіскальний».
+    Перевіряємо не «немає банера», а саме РАЗ і саме ВНИЗУ: інакше тест
+    проходив би й тоді, коли назва зникла з чека зовсім.
+
+    Чек беремо БЕЗ QR: його растр — двійкові байти в тому ж потоці, і текст
+    у них не вичитаєш.
+    """
+    from datetime import datetime
+
+    from src.models.fiscal_receipt import FiscalReceipt, FiscalReceiptItem
+    from src.services.fiscal_receipt import render_fiscal_receipt
+
+    receipt = FiscalReceipt(
+        receipt_type="ФІСКАЛЬНИЙ ЧЕК",
+        business_name="ФОП Левинець Максим Сергійович",
+        items=[
+            FiscalReceiptItem(
+                name="Курточка мембранна утеплена",
+                quantity=1,
+                price=3300.0,
+                sum=3300.0,
+                tax_symbol="З",
+            )
+        ],
+        paid_sum=3300.0,
+        total_sum=3300.0,
+        fiscal_number="TEST-g9qaC3",
+        fiscal_date=datetime(2026, 9, 16, 15, 47, 2),
+        cashier="Super Admin",
+    )
+    _dev, esc = _device("escpos")
+
+    render_fiscal_receipt(esc, receipt, chars_per_line=32)
+
+    printed = b"".join(esc.raw).decode("utf-8", errors="ignore")
+    lines = [l for l in printed.splitlines() if l.strip()]
+    hits = [i for i, l in enumerate(lines) if "ФІСКАЛЬНИЙ ЧЕК" in l]
+    assert len(hits) == 1, f"назва документа має бути рівно раз, а не {len(hits)}"
+    # І саме у фіскальному блоці — ПІСЛЯ «Режим роботи» й «ФН ПРРО», а не
+    # просто «десь у другій половині»: інакше тест пройшов би й тоді, коли
+    # назву переставили до підсумків.
+    mode = next(i for i, l in enumerate(lines) if "Режим роботи" in l)
+    assert hits[0] > mode, "назва документа має стояти після фіскального блоку"
+    # Зірочкового банера більше немає взагалі.
+    assert "*" * 10 not in printed, "верхній банер у зірочках лишився"
+    # А чек тепер починається з назви закладу — жирної й по центру.
+    assert "Левинець" in lines[0], f"перший рядок чека: {lines[0]!r}"
+    first_text = next(i for i, (kind, _) in enumerate(esc.ops) if kind == "text")
+    state = {}
+    for kind, payload in esc.ops[:first_text]:
+        if kind == "set":
+            state.update(payload)
+    assert state.get("bold") is True, "назва закладу втратила жирність"
+    assert state.get("align") == "center", "назва закладу з'їхала з центру"
