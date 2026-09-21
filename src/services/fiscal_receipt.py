@@ -182,7 +182,23 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
     # ---- Payment ----
     printer.text(_separator(width) + "\n")
     printer.text(_two_col("Вид операції", receipt.operation, width) + "\n")
-    printer.text(_two_col(receipt.payment_name, f"{_format_money(receipt.paid_sum)} грн", width) + "\n")
+    # Чек могли закрити кількома способами — тоді кожна частина йде своїм
+    # рядком зі СВОЄЮ сумою. Доти друкувався один спосіб і весь підсумок:
+    # «Готівка 300.00» там, де готівкою дали 200, а карткою 100.
+    if receipt.payments:
+        for part in receipt.payments:
+            printer.text(
+                _two_col(part.name, f"{_format_money(part.sum)} грн", width) + "\n"
+            )
+    else:
+        printer.text(
+            _two_col(
+                receipt.payment_name,
+                f"{_format_money(receipt.paid_sum)} грн",
+                width,
+            )
+            + "\n"
+        )
     if receipt.acquirer:
         a = receipt.acquirer
         if a.cardmask:
