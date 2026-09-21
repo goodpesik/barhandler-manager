@@ -283,7 +283,7 @@ def test_the_child_keeps_a_console_so_powershell_survives(tmp_path, monkeypatch)
         system_routes, "_win_script_path", lambda: tmp_path / "update-cmd.ps1"
     )
     monkeypatch.setattr(system_routes, "IS_WIN", True)
-    monkeypatch.setattr(system_routes, "FROZEN", True)
+    monkeypatch.setattr(system_routes, "FROZEN", False)
     monkeypatch.setattr(system_routes, "IS_MAC_APP_INSTALL", False)
 
     from types import SimpleNamespace
@@ -316,7 +316,7 @@ def test_a_launcher_that_dies_at_once_is_not_reported_as_started(tmp_path, monke
         system_routes, "_win_script_path", lambda: tmp_path / "update-cmd.ps1"
     )
     monkeypatch.setattr(system_routes, "IS_WIN", True)
-    monkeypatch.setattr(system_routes, "FROZEN", True)
+    monkeypatch.setattr(system_routes, "FROZEN", False)
     monkeypatch.setattr(system_routes, "IS_MAC_APP_INSTALL", False)
 
     from types import SimpleNamespace
@@ -363,7 +363,7 @@ def test_the_log_handle_is_not_handed_to_the_child_on_windows(tmp_path, monkeypa
         system_routes, "_win_script_path", lambda: tmp_path / "update-cmd.ps1"
     )
     monkeypatch.setattr(system_routes, "IS_WIN", True)
-    monkeypatch.setattr(system_routes, "FROZEN", True)
+    monkeypatch.setattr(system_routes, "FROZEN", False)
     monkeypatch.setattr(system_routes, "IS_MAC_APP_INSTALL", False)
     monkeypatch.setattr(system_routes, "_DEAD_CHILD_GRACE_SECONDS", 0)
 
