@@ -40,6 +40,9 @@ from fastapi import Request
 # роутера); значення — текст для людини, який каса покаже у відмові.
 CRITICAL_OPERATIONS: dict[tuple[str, str], str] = {
     ("POST", "/terminal/charge"): "оплата карткою",
+    # PET-882 — повернення на картку. Гроші їдуть так само, як і при
+    # оплаті, тож оновлення посеред нього так само неприпустиме.
+    ("POST", "/terminal/refund"): "повернення на картку",
     ("POST", "/terminal/{terminal_id}/cancel"): "скасування оплати на терміналі",
     ("POST", "/print/receipt"): "друк чека",
     ("POST", "/print/fiscal"): "друк фіскального чека",
