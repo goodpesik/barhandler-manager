@@ -39,6 +39,7 @@ from typing import Optional
 from src.models.terminal import (
     AcquirerResult,
     ChargeRequest,
+    RefundRequest,
     TerminalDescriptor,
     TerminalKind,
     TerminalNetworkAddress,
@@ -519,25 +520,40 @@ class PrivatBankTerminalAdapter(TerminalAdapter):
             vendor_data=params,
         )
 
-    async def refund(self, request: ChargeRequest, *, rrn: str) -> AcquirerResult:
+    async def refund(self, request: RefundRequest) -> AcquirerResult:
         """Reversal-by-RRN — spec §5.2. Refunds reach back into earlier
         batches (unlike Cancel which is current-batch-only), so RRN is
         the right key. Caller already has the RRN from the original
-        Purchase result we returned."""
+        Purchase result we returned.
+
+        PET-882 — підпис приведений до СПІЛЬНОГО контракту
+        (`TerminalAdapter.refund(RefundRequest)`). Доти метод брав
+        `ChargeRequest` і окремий keyword-only `rrn`, тобто мовчки перекривав
+        базовий іншою формою: спільний маршрут `/terminal/refund` викликав би
+        його одним позиційним аргументом і падав би `TypeError` — тобто 500
+        замість зрозумілого «проведіть вручну» (знайшло ревʼю).
+
+        RRN тут ОБОВʼЯЗКОВИЙ: без нього банку нічого шукати, і краще не
+        починати, ніж відмовитись уже перед людиною.
+        """
+        if not request.rrn:
+            raise TerminalUnavailable(
+                "refund needs the rrn of the payment",
+                code="missing_refund_reference",
+            )
         merchant_id = (
             request.merchant_id
             or self.registration.default_merchant_id
             or "0"
         )
+        discount = request.extras.get("discounted_amount_kopecks")
         params: dict = {
             "amount": _format_amount(request.amount_kopecks),
             "discount": (
-                _format_amount(request.discounted_amount_kopecks)
-                if request.discounted_amount_kopecks is not None
-                else ""
+                _format_amount(int(discount)) if discount is not None else ""
             ),
             "merchantId": str(merchant_id),
-            "rrn": rrn,
+            "rrn": request.rrn,
         }
         response = await self._send(
             {"method": "Refund", "step": 0, "params": params},

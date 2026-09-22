@@ -251,6 +251,7 @@ def test_money_and_paper_routes_are_critical() -> None:
     із самої таблиці: інакше тест погодиться з будь-яким її станом."""
     for key in [
         ("POST", "/terminal/charge"),
+        ("POST", "/terminal/refund"),
         ("POST", "/terminal/{terminal_id}/cancel"),
         ("POST", "/print/receipt"),
         ("POST", "/print/fiscal"),

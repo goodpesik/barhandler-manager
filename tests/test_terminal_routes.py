@@ -389,3 +389,114 @@ def test_endpoints_require_api_key(client_with_terminal: TestClient) -> None:
     """No X-Api-Key → 401. Same posture as the printer routes."""
     response = client_with_terminal.post("/terminal/discover")
     assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------
+# PET-882 — /terminal/refund
+# ---------------------------------------------------------------------
+
+
+def test_refund_endpoint_returns_acquirer_result(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    """Каса створює проводку повернення й фіскальний чек ЛИШЕ за цим
+    `status == "ok"`, тож він мусить доходити до неї цілим."""
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    fake_result = AcquirerResult(
+        status="ok",
+        rrn="8888888888",
+        auth_code="654321",
+        raw_transaction_result="APPROVED",
+    )
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.refund",
+        new=AsyncMock(return_value=fake_result),
+    ):
+        response = client_with_terminal.post(
+            "/terminal/refund",
+            headers=auth_headers,
+            json={
+                "amount_kopecks": 24500,
+                "rrn": "9999999999",
+                "transaction_uid": "refund-intent-1",
+            },
+        )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["result"]["status"] == "ok"
+    # Номери САМОГО повернення, а не оплати: саме вони йдуть у чек.
+    assert body["result"]["rrn"] == "8888888888"
+
+
+def test_refund_endpoint_passes_the_idempotency_key_through(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    """Ключ їде від каси до термінала не зміненим — інакше повтор створив
+    би друге повернення."""
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    spy = AsyncMock(return_value=AcquirerResult(status="ok"))
+    with patch("src.services.terminals.ssi.SSITerminalAdapter.refund", new=spy):
+        client_with_terminal.post(
+            "/terminal/refund",
+            headers=auth_headers,
+            json={
+                "amount_kopecks": 100,
+                "rrn": "1",
+                "transaction_uid": "refund-intent-7",
+                "extras": {"operation": "Refund"},
+            },
+        )
+    sent = spy.await_args.args[0]
+    assert sent.transaction_uid == "refund-intent-7"
+    assert sent.extras["operation"] == "Refund"
+
+
+def test_refund_endpoint_surfaces_a_declined_refund_as_an_answer(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    """Відмова банку — це відповідь, а не збій: касир мусить побачити
+    «відхилено» й піти проводити руками, і саме за цим каса НЕ створить
+    фіскального чека."""
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.refund",
+        new=AsyncMock(return_value=AcquirerResult(status="declined")),
+    ):
+        response = client_with_terminal.post(
+            "/terminal/refund",
+            headers=auth_headers,
+            json={"amount_kopecks": 100, "rrn": "1"},
+        )
+    assert response.status_code == 200
+    assert response.json()["result"]["status"] == "declined"
+
+
+def test_refund_endpoint_surfaces_terminal_unavailable_as_503(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.refund",
+        new=AsyncMock(
+            side_effect=TerminalUnavailable("nope", code="refund_unsupported"),
+        ),
+    ):
+        response = client_with_terminal.post(
+            "/terminal/refund",
+            headers=auth_headers,
+            json={"amount_kopecks": 100, "rrn": "1"},
+        )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "refund_unsupported"
+
+
+def test_refund_without_registered_terminal_returns_no_terminal(
+    client_with_terminal: TestClient, auth_headers: dict,
+) -> None:
+    response = client_with_terminal.post(
+        "/terminal/refund",
+        headers=auth_headers,
+        json={"amount_kopecks": 100, "rrn": "1"},
+    )
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "no_terminal"

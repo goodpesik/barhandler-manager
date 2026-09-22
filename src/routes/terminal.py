@@ -22,6 +22,7 @@ from pydantic import BaseModel, Field
 from src.devices.terminal_registry import TerminalRegistry, UnknownTerminal
 from src.models.terminal import (
     ChargeRequest,
+    RefundRequest,
     MerchantBinding,
     MerchantNicknameUpdate,
     TerminalKind,
@@ -332,6 +333,53 @@ async def charge(
             },
         )
     log.info("[charge] terminal=%s result=%s", used_id, result.model_dump_json())
+    return {"terminal_id": used_id, "result": result.model_dump()}
+
+
+@router.post("/refund")
+async def refund(
+    payload: RefundRequest,
+    request: Request,
+    terminal_id: Optional[str] = None,
+) -> dict:
+    """PET-882 — гроші назад на ту саму картку.
+
+    Дзеркало `/charge`: один виклик, чекаємо на остаточну відповідь
+    термінала, віддаємо той самий `AcquirerResult`. Каса створює проводку
+    повернення й фіскальний чек ЛИШЕ після `status == "ok"` — саме тому тут
+    важливо не вдавати успіх: відмова термінала їде назад як відмова, а не
+    як порожній результат.
+
+    Який саме операцією повертати, вирішує каса (`choose_refund_operation`)
+    і кладе в `extras.operation`; замовчування — `Refund`, бо воно працює
+    завжди, коли відомі номери оплати.
+    """
+    import logging
+    log = logging.getLogger("src.routes.terminal")
+    adapter, used_id = _resolve(request, terminal_id)
+    log.info(
+        "[refund] terminal=%s payload=%s", used_id, payload.model_dump_json(),
+    )
+    try:
+        result = await adapter.refund(payload)
+    except TerminalUnavailable as exc:
+        log.warning(
+            "[refund] terminal=%s TerminalUnavailable code=%s msg=%s",
+            used_id, getattr(exc, "code", None), exc,
+        )
+        raise _surface_terminal_error(exc)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001 — surface root cause instead of bare 500
+        log.exception("[refund] terminal=%s unhandled error: %s", used_id, exc)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "internal_error",
+                "message": f"{type(exc).__name__}: {exc}",
+            },
+        )
+    log.info("[refund] terminal=%s result=%s", used_id, result.model_dump_json())
     return {"terminal_id": used_id, "result": result.model_dump()}
 
 
