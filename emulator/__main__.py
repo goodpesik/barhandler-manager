@@ -131,9 +131,14 @@ def _banner(bank: Bank, host: str, port: int, manager_port: int) -> None:
 def _prompt_outcome(pending: Pending) -> str:
     amount = _format_amount(pending.amount_kopecks, pending.currency)
     console.print()
+    # BH-177 — видно, ЩО саме підтверджують: повернення від оплати тут
+    # відрізняється лише написом, а гроші йдуть у протилежні боки.
+    icon = "💳" if pending.kind == "purchase" else "↩️"
+    reference = f"\n{pending.reference}" if pending.reference else ""
     console.print(Panel(
-        Text(f"💳  Оплата на {amount}", style="bold white"),
-        border_style="magenta", title="Нова транзакція",
+        Text(f"{icon}  {pending.label} на {amount}{reference}", style="bold white"),
+        border_style="magenta" if pending.kind == "purchase" else "yellow",
+        title="Нова транзакція",
     ))
     choice = questionary.select(
         "Що робить термінал?",

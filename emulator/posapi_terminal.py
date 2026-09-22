@@ -49,7 +49,10 @@ class PosApiTerminalEmulator(BankEmulator):
             return self._purchase(request)
         if fn == "GET_LAST":
             return self._approved(request.get("reference"))
-        return {"function": fn, "responseCode": "00"}
+        # BH-177 — невідома функція мусить відмовити, а не віддавати «успіх».
+        return {"function": fn, "responseCode": "99",
+                "approved": False,
+                "responseText": f"функція {fn!r} емулятором не підтримується"}
 
     def _purchase(self, request: dict) -> dict:
         amount = int(request.get("amount") or 0)

@@ -50,7 +50,9 @@ class BposTerminalEmulator(BankEmulator):
             return self._purchase(request)
         if cmd == "95":
             return self._approved("95")
-        return {"cmd": cmd, "result": "0"}
+        # BH-177 — невідома команда мусить відмовити, а не віддавати «успіх».
+        return {"cmd": cmd, "result": "1",
+                "message": f"команда {cmd!r} емулятором не підтримується"}
 
     def _purchase(self, request: dict) -> dict:
         amount = _amount_to_kopecks(request.get("amount"))
