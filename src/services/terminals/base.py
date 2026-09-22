@@ -20,6 +20,7 @@ from typing import Optional
 from src.models.terminal import (
     AcquirerResult,
     ChargeRequest,
+    RefundRequest,
     TerminalDescriptor,
     TerminalRegistration,
 )
@@ -108,6 +109,23 @@ class TerminalAdapter(ABC):
         """End-to-end Purchase: send request, poll status until S00,
         retrieve final result via GetLastResult. Returns a normalised
         AcquirerResult; the caller doesn't need to know about SSI."""
+
+    async def refund(self, request: RefundRequest) -> AcquirerResult:
+        """PET-882 — гроші назад на ту саму картку.
+
+        НЕ абстрактний навмисно. Адаптерів кілька, і повернення вміє поки
+        що не кожен банк; зробити метод обовʼязковим означало б одразу
+        зламати всі інші адаптери або нашвидкуруч дописати їм заглушки,
+        які мовчки вдають, що щось повернули.
+
+        Замість цього замовчування чесно каже «не вмію»: сервер на це
+        відповість касиру «проведіть повернення на терміналі вручну» — той
+        самий шлях, яким усе працювало досі.
+        """
+        raise TerminalUnavailable(
+            "this terminal cannot refund from the cash register",
+            code="refund_unsupported",
+        )
 
     @abstractmethod
     async def cancel(self) -> None:

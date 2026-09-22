@@ -162,6 +162,35 @@ class ChargeRequest(BaseModel):
     extras: dict = Field(default_factory=dict)  # splitData etc — passed through
 
 
+class RefundRequest(BaseModel):
+    """PET-882 — гроші назад на ту саму картку, через термінал.
+
+    Протокол уміє це двома різними операціями, і вони не взаємозамінні:
+
+    * ``Void`` / ``PartialVoid`` скасовує операцію ДНЯ за номером чека на
+      терміналі (``invoice_num``) і працює лише доти, доки не зроблено
+      звірку підсумків. Після звірки операції вже немає що скасовувати.
+    * ``Refund`` — окрема операція повернення за ``rrn`` та/або
+      ``auth_code``; днем не обмежена, але потребує саме цих номерів і
+      того ж мерчанта.
+
+    Тому спосіб вибирає той, хто знає обставини (див.
+    ``choose_refund_operation``), а не адаптер.
+    """
+
+    amount_kopecks: int = Field(gt=0)
+    currency: str = "980"
+    merchant_id: Optional[str] = None
+    # Наш ключ ідемпотентності: народжується разом із наміром повернути,
+    # а не в момент кліку, тож повтор не зробить другого повернення.
+    transaction_uid: Optional[str] = None
+    # Від початкової оплати. Що з цього потрібно — вирішує операція.
+    rrn: Optional[str] = None
+    auth_code: Optional[str] = None
+    invoice_num: Optional[str] = None
+    extras: dict = Field(default_factory=dict)
+
+
 class AcquirerResult(BaseModel):
     """Unified outcome the FiscalReceipt `acquirer` block consumes."""
 

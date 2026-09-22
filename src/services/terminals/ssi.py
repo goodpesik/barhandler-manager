@@ -30,6 +30,7 @@ from typing import Optional
 from src.models.terminal import (
     AcquirerResult,
     ChargeRequest,
+    RefundRequest,
     TerminalDescriptor,
     TerminalKind,
     TerminalNetworkAddress,
@@ -470,6 +471,141 @@ class SSITerminalAdapter(TerminalAdapter):
                     "[%s] GetLastReceipt failed: %s (charge still ok)",
                     self.descriptor.id, exc,
                 )
+        return result
+
+    async def refund(self, request: RefundRequest) -> AcquirerResult:
+        """PET-882 — гроші назад на ту саму картку.
+
+        Той самий танець, що й у ``charge``: надсилаємо, чекаємо, поки
+        термінал повернеться в спокій, і забираємо остаточний результат
+        через ``GetLastResult``. Одноетапно — другого кроку повернення не
+        має, картку тут не читають.
+
+        Операцію (``Void`` / ``PartialVoid`` / ``Refund``) вибирає той, хто
+        знає обставини: ``choose_refund_operation`` у сусідньому модулі. Тут
+        ми лише складаємо параметри, яких вимагає саме ця операція, і
+        вимагаємо їх ЯВНО — ``Void`` без номера чека або ``Refund`` без rrn і
+        коду авторизації термінал прийняв би й відмовив уже перед людиною.
+        """
+        merchant_id = (
+            request.merchant_id
+            or self.registration.default_merchant_id
+            or ""
+        )
+        if not merchant_id:
+            raise TerminalUnavailable(
+                "no merchant_id provided and registration has no default",
+                code="missing_merchant",
+            )
+
+        operation = request.extras.get("operation") or "Refund"
+        if operation not in ("Refund", "Void", "PartialVoid"):
+            raise TerminalUnavailable(
+                f"unknown refund operation {operation!r}",
+                code="bad_refund_operation",
+            )
+
+        params: dict = {
+            "transAmount": str(request.amount_kopecks),
+            "transCurrency": request.currency,
+            "merchantId": merchant_id,
+        }
+        if operation == "Refund":
+            # Повернення живе за номерами САМОЇ оплати; без них банку нічого
+            # шукати. Який саме з двох потрібен, залежить від профілю
+            # термінала, тож віддаємо обидва, коли вони є.
+            if not request.rrn and not request.auth_code:
+                raise TerminalUnavailable(
+                    "refund needs the rrn or the auth code of the payment",
+                    code="missing_refund_reference",
+                )
+            if request.rrn:
+                params["rrn"] = request.rrn
+            if request.auth_code:
+                params["authCode"] = request.auth_code
+        else:
+            # Скасування — за номером чека на самому терміналі.
+            if not request.invoice_num:
+                raise TerminalUnavailable(
+                    "void needs the terminal receipt number",
+                    code="missing_invoice_num",
+                )
+            params["invoiceNum"] = request.invoice_num
+
+        if request.transaction_uid:
+            params["transactionUid"] = request.transaction_uid
+        if self.registration.default_terminal_id:
+            params["terminalId"] = self.registration.default_terminal_id
+        for k, v in request.extras.items():
+            if k == "operation":
+                continue
+            params.setdefault(k, v)
+
+        logger.info(
+            "[%s] %s starting: amount=%s merchant=%s uid=%s",
+            self.descriptor.id,
+            operation,
+            request.amount_kopecks,
+            merchant_id,
+            request.transaction_uid,
+        )
+        from src.services.log_uplink import emit_event
+        emit_event(
+            "refund_started",
+            terminal_id=self.descriptor.id,
+            operation=operation,
+            amount_kopecks=request.amount_kopecks,
+            merchant_id=merchant_id,
+            transaction_uid=request.transaction_uid,
+        )
+
+        ack = await self._send({"method": operation, "params": params})
+        # Відмова оператора чи банку — це ЗАКОННИЙ результат операції, а не
+        # збій сервісу: касир мусить побачити «відхилено» й піти проводити
+        # руками, а не помилку з'єднання.
+        business = _business_error_to_result(ack)
+        if business is not None:
+            logger.info(
+                "[%s] %s business-rejected at ack: status=%s code=%s",
+                self.descriptor.id, operation, business.status,
+                business.error_code,
+            )
+            emit_event(
+                "refund_declined",
+                terminal_id=self.descriptor.id,
+                operation=operation,
+                code=business.error_code,
+                transaction_uid=request.transaction_uid,
+            )
+            return business
+        _raise_if_error(ack, default_code="refund_rejected")
+
+        await self._wait_idle()
+        result = await self.get_last_result(
+            transaction_uid=request.transaction_uid,
+        )
+        logger.info(
+            "[%s] %s final: status=%s raw=%s rrn=%s auth=%s",
+            self.descriptor.id,
+            operation,
+            result.status,
+            result.raw_transaction_result,
+            result.rrn,
+            result.auth_code,
+        )
+        emit_event(
+            {
+                "ok": "refund_approved",
+                "declined": "refund_declined",
+                "cancelled": "refund_cancelled",
+            }.get(result.status, "refund_other"),
+            terminal_id=self.descriptor.id,
+            operation=operation,
+            rrn=result.rrn,
+            auth_code=result.auth_code,
+            raw=result.raw_transaction_result,
+            transaction_uid=request.transaction_uid,
+        )
         return result
 
     async def _wait_idle(self) -> Optional[str]:

@@ -17,6 +17,7 @@ import pytest
 
 from src.models.terminal import (
     ChargeRequest,
+    RefundRequest,
     TerminalDescriptor,
     TerminalKind,
     TerminalNetworkAddress,
@@ -368,3 +369,152 @@ async def test_probe_returns_none_for_closed_port() -> None:
     server.close()
     await server.wait_closed()
     assert await SSITerminalAdapter.probe("127.0.0.1", port) is None
+
+
+# ---------------------------------------------------------------------
+# PET-882 — refunds
+# ---------------------------------------------------------------------
+
+_OK_ACK = {"error": False, "errorCode": "", "errorDescription": "", "params": {}}
+_IDLE = {
+    "method": "GetStatus", "error": False, "errorCode": "",
+    "errorDescription": "", "status": "S00", "params": {},
+}
+
+
+def _approved(method: str = "GetLastResult") -> dict:
+    return {
+        "method": method, "error": False, "errorCode": "", "errorDescription": "",
+        "params": {
+            "transactionResult": "APPROVED",
+            "rrn": "1111111111111",
+            "authCode": "AUTH99",
+            "invoiceNum": "000777",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_refund_sends_the_payment_numbers_it_lives_by() -> None:
+    """Повернення банк шукає за номерами САМОЇ оплати. Без них йому нічого
+    знайти, і відмова прийде вже перед людиною."""
+    async with MockTerminal({
+        "Refund": [{"method": "Refund", **_OK_ACK}],
+        "GetStatus": [_IDLE],
+        "GetLastResult": [_approved()],
+    }) as mock:
+        adapter = SSITerminalAdapter(_registration(mock.port))
+        result = await adapter.refund(RefundRequest(
+            amount_kopecks=24500,
+            rrn="9999999999999",
+            auth_code="AUTH01",
+        ))
+        assert result.status == "ok"
+        sent = next(r for r in mock.requests if r.get("method") == "Refund")
+        assert sent["params"]["rrn"] == "9999999999999"
+        assert sent["params"]["authCode"] == "AUTH01"
+        assert sent["params"]["transAmount"] == "24500"
+        assert sent["params"]["merchantId"] == "000000060007176"
+
+
+@pytest.mark.asyncio
+async def test_refund_refuses_to_go_without_a_reference() -> None:
+    """Термінал прийняв би такий запит і відмовив; краще не починати."""
+    async with MockTerminal({}) as mock:
+        adapter = SSITerminalAdapter(_registration(mock.port))
+        with pytest.raises(TerminalUnavailable):
+            await adapter.refund(RefundRequest(amount_kopecks=100))
+        assert mock.requests == []
+
+
+@pytest.mark.asyncio
+async def test_void_cancels_by_the_terminal_receipt_number() -> None:
+    async with MockTerminal({
+        "Void": [{"method": "Void", **_OK_ACK}],
+        "GetStatus": [_IDLE],
+        "GetLastResult": [_approved()],
+    }) as mock:
+        adapter = SSITerminalAdapter(_registration(mock.port))
+        result = await adapter.refund(RefundRequest(
+            amount_kopecks=24500,
+            invoice_num="000777",
+            extras={"operation": "Void"},
+        ))
+        assert result.status == "ok"
+        sent = next(r for r in mock.requests if r.get("method") == "Void")
+        assert sent["params"]["invoiceNum"] == "000777"
+        # Номери оплати скасуванню не потрібні — і не мусять летіти туди.
+        assert "rrn" not in sent["params"]
+
+
+@pytest.mark.asyncio
+async def test_void_refuses_to_go_without_a_receipt_number() -> None:
+    async with MockTerminal({}) as mock:
+        adapter = SSITerminalAdapter(_registration(mock.port))
+        with pytest.raises(TerminalUnavailable):
+            await adapter.refund(RefundRequest(
+                amount_kopecks=100, extras={"operation": "Void"},
+            ))
+        assert mock.requests == []
+
+
+@pytest.mark.asyncio
+async def test_partial_void_is_its_own_method() -> None:
+    async with MockTerminal({
+        "PartialVoid": [{"method": "PartialVoid", **_OK_ACK}],
+        "GetStatus": [_IDLE],
+        "GetLastResult": [_approved()],
+    }) as mock:
+        adapter = SSITerminalAdapter(_registration(mock.port))
+        await adapter.refund(RefundRequest(
+            amount_kopecks=5000,
+            invoice_num="000777",
+            extras={"operation": "PartialVoid"},
+        ))
+        assert any(r.get("method") == "PartialVoid" for r in mock.requests)
+
+
+@pytest.mark.asyncio
+async def test_refund_carries_our_idempotency_key() -> None:
+    """Ключ народжується разом із наміром повернути; без нього другий клік
+    касира зробив би друге повернення."""
+    async with MockTerminal({
+        "Refund": [{"method": "Refund", **_OK_ACK}],
+        "GetStatus": [_IDLE],
+        "GetResultByUid": [_approved("GetResultByUid")],
+    }) as mock:
+        adapter = SSITerminalAdapter(_registration(mock.port))
+        await adapter.refund(RefundRequest(
+            amount_kopecks=100, rrn="1", transaction_uid="refund-intent-1",
+        ))
+        sent = next(r for r in mock.requests if r.get("method") == "Refund")
+        assert sent["params"]["transactionUid"] == "refund-intent-1"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_refund_is_an_answer_not_a_service_error() -> None:
+    """Касир мусить побачити «відхилено» й піти проводити руками, а не
+    помилку з'єднання."""
+    async with MockTerminal({
+        "Refund": [{"method": "Refund", **_OK_ACK}],
+        "GetStatus": [_IDLE],
+        "GetLastResult": [{
+            "method": "GetLastResult", "error": False, "errorCode": "",
+            "errorDescription": "",
+            "params": {"transactionResult": "DECLINED-ONLINE", "responseCode": "05"},
+        }],
+    }) as mock:
+        adapter = SSITerminalAdapter(_registration(mock.port))
+        result = await adapter.refund(RefundRequest(amount_kopecks=100, rrn="1"))
+        assert result.status == "declined"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_operation_never_reaches_the_terminal() -> None:
+    async with MockTerminal({}) as mock:
+        adapter = SSITerminalAdapter(_registration(mock.port))
+        with pytest.raises(TerminalUnavailable):
+            await adapter.refund(RefundRequest(
+                amount_kopecks=100, rrn="1", extras={"operation": "Purchase"},
+            ))
+        assert mock.requests == []
