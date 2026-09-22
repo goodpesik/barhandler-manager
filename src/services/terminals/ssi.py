@@ -580,7 +580,30 @@ class SSITerminalAdapter(TerminalAdapter):
             return business
         _raise_if_error(ack, default_code="refund_rejected")
 
-        await self._wait_idle()
+        idle_status = await self._wait_idle()
+        # S08 — термінал чекає на ДРУГИЙ крок. У поверненні другого кроку
+        # немає, тож такий стан означає, що термінал завис посеред операції.
+        # Забрати `GetLastResult` звідси означало б видати проміжний результат
+        # (без rrn і коду авторизації) за остаточний, а термінал лишити
+        # незакритим — наступна операція на ньому відмовила б (знайшло ревʼю).
+        # Тому: відпускаємо термінал і кажемо касиру, що результат невідомий.
+        if idle_status == "S08":
+            logger.warning(
+                "[%s] %s parked in S08 with no second step — interrupting",
+                self.descriptor.id, operation,
+            )
+            with _suppress(Exception):
+                await self.cancel()
+            emit_event(
+                "refund_stuck",
+                terminal_id=self.descriptor.id,
+                operation=operation,
+                transaction_uid=request.transaction_uid,
+            )
+            raise TerminalUnavailable(
+                f"{operation} left the terminal waiting for a second step",
+                code="refund_incomplete",
+            )
         result = await self.get_last_result(
             transaction_uid=request.transaction_uid,
         )

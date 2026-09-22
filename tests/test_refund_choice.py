@@ -71,26 +71,58 @@ class TestUncertaintyFallsBackToRefund:
     """Кожна невизначеність веде до Refund: він працює завжди, коли є
     номери оплати, а Void у сумнівному випадку просто відмовить."""
 
-    def test_settlement_unknown_still_allows_void_when_all_else_matches(
-        self,
-    ) -> None:
-        # Звірку ми не завжди бачимо; решта збіглась — пробуємо дешевший шлях.
-        assert choose_refund_operation(ctx(settled=None)) == "Void"
+    def test_settlement_unknown_is_enough_on_its_own(self) -> None:
+        """Раніше тут стояло протилежне — тест фіксував ваду як правильну
+        поведінку. Звірка могла вже пройти, а прапорець просто ніхто не
+        встиг виставити: тоді Void відмовляє вже перед людиною."""
+        assert choose_refund_operation(ctx(settled=None)) == "Refund"
 
-    def test_but_unknown_settlement_never_rescues_a_mismatch(self) -> None:
-        assert (
-            choose_refund_operation(ctx(settled=None, current_terminal_id="T2"))
-            == "Refund"
-        )
+    def test_void_needs_to_KNOW_there_was_no_settlement(self) -> None:
+        assert choose_refund_operation(ctx(settled=False)) == "Void"
 
     def test_every_single_mismatch_is_enough_on_its_own(self) -> None:
         """Жодна з умов не «перекривається» іншою: приберемо по одній —
         і щоразу маємо Refund. Інакше зайва умова тихо нічого не робила б."""
         for over in (
             {"settled": True},
+            {"settled": None},
             {"paid_at": datetime(2026, 9, 20, 9, 0)},
             {"invoice_num": None},
             {"paid_terminal_id": None},
             {"current_terminal_id": "T9"},
         ):
             assert choose_refund_operation(ctx(**over)) == "Refund", over
+
+
+class TestEveryAdapterAnswersTheSameRefundContract:
+    """PET-882 — спільний маршрут `/terminal/refund` кличе `adapter.refund`
+    ОДНИМ позиційним аргументом. Адаптер із власним `refund` іншої форми
+    тихо перекриває базовий, і виклик падає `TypeError` — тобто 500 замість
+    зрозумілого «проведіть вручну». Саме так і сталося з PrivatBank, поки
+    ревʼю це не знайшло; перевіряємо ВСІ адаптери, а не той один."""
+
+    def test_signature_matches_the_base_everywhere(self) -> None:
+        import inspect
+
+        from src.services.terminals.base import TerminalAdapter
+        from src.services.terminals.bpos import BposTerminalAdapter
+        from src.services.terminals.oschad import OschadTerminalAdapter
+        from src.services.terminals.posapi import PosApiTerminalAdapter
+        from src.services.terminals.privatbank import PrivatBankTerminalAdapter
+        from src.services.terminals.ssi import SSITerminalAdapter
+
+        adapters = [
+            BposTerminalAdapter,
+            OschadTerminalAdapter,
+            PosApiTerminalAdapter,
+            PrivatBankTerminalAdapter,
+            SSITerminalAdapter,
+        ]
+        # Перелік іменований, а не виведений з модуля: інакше тест погодився
+        # б із тим, що якийсь адаптер просто зник із перевірки.
+        assert len(adapters) == 5
+
+        base = list(inspect.signature(TerminalAdapter.refund).parameters)
+        for cls in adapters:
+            got = list(inspect.signature(cls.refund).parameters)
+            assert got == base, f"{cls.__name__}.refund{tuple(got)}"

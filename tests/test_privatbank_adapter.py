@@ -26,6 +26,7 @@ import pytest
 
 from src.models.terminal import (
     ChargeRequest,
+    RefundRequest,
     TerminalDescriptor,
     TerminalKind,
     TerminalNetworkAddress,
@@ -408,8 +409,7 @@ async def test_refund_carries_rrn_in_request() -> None:
     }) as mock:
         adapter = PrivatBankTerminalAdapter(_registration(mock.port))
         result = await adapter.refund(
-            ChargeRequest(amount_kopecks=12300),
-            rrn="9999999999999",
+            RefundRequest(amount_kopecks=12300, rrn="9999999999999"),
         )
         refund = next(r for r in mock.requests if r.get("method") == "Refund")
         assert refund["params"]["rrn"] == "9999999999999"

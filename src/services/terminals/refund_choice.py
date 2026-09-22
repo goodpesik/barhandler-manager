@@ -36,7 +36,8 @@ class RefundContext:
     current_terminal_id: Optional[str]
     #: Чи повертаємо всю суму оплати.
     full_amount: bool
-    #: Чи вже робили звірку підсумків після тієї оплати. ``None`` — не знаємо.
+    #: Чи вже робили звірку підсумків після тієї оплати. ``None`` — не знаємо,
+    #: і це веде до ``Refund``: невідоме тут коштує відмови перед людиною.
     settled: Optional[bool] = None
 
 
@@ -53,7 +54,11 @@ def choose_refund_operation(ctx: RefundContext) -> RefundOperation:
     ще не було. Заборонна форма («усе, крім…») пропускала б кожен новий
     випадок, який колись зʼявиться.
     """
-    if ctx.settled is True:
+    # НЕ `is True`: «не знаємо» — теж не привід скасовувати. Void після
+    # звірки просто відмовить, і касир дізнається про це вже перед людиною,
+    # тож дозволяємо його ЛИШЕ коли достеменно відомо, що звірки не було
+    # (знайшло ревʼю: докстрінг обіцяв саме це, а код пускав `None`).
+    if ctx.settled is not False:
         return "Refund"
     if not ctx.invoice_num:
         return "Refund"
