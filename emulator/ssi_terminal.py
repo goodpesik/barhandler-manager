@@ -28,6 +28,18 @@ S_IDLE = "S00"
 S_BUSY = "S02"
 S_SECOND_STEP = "S08"
 
+#: Операції повернення, які шле `ssi.refund` → вид для консолі (BH-177).
+REFUND_METHODS = {
+    "Refund": "refund",
+    "Void": "void",
+    "PartialVoid": "partial_void",
+}
+
+
+def _error(code: str, description: str) -> dict:
+    """Конверт помилки в тій формі, яку читає адаптер (`_raise_if_error`)."""
+    return {"error": True, "errorCode": code, "errorDescription": description}
+
 
 def calc_lrc(payload: bytes) -> int:
     lrc = 0
@@ -89,6 +101,54 @@ class SSITerminalEmulator(BankEmulator):
             self.interrupt_current()
             self.phase = 2
             return {"error": False}
+        if method in REFUND_METHODS:
+            return self._refund(method, request)
+        # BH-177 — невідомий метод мусить ВІДМОВИТИ.
+        #
+        # Доти тут стояло `return {"error": False}`, і будь-яка команда, якої
+        # емулятор не знає, проходила як успіх: адаптер бачив ack без помилки,
+        # `GetStatus` віддавав S00, а `GetLastResult` — APPROVED із вигаданими
+        # rrn і кодом авторизації, ніякого оператора не питаючи. Саме так
+        # «працювали» повернення, яких емулятор не вмів зовсім: перевірка на
+        # ньому проходила завжди, хоч би що було в адаптері.
+        return _error("unknown_method", f"метод {method!r} емулятор не підтримує")
+
+    def _refund(self, method: str, message: dict) -> dict:
+        """Повернення й скасування (BH-177). Одноетапні: картку не читають.
+
+        Обовʼязкові параметри вимагаємо так само, як справжній термінал:
+        `Refund` живе за номерами САМОЇ оплати (rrn або код авторизації), а
+        `Void`/`PartialVoid` — за номером чека на терміналі. Без них банку
+        нічого шукати, і мовчки «схвалити» таке означало б те саме, що
+        емулятор робив раніше.
+        """
+        params = message.get("params") or {}
+        if method == "Refund":
+            reference = str(params.get("rrn") or params.get("authCode") or "")
+            if not reference:
+                return _error(
+                    "missing_refund_reference",
+                    "повернення потребує rrn або authCode оплати",
+                )
+        else:
+            reference = str(params.get("invoiceNum") or "")
+            if not reference:
+                return _error(
+                    "missing_invoice_num",
+                    "скасування потребує номера чека (invoiceNum)",
+                )
+
+        self.current = Pending(
+            amount_kopecks=int(params.get("transAmount") or 0),
+            currency=str(params.get("transCurrency") or "980"),
+            kind=REFUND_METHODS[method],
+            reference=f"за {reference}",
+        )
+        # Другого кроку немає, тож одразу «виконується»: `GetStatus` віддає
+        # S02, поки оператор не вирішив, і S00 після. Саме цього чекає
+        # `ssi.refund` — S08 він трактує як зависання.
+        self.phase = 2
+        self.decisions.put(self.current)
         return {"error": False}
 
     def _purchase(self, message: dict) -> dict:

@@ -5,7 +5,7 @@ manager flow with no hardware:
 
 | Run | Emulates | What you do |
 |---|---|---|
-| `python3 -m emulator` | **POS terminal** — any supported bank (SSI / Privat / PosAPI / BPOS / Oschad) | pick a bank, approve / decline / cancel charges from a console menu |
+| `python3 -m emulator` | **POS terminal** — any supported bank (SSI / Privat / PosAPI / BPOS / Oschad) | pick a bank, approve / decline / cancel charges **and refunds** from a console menu |
 | `python3 -m emulator.printer` | **ESC/POS thermal printer** (RAW/9100) | watch receipts render live in your browser |
 | `python3 -m emulator.label_printer` | **TSPL label printer** (RAW/9100) | watch labels render live in your browser |
 | `python3 -m emulator.fiscal_epos` | **Epson RT fiscal printer** (Fiscal ePOS-Print / EpsonFPMate, HTTP) | watch Documenti Commerciali render live; test Z/X + error 17 |
@@ -154,9 +154,18 @@ it appears in the viewer instantly. Wire detail → `label-emulator.log`.
 
 Emulates the **terminal side** of every ECR protocol the manager supports, so
 you can exercise the full `barhandler-manager → terminal` flow — discover,
-register, charge, approve/decline/cancel — with no real hardware. Pick which
-bank to emulate at startup, and **switch banks while idle** without
+register, charge, refund, approve/decline/cancel — with no real hardware. Pick
+which bank to emulate at startup, and **switch banks while idle** without
 restarting.
+
+**Refunds** (BH-177) work on the two protocols whose adapters can refund at
+all — SSI (`Refund` / `Void` / `PartialVoid`) and PrivatBank (`Refund`). The
+console says which one it is asking about, and the emulator refuses a refund
+that arrives without the key the real terminal needs: `rrn` or `authCode` for
+a refund, the terminal receipt number for a void. PosAPI / BPOS / Oschad have
+no refund in the manager either (`base.refund` answers `refund_unsupported`),
+so their emulators do not pretend to have one: an unknown command is refused,
+never answered with a quiet "success".
 
 | Bank(s) | Protocol | Default port | `kind` |
 |---|---|---|---|
@@ -215,8 +224,8 @@ a real one.
 
 1. Start the emulator, pick a bank, register it (above).
 2. In the app: card payment → pick the emulator terminal → Pay.
-3. The emulator console shows the amount and an arrow-key menu:
-   **Approve / Decline / Cancel** (↑/↓, Enter).
+3. The emulator console shows the operation (Оплата / ПОВЕРНЕННЯ / СКАСУВАННЯ),
+   the amount, and an arrow-key menu: **Approve / Decline / Cancel** (↑/↓, Enter).
 4. The app receives the matching outcome (approved / declined / cancelled).
 
 Wire traffic is logged to `emulator.log` (`tail -f emulator.log`).

@@ -52,7 +52,9 @@ class OschadTerminalEmulator(BankEmulator):
             return self._sale(request)
         if op == "last":
             return self._approved("last")
-        return {"op": op, "rc": "000"}
+        # BH-177 — невідома операція мусить відмовити, а не віддавати «успіх».
+        return {"op": op, "rc": "909",
+                "msg": f"операція {op!r} емулятором не підтримується"}
 
     def _sale(self, request: dict) -> dict:
         amount = int(request.get("sum") or 0)
