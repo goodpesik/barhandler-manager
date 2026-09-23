@@ -126,8 +126,11 @@ class PrinterRegistry:
 
     # ---------- discovery ----------
 
-    def discover(self) -> list[PrinterDescriptor]:
-        descriptors = discover_all()
+    def discover(self, usb_report: Optional[dict] = None) -> list[PrinterDescriptor]:
+        """`usb_report`, when given, is filled with what the USB scan saw —
+        the caller's own copy, so two overlapping discoveries cannot hand each
+        other's numbers to the wrong request (BH-179)."""
+        descriptors = discover_all(usb_report=usb_report)
         self._last_discovery = {d.id: d for d in descriptors}
         return descriptors
 

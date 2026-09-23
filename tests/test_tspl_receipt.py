@@ -95,7 +95,7 @@ def test_protocol_comes_from_the_device_not_from_the_role(client, auth_headers, 
         label="4BARCODE 3B-365B",
         usb=UsbAddress(vendor_id=0x1FC9, product_id=0x2016, in_ep=0x81, out_ep=0x03),
     )
-    monkeypatch.setattr(scan, "discover_usb", lambda: [desc])
+    monkeypatch.setattr(scan, "discover_usb", lambda **_: [desc])
     client.post("/devices/discover", headers=auth_headers)
 
     r = client.post(
@@ -118,7 +118,7 @@ def test_operator_choice_beats_the_table(client, auth_headers, monkeypatch):
         label="4BARCODE 3B-365B",
         usb=UsbAddress(vendor_id=0x1FC9, product_id=0x2017, in_ep=0x81, out_ep=0x03),
     )
-    monkeypatch.setattr(scan, "discover_usb", lambda: [desc])
+    monkeypatch.setattr(scan, "discover_usb", lambda **_: [desc])
     client.post("/devices/discover", headers=auth_headers)
 
     r = client.post(
@@ -227,7 +227,7 @@ def test_a_known_model_is_credited_to_the_table_even_when_the_role_agrees(
         label="4BARCODE 3B-365B",
         usb=UsbAddress(vendor_id=0x1FC9, product_id=0x2018, in_ep=0x81, out_ep=0x03),
     )
-    monkeypatch.setattr(scan, "discover_usb", lambda: [desc])
+    monkeypatch.setattr(scan, "discover_usb", lambda **_: [desc])
     client.post("/devices/discover", headers=auth_headers)
 
     r = client.post(
@@ -470,7 +470,7 @@ def _register_tspl_printer(client, auth_headers, monkeypatch, kind: str, pid: in
         label="4BARCODE 3B-365B",
         usb=UsbAddress(vendor_id=0x1FC9, product_id=pid, in_ep=0x81, out_ep=0x03),
     )
-    monkeypatch.setattr(scan, "discover_usb", lambda: [desc])
+    monkeypatch.setattr(scan, "discover_usb", lambda **_: [desc])
     client.post("/devices/discover", headers=auth_headers)
     r = client.post(
         "/devices/register", headers=auth_headers,
