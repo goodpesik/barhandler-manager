@@ -180,12 +180,18 @@ async def discover(request: Request) -> dict:
     import asyncio
 
     registry = _registry(request)
+    usb_report: dict = {}
     descriptors: list[PrinterDescriptor] = await asyncio.to_thread(
-        registry.discover,
+        registry.discover, usb_report,
     )
+    # BH-179 — what the USB bus looked like, so "nothing found" can be told
+    # apart from "found it and walked past it". Without this the only way to
+    # learn why a plugged-in printer is missing is to have the operator run
+    # scripts/usb_probe.py by hand.
     return {
         "printers": [d.model_dump() for d in descriptors],
         "warnings": _discovery_warnings(),
+        "usb_scan": usb_report,
     }
 
 

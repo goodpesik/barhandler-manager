@@ -8,6 +8,8 @@
 
 from pathlib import Path
 
+import json
+
 import pytest
 from PIL import Image
 
@@ -93,7 +95,7 @@ def test_protocol_comes_from_the_device_not_from_the_role(client, auth_headers, 
         label="4BARCODE 3B-365B",
         usb=UsbAddress(vendor_id=0x1FC9, product_id=0x2016, in_ep=0x81, out_ep=0x03),
     )
-    monkeypatch.setattr(scan, "discover_usb", lambda: [desc])
+    monkeypatch.setattr(scan, "discover_usb", lambda **_: [desc])
     client.post("/devices/discover", headers=auth_headers)
 
     r = client.post(
@@ -116,7 +118,7 @@ def test_operator_choice_beats_the_table(client, auth_headers, monkeypatch):
         label="4BARCODE 3B-365B",
         usb=UsbAddress(vendor_id=0x1FC9, product_id=0x2017, in_ep=0x81, out_ep=0x03),
     )
-    monkeypatch.setattr(scan, "discover_usb", lambda: [desc])
+    monkeypatch.setattr(scan, "discover_usb", lambda **_: [desc])
     client.post("/devices/discover", headers=auth_headers)
 
     r = client.post(
@@ -127,6 +129,258 @@ def test_operator_choice_beats_the_table(client, auth_headers, monkeypatch):
     printer = r.json()["printer"]
     assert printer["protocol"] == "escpos"
     assert printer["protocol_source"] == "operator"
+
+
+# BH-178 — a model the table has never seen. Every network printer is
+# discovered as plain "Network printer <ip>", so this is the common case in
+# the field, not an edge one: it used to fall through to ESC/POS, which TSPL
+# firmware accepts and discards while /print/label still answers "printed".
+
+def test_an_unknown_label_printer_gets_tspl_not_silence(client, auth_headers, monkeypatch):
+    from src.devices import scan
+    from src.models.printer import NetworkAddress, PrinterDescriptor, PrinterTransport
+
+    desc = PrinterDescriptor(
+        id="net:10.0.0.9",
+        transport=PrinterTransport.network,
+        label="Network printer 10.0.0.9",
+        network=NetworkAddress(host="10.0.0.9", port=9100),
+    )
+    monkeypatch.setattr(scan, "discover_network", lambda: [desc])
+    client.post("/devices/discover", headers=auth_headers)
+
+    r = client.post(
+        "/devices/register", headers=auth_headers,
+        json={"id": desc.id, "kind": "label", "paper_width": 40},
+    )
+
+    assert r.status_code == 200, r.text
+    printer = r.json()["printer"]
+    assert printer["protocol"] == "tspl"
+    assert printer["protocol_source"] == "label-kind"
+
+
+def test_an_unknown_receipt_printer_still_gets_escpos(client, auth_headers, monkeypatch):
+    """The role is only a hint for label printers. A receipt printer the table
+    does not know keeps ESC/POS — guessing TSPL there would silence it."""
+    from src.devices import scan
+    from src.models.printer import NetworkAddress, PrinterDescriptor, PrinterTransport
+
+    desc = PrinterDescriptor(
+        id="net:10.0.0.10",
+        transport=PrinterTransport.network,
+        label="Network printer 10.0.0.10",
+        network=NetworkAddress(host="10.0.0.10", port=9100),
+    )
+    monkeypatch.setattr(scan, "discover_network", lambda: [desc])
+    client.post("/devices/discover", headers=auth_headers)
+
+    r = client.post(
+        "/devices/register", headers=auth_headers,
+        json={"id": desc.id, "kind": "receipt", "paper_width": 80},
+    )
+
+    assert r.status_code == 200, r.text
+    printer = r.json()["printer"]
+    assert printer["protocol"] == "escpos"
+    assert printer["protocol_source"] == "default"
+
+
+def test_an_operator_who_asked_for_escpos_on_a_label_printer_keeps_it(
+    client, auth_headers, monkeypatch,
+):
+    from src.devices import scan
+    from src.models.printer import NetworkAddress, PrinterDescriptor, PrinterTransport
+
+    desc = PrinterDescriptor(
+        id="net:10.0.0.11",
+        transport=PrinterTransport.network,
+        label="Network printer 10.0.0.11",
+        network=NetworkAddress(host="10.0.0.11", port=9100),
+    )
+    monkeypatch.setattr(scan, "discover_network", lambda: [desc])
+    client.post("/devices/discover", headers=auth_headers)
+
+    r = client.post(
+        "/devices/register", headers=auth_headers,
+        json={"id": desc.id, "kind": "label", "protocol": "escpos"},
+    )
+
+    printer = r.json()["printer"]
+    assert printer["protocol"] == "escpos"
+    assert printer["protocol_source"] == "operator"
+
+
+def test_a_known_model_is_credited_to_the_table_even_when_the_role_agrees(
+    client, auth_headers, monkeypatch,
+):
+    """The model is the stronger signal, so it must be consulted first. Both
+    answers are TSPL here, which is why only the recorded source can tell the
+    two orders apart — and that source is what support reads to know whether
+    we recognised the hardware or merely guessed from the role."""
+    from src.devices import scan
+    from src.models.printer import PrinterDescriptor, PrinterTransport, UsbAddress
+
+    desc = PrinterDescriptor(
+        id="usb:1fc9:2018",
+        transport=PrinterTransport.usb,
+        label="4BARCODE 3B-365B",
+        usb=UsbAddress(vendor_id=0x1FC9, product_id=0x2018, in_ep=0x81, out_ep=0x03),
+    )
+    monkeypatch.setattr(scan, "discover_usb", lambda **_: [desc])
+    client.post("/devices/discover", headers=auth_headers)
+
+    r = client.post(
+        "/devices/register", headers=auth_headers,
+        json={"id": desc.id, "kind": "label", "paper_width": 40},
+    )
+
+    printer = r.json()["printer"]
+    assert printer["protocol"] == "tspl"
+    assert printer["protocol_source"] == "model-table"
+
+
+# ---------- migrating what is already on disk (BH-178) ----------
+
+def _registry_with(entry: dict, tmp_path):
+    from src.devices.registry import PrinterRegistry
+
+    path = tmp_path / "printers.json"
+    path.write_text(json.dumps({"printers": [entry]}, ensure_ascii=False))
+    registry = PrinterRegistry(path=path)
+    registry.load()
+    return registry, path
+
+
+def _label_entry(**over) -> dict:
+    entry = {
+        "descriptor": {
+            "id": "net:10.0.0.12", "transport": "network",
+            "label": "Network printer 10.0.0.12",
+            "network": {"host": "10.0.0.12", "port": 9100},
+        },
+        "kind": "label", "paper_width": 40,
+        "protocol": "escpos", "protocol_source": "default",
+    }
+    entry.update(over)
+    return entry
+
+
+def test_a_label_printer_left_on_escpos_by_our_own_guess_is_migrated(tmp_path):
+    """This is what the field looks like right now: printers.json holds
+    protocol=escpos with protocol_source=default for a label printer, so it
+    prints nothing until someone re-registers it by hand."""
+    registry, path = _registry_with(_label_entry(), tmp_path)
+
+    reg = registry.get_registration("net:10.0.0.12")
+
+    assert reg.protocol.value == "tspl"
+    assert reg.protocol_source == "legacy-upgrade"
+    on_disk = json.loads(path.read_text())["printers"][0]
+    assert on_disk["protocol"] == "tspl", "the migration was not written back"
+    assert on_disk["protocol_source"] == "legacy-upgrade"
+
+
+def test_an_operators_escpos_label_printer_is_left_alone(tmp_path):
+    """Someone chose ESC/POS on purpose — perhaps a receipt printer doing
+    labels on continuous tape. Overriding that would break their setup."""
+    registry, _ = _registry_with(
+        _label_entry(protocol_source="operator"), tmp_path,
+    )
+
+    reg = registry.get_registration("net:10.0.0.12")
+
+    assert reg.protocol.value == "escpos"
+    assert reg.protocol_source == "operator"
+
+
+def test_a_pre_protocol_source_escpos_label_printer_is_left_alone(tmp_path):
+    """The file predates `protocol_source`, so the field is simply absent. Back
+    then `kind == label` already meant TSPL, so ESC/POS here can only be a
+    deliberate choice — a receipt printer running labels on continuous tape.
+    Pydantic fills the missing field with "default", which is why asking the
+    validated object instead of the raw entry would destroy this setup, and the
+    rewrite would make it unrecoverable."""
+    entry = _label_entry()
+    del entry["protocol_source"]
+    registry, path = _registry_with(entry, tmp_path)
+
+    reg = registry.get_registration("net:10.0.0.12")
+
+    assert reg.protocol.value == "escpos"
+    assert json.loads(path.read_text())["printers"][0]["protocol"] == "escpos"
+
+
+def test_an_unreadable_entry_survives_a_migration(tmp_path):
+    """`save()` used to write only what parsed, so rewriting the file because
+    ANOTHER printer needed migrating silently deleted the entry we could not
+    read — nobody asked us to delete it."""
+    from src.devices.registry import PrinterRegistry
+
+    path = tmp_path / "printers.json"
+    path.write_text(json.dumps({"printers": [{"junk": True}, _label_entry()]}))
+    registry = PrinterRegistry(path=path)
+    registry.load()
+
+    assert registry.get_registration("net:10.0.0.12").protocol.value == "tspl"
+    assert {"junk": True} in json.loads(path.read_text())["printers"]
+
+
+def test_an_unreadable_entry_survives_a_later_registration(tmp_path):
+    """Found by the second review round: keeping the entry through the
+    migration is not enough. Every register/unregister writes the file too, and
+    an operator adding an unrelated printer an hour later would have dropped
+    it — the same loss, by another hand."""
+    from src.models.printer import NetworkAddress, PrinterDescriptor, PrinterTransport
+    from src.models.printer import PrinterKind, RegistrationRequest
+    from src.devices.registry import PrinterRegistry
+
+    path = tmp_path / "printers.json"
+    path.write_text(json.dumps({"printers": [{"junk": True}, _label_entry()]}))
+    registry = PrinterRegistry(path=path)
+    registry.load()
+    registry._last_discovery["net:10.0.0.99"] = PrinterDescriptor(
+        id="net:10.0.0.99",
+        transport=PrinterTransport.network,
+        label="Network printer 10.0.0.99",
+        network=NetworkAddress(host="10.0.0.99", port=9100),
+    )
+
+    registry.register(RegistrationRequest(id="net:10.0.0.99", kind=PrinterKind.receipt))
+
+    on_disk = json.loads(path.read_text())["printers"]
+    assert {"junk": True} in on_disk, "an unrelated registration dropped it"
+    assert len(on_disk) == 3
+
+
+def test_a_registry_that_cannot_write_still_starts(tmp_path, monkeypatch):
+    """`load()` runs inside the app lifespan with no try/except around it, so a
+    failed write-back here would take the whole manager down — a silent printer
+    turned into a dead service."""
+    from src.devices.registry import PrinterRegistry
+
+    def _read_only(self):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(PrinterRegistry, "save", _read_only)
+    path = tmp_path / "printers.json"
+    path.write_text(json.dumps({"printers": [_label_entry()]}))
+    registry = PrinterRegistry(path=path)
+
+    registry.load()
+
+    assert registry.get_registration("net:10.0.0.12").protocol.value == "tspl"
+
+
+def test_a_label_printer_already_on_tspl_is_not_relabelled(tmp_path):
+    registry, _ = _registry_with(
+        _label_entry(protocol="tspl", protocol_source="model-table"), tmp_path,
+    )
+
+    reg = registry.get_registration("net:10.0.0.12")
+
+    assert reg.protocol.value == "tspl"
+    assert reg.protocol_source == "model-table"
 
 
 # ---------- обгортання ----------
@@ -216,7 +470,7 @@ def _register_tspl_printer(client, auth_headers, monkeypatch, kind: str, pid: in
         label="4BARCODE 3B-365B",
         usb=UsbAddress(vendor_id=0x1FC9, product_id=pid, in_ep=0x81, out_ep=0x03),
     )
-    monkeypatch.setattr(scan, "discover_usb", lambda: [desc])
+    monkeypatch.setattr(scan, "discover_usb", lambda **_: [desc])
     client.post("/devices/discover", headers=auth_headers)
     r = client.post(
         "/devices/register", headers=auth_headers,

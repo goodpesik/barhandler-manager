@@ -188,3 +188,28 @@ def test_register_usb_manual_without_discovery(
     assert printer["descriptor"]["id"] == expected_id
     saved = json.loads(tmp_registry.read_text())
     assert saved["printers"][0]["descriptor"]["id"] == expected_id
+
+
+def test_discover_reports_the_usb_scan_it_actually_ran(auth_headers, config):
+    """End to end, with nothing stubbed between the scan and the response: the
+    field has to describe THIS call's bus, not a report left by another one."""
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    from src.devices import scan
+    from src.server import create_app
+    from tests._usb_fakes import _FakeEndpoint, _FakeInterface, _device
+
+    label_printer = _device(0x1234, 0x5678, _FakeInterface(0x07, [_FakeEndpoint(0x03)]))
+    with patch.object(scan.usb.core, "find", return_value=[label_printer]), \
+         patch.object(scan, "_is_termux", return_value=False), \
+         patch.object(scan, "discover_network", return_value=[]), \
+         patch.object(scan, "discover_bluetooth", return_value=[]):
+        with TestClient(create_app(config)) as client:
+            body = client.post("/devices/discover", headers=auth_headers).json()
+
+    assert body["printers"] == []
+    assert body["usb_scan"]["seen"] == 1
+    assert body["usb_scan"]["skipped"][0]["id"] == "1234:5678"
+    assert body["usb_scan"]["skipped"][0]["reason"] == "no_bulk_in"

@@ -50,6 +50,10 @@ class PrinterRegistry:
         # Discoveries cached in-memory between a /discover and a /register
         # call so the frontend doesn't have to round-trip the full descriptor.
         self._last_discovery: Dict[str, PrinterDescriptor] = {}
+        # Entries of printers.json this version cannot parse. Kept verbatim so
+        # every save() puts them back: nobody asked us to delete a registration
+        # just because we could not read it (BH-178).
+        self._unreadable: list = []
 
     # ---------- persistence ----------
 
@@ -62,37 +66,71 @@ class PrinterRegistry:
             logger.warning("printers.json unreadable: %s", exc)
             return
         upgraded = False
+        self._unreadable = []
         for entry in raw.get("printers", []):
             try:
                 reg = PrinterRegistration.model_validate(entry)
             except Exception as exc:
                 logger.warning("skipping bad registration: %s", exc)
+                self._unreadable.append(entry)
                 continue
-            # Auto-upgrade: a label-kind printer registered before
-            # PrintProtocol existed loads with protocol=escpos (default),
-            # but XP-246B & friends ship in TSPL mode — keep them
-            # working without forcing the operator to re-register.
             kind_value = reg.kind.value if hasattr(reg.kind, "value") else reg.kind
+            # BH-178 — a label printer that was never told which protocol to
+            # speak. Two ways to end up here: registered before PrintProtocol
+            # existed (no field at all), or registered while the fallback was
+            # a blanket ESC/POS, which left it silent on TSPL hardware. Both
+            # are our guess, not the operator's, so both get corrected.
+            #
+            # Read the RAW entry, never the validated object: pydantic fills a
+            # missing `protocol_source` with "default", so asking the model
+            # cannot tell "we guessed" from "the file predates the field". In
+            # that older era `kind == label` already defaulted to TSPL, so an
+            # ESC/POS label printer from back then is a DELIBERATE choice — a
+            # receipt printer running labels on continuous tape, say. Flipping
+            # it would destroy that setup, and the rewrite below makes it
+            # unrecoverable (found by review).
             had_protocol = "protocol" in entry
-            if not had_protocol and kind_value == "label":
+            ours = entry.get("protocol_source") == "default"
+            if kind_value == "label" and reg.protocol != PrintProtocol.tspl and (
+                not had_protocol or ours
+            ):
                 reg.protocol = PrintProtocol.tspl
-                # Це не «дефолт ESC/POS», а міграція старої реєстрації —
-                # хай у підтримки не лишається питання, звідки взявся TSPL.
+                # Not "the ESC/POS default" — this is a migrated registration,
+                # and support should be able to see that at a glance.
                 reg.protocol_source = "legacy-upgrade"
                 upgraded = True
             self._registrations[reg.descriptor.id] = reg
         if upgraded:
-            self.save()
+            try:
+                self.save()
+            except Exception as exc:  # noqa: BLE001 — a read-only path, a gone directory
+                # Losing the migration is a printer that needs re-registering.
+                # Failing here would take the whole manager down with it:
+                # `load()` runs inside the app's lifespan, unguarded.
+                logger.warning(
+                    "could not write the migrated printers.json (%s) — "
+                    "the correction holds for this run only", exc,
+                )
         logger.info("loaded %d registered printers", len(self._registrations))
 
     def save(self) -> None:
-        payload = {"printers": [r.model_dump() for r in self._registrations.values()]}
+        # Entries we could not parse ride along untouched. Writing only what we
+        # understood would delete them, and every registration change calls
+        # this — so the loss would arrive later, by an unrelated hand (BH-178,
+        # found by the second review round).
+        payload = {
+            "printers": [r.model_dump() for r in self._registrations.values()]
+            + self._unreadable,
+        }
         self.path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
     # ---------- discovery ----------
 
-    def discover(self) -> list[PrinterDescriptor]:
-        descriptors = discover_all()
+    def discover(self, usb_report: Optional[dict] = None) -> list[PrinterDescriptor]:
+        """`usb_report`, when given, is filled with what the USB scan saw —
+        the caller's own copy, so two overlapping discoveries cannot hand each
+        other's numbers to the wrong request (BH-179)."""
+        descriptors = discover_all(usb_report=usb_report)
         self._last_discovery = {d.id: d for d in descriptors}
         return descriptors
 
@@ -128,26 +166,32 @@ class PrinterRegistry:
                     f"{req.id}: run /devices/discover first or provide a known id"
                 )
             descriptor = existing.descriptor
-        # PrintProtocol auto-default: dedicated label printers default
-        # to TSPL (they ship in `Print mode: LABEL` and silently ignore
-        # ESC/POS) — everything else defaults to ESC/POS. The operator
-        # can override either way via the request.
-        # BH-160 — протокол береться від ПРИСТРОЮ, не від ролі.
+        # Which wire protocol this printer speaks, in falling order of
+        # confidence, recording WHERE the answer came from so support never
+        # has to guess.
         #
-        # Доти було `kind == label → tspl`, решта → escpos. Тобто оператор,
-        # обравши «чек» на етикетковому залізі, мовчки отримував ESC/POS —
-        # прошивка приймала байти й викидала їх, а ми рапортували успіх.
+        # BH-160 took the protocol from the DEVICE rather than the role:
+        # picking "receipt" on label hardware used to hand it ESC/POS, which
+        # the firmware accepts and throws away while we report success.
         #
-        # Порядок: явний вибір оператора → таблиця моделей → дефолт. Записуємо
-        # ще й ДЖЕРЕЛО, щоб у підтримки не лишалось питання «звідки це взялось».
+        # BH-178 — but dropping the role entirely was too much. A model this
+        # table has never seen (every network printer is discovered as plain
+        # "Network printer <ip>") fell through to ESC/POS, so a label printer
+        # registered as one printed NOTHING and the manager still answered
+        # "printed". The role is a weaker signal than the model, not a useless
+        # one: someone registering a label printer is telling us what it is.
         if req.protocol is not None:
             protocol = req.protocol
             protocol_source = "operator"
         else:
             detected = protocol_for_model(descriptor.label)
+            kind_value = req.kind.value if hasattr(req.kind, "value") else req.kind
             if detected is not None:
                 protocol = PrintProtocol(detected)
                 protocol_source = "model-table"
+            elif kind_value == "label":
+                protocol = PrintProtocol.tspl
+                protocol_source = "label-kind"
             else:
                 protocol = PrintProtocol.escpos
                 protocol_source = "default"

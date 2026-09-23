@@ -29,14 +29,32 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 
+#: Що саме підтверджує оператор. BH-177: доти було лише «Оплата», і
+#: повернення, яке емулятор навчився проводити, виглядало б у консолі як
+#: списання — тобто людина підтверджувала б не те, що думає.
+KIND_LABELS = {
+    "purchase": "Оплата",
+    "refund": "ПОВЕРНЕННЯ",
+    "void": "СКАСУВАННЯ оплати",
+    "partial_void": "ЧАСТКОВЕ скасування",
+}
+
+
 @dataclass
 class Pending:
-    """One in-flight Purchase handed from the server thread to the console."""
+    """One in-flight operation handed from the server thread to the console."""
 
     amount_kopecks: int
     currency: str
     event: threading.Event = field(default_factory=threading.Event)
     decision: str = "a"  # 'a' approve | 'd' decline | 'c' cancel
+    kind: str = "purchase"  # див. KIND_LABELS
+    #: rrn / номер чека, за яким повертають — щоб оператор бачив, ЩО саме
+    reference: str = ""
+
+    @property
+    def label(self) -> str:
+        return KIND_LABELS.get(self.kind, self.kind)
 
 
 class BankEmulator(ABC):
@@ -69,10 +87,20 @@ class BankEmulator(ABC):
 
     # -- console handoff ---------------------------------------------------
 
-    def _await_decision(self, amount_kopecks: int, currency: str) -> str:
+    def _await_decision(
+        self,
+        amount_kopecks: int,
+        currency: str,
+        *,
+        kind: str = "purchase",
+        reference: str = "",
+    ) -> str:
         """Block (in the executor thread) until the console operator picks an
-        outcome for this Purchase. Returns 'a' | 'd' | 'c'."""
-        pending = Pending(amount_kopecks=amount_kopecks, currency=currency)
+        outcome for this operation. Returns 'a' | 'd' | 'c'."""
+        pending = Pending(
+            amount_kopecks=amount_kopecks, currency=currency,
+            kind=kind, reference=reference,
+        )
         self.current = pending
         self.decisions.put(pending)
         pending.event.wait()

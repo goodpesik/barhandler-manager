@@ -16,53 +16,15 @@ from unittest.mock import patch
 from src.devices import scan
 
 
-class _FakeEndpoint:
-    def __init__(self, address: int, attributes: int = 0x02) -> None:
-        self.bEndpointAddress = address
-        self.bmAttributes = attributes  # 0x02 == bulk
-
-
-class _FakeInterface:
-    def __init__(self, cls: int, endpoints: list[_FakeEndpoint]) -> None:
-        self.bInterfaceClass = cls
-        self._endpoints = endpoints
-
-    def __iter__(self):
-        return iter(self._endpoints)
-
-
-class _FakeConfig:
-    def __init__(self, interfaces: list[_FakeInterface]) -> None:
-        self._interfaces = interfaces
-
-    def __iter__(self):
-        return iter(self._interfaces)
-
-
-class _FakeDevice:
-    def __init__(self, vendor: int, product: int, configs: list[_FakeConfig]) -> None:
-        self.idVendor = vendor
-        self.idProduct = product
-        self._configs = configs
-        # 0 → falsy → _safe_string returns None without touching libusb
-        self.iManufacturer = 0
-        self.iProduct = 0
-        self.iSerialNumber = 0
-
-    def __iter__(self):
-        return iter(self._configs)
-
-
-def _bulk_pair() -> list[_FakeEndpoint]:
-    return [_FakeEndpoint(0x81), _FakeEndpoint(0x03)]  # bulk IN + bulk OUT
-
-
-def _iface(cls: int, with_bulk: bool = True) -> _FakeInterface:
-    return _FakeInterface(cls, _bulk_pair() if with_bulk else [])
-
-
-def _device(vendor: int, product: int, *interfaces: _FakeInterface) -> _FakeDevice:
-    return _FakeDevice(vendor, product, [_FakeConfig(list(interfaces))])
+from tests._usb_fakes import (  # noqa: F401 — re-exported for other tests
+    _FakeConfig,
+    _FakeDevice,
+    _FakeEndpoint,
+    _FakeInterface,
+    _bulk_pair,
+    _device,
+    _iface,
+)
 
 
 def _discover(devices):
@@ -122,3 +84,115 @@ def test_broken_descriptor_does_not_sink_the_whole_scan():
     bad = _Exploding(0x9999, 0x9999, [])
     found = _discover([bad, good])
     assert [d.usb.vendor_id for d in found] == [0x0FE6]
+
+
+# ---------- what the scan walked past (BH-179) ----------
+#
+# A printer that is plugged in and still missing from the result used to look
+# exactly like one that is not plugged in at all: the skip was logged at DEBUG
+# and nothing reached the caller. Support had to talk an operator through
+# running scripts/usb_probe.py by hand.
+
+
+def _report(devices) -> dict:
+    """Run a scan and return the report it filled in for THIS call."""
+    report: dict = {}
+    with patch.object(scan.usb.core, "find", return_value=devices), \
+         patch.object(scan, "_is_termux", return_value=False):
+        scan.discover_usb(report=report)
+    return report
+
+
+def _out_only_iface(cls: int = 0x07) -> _FakeInterface:
+    """A cheap label printer: bulk OUT, nothing coming back."""
+    return _FakeInterface(cls, [_FakeEndpoint(0x03)])
+
+
+def test_a_printer_with_no_bulk_in_is_reported_as_skipped():
+    report = _report([_device(0x1234, 0x5678, _out_only_iface())])
+
+    assert report["seen"] == 1 and report["matched"] == 0
+    assert [d["id"] for d in report["skipped"]] == ["1234:5678"]
+    assert report["skipped"][0]["reason"] == "no_bulk_in"
+    assert report["skipped"][0]["message"]
+
+
+def test_channels_split_across_interfaces_get_their_own_reason():
+    """Found by review: asking whether the DEVICE has both channels answers a
+    different question than the scan asks, which is whether ONE interface has
+    both. Calling this a class mismatch would send support hunting the wrong
+    thing."""
+    report = _report([_device(
+        0x1234, 0x5678,
+        _FakeInterface(0x07, [_FakeEndpoint(0x81)]),
+        _FakeInterface(0x07, [_FakeEndpoint(0x03)]),
+    )])
+
+    assert report["skipped"][0]["reason"] == "split_interfaces"
+
+
+def test_a_device_whose_descriptors_cannot_be_read_is_reported():
+    """What a printer held by another driver looks like — on macOS that is a
+    printer someone added in System Settings."""
+    class _Locked(_FakeDevice):
+        def __iter__(self):
+            raise OSError("access denied")
+
+    report = _report([_Locked(0x0483, 0x5011, [])])
+
+    assert report["skipped"][0]["reason"] == "descriptor_unreadable"
+    assert report["skipped"][0]["id"] == "0483:5011"
+
+
+def test_an_ordinary_device_is_not_reported_as_a_missing_printer():
+    """A keyboard has no bulk OUT, so it cannot be a printer. Listing every
+    hub and mouse would bury the one line support is looking for."""
+    report = _report([_device(0x046D, 0xC534, _iface(0x03, with_bulk=False))])
+
+    assert report["skipped"] == []
+
+
+def test_a_printer_that_matched_is_not_reported_as_skipped():
+    report = _report([_device(0x0519, 0x0001, _iface(0x07))])
+
+    assert report["matched"] == 1 and report["skipped"] == []
+
+
+def test_an_empty_bus_is_told_apart_from_a_skipped_printer():
+    """Zero devices means libusb cannot reach the bus at all — a different
+    problem from "saw it, walked past it", and the two used to look the same."""
+    assert _report([]) == {"seen": 0, "matched": 0, "skipped": [], "skipped_total": 0}
+
+
+def test_the_list_of_skipped_devices_is_capped():
+    """A hub full of peripherals must not push the real answer out of sight."""
+    many = [_device(0x1234, i, _out_only_iface()) for i in range(scan.MAX_REPORTED_SKIPS + 5)]
+
+    report = _report(many)
+
+    assert len(report["skipped"]) == scan.MAX_REPORTED_SKIPS
+    assert report["skipped_total"] == scan.MAX_REPORTED_SKIPS + 5
+
+
+def test_a_scan_that_cannot_start_does_not_look_like_a_clean_bus():
+    """`usb.core.find` fails outright when there is no libusb backend. The
+    report must say so rather than let a caller show the previous scan."""
+    report: dict = {}
+    with patch.object(scan.usb.core, "find", side_effect=RuntimeError("no backend")), \
+         patch.object(scan, "_is_termux", return_value=False):
+        scan.discover_all(usb_report=report)
+
+    assert report["error"] == "no backend"
+    assert report["seen"] == 0
+
+
+def test_a_scan_that_never_runs_leaves_no_stale_numbers():
+    """On Android the USB scan is skipped outright. A caller reusing a dict —
+    or reading one filled by an earlier scan — must not be shown those numbers
+    as if they described the bus right now."""
+    report = {"seen": 7, "matched": 3, "skipped": [{"id": "dead:beef"}]}
+
+    with patch.object(scan, "_is_termux", return_value=True):
+        assert scan.discover_usb(report=report) == []
+
+    assert report == {"seen": 0, "matched": 0, "skipped": [], "skipped_total": 0}

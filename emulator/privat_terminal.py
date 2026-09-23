@@ -52,9 +52,13 @@ class PrivatTerminalEmulator(BankEmulator):
             return self._service(request.get("params") or {})
         if method == "Purchase":
             return self._purchase(request.get("params") or {})
-        if method in ("Refund", "GetReceiptInfo"):
-            return self._purchase(request.get("params") or {})
-        return {"error": False}
+        if method == "Refund":
+            return self._refund(request.get("params") or {})
+        if method == "GetReceiptInfo":
+            return self._receipt_info(request.get("params") or {})
+        # BH-177 — невідомий метод мусить відмовити, а не віддавати «успіх».
+        return {"method": method, "error": True,
+                "errorDescription": f"метод {method!r} емулятором не підтримується"}
 
     def _service(self, params: dict) -> dict:
         msg_type = params.get("msgType")
@@ -73,18 +77,60 @@ class PrivatTerminalEmulator(BankEmulator):
             return {"error": False, "params": {"LastResult": "0" if ok else "2"}}
         return {"error": False, "params": {}}
 
-    def _purchase(self, params: dict) -> dict:
+    def _refund(self, params: dict) -> dict:
+        """Повернення за rrn — спец. §5.2 (BH-177).
+
+        Доти воно йшло тим самим шляхом, що й оплата, тож оператор бачив у
+        консолі «Оплата» й підтверджував не те, що думає. Тепер видно, що це
+        повернення й за яким rrn.
+
+        `rrn` вимагаємо так само, як справжній термінал: без нього банку нічого
+        шукати. Адаптер теж його вимагає, але емулятор не має вдавати, що
+        провів би повернення, якого термінал не провів би.
+        """
+        if not params.get("rrn"):
+            return {"method": "Refund", "error": True,
+                    "errorDescription": "повернення потребує rrn оплати",
+                    "params": {"responseCode": "1002", "trnStatus": "2"}}
+        return self._purchase(
+            params, method="Refund", kind="refund",
+            reference=f"за {params.get('rrn')}",
+        )
+
+    def _receipt_info(self, params: dict) -> dict:
+        """Довідка про вже проведений чек — грошей не рухає (BH-177).
+
+        Доти йшла через `_purchase`, тобто блокувала консоль питанням
+        «підтвердіть оплату ₴0.00» на запит, який лише читає чек.
+        """
+        return {"method": "GetReceiptInfo", "error": False, "params": {
+            "trnStatus": "1",
+            "responseCode": "0000",
+            "invoiceNumber": str(params.get("invoiceNumber") or "000001"),
+            "receipt": "ЕМУЛЯТОР — копія чека",
+        }}
+
+    def _purchase(
+        self,
+        params: dict,
+        *,
+        method: str = "Purchase",
+        kind: str = "purchase",
+        reference: str = "",
+    ) -> dict:
         amount_kopecks = _amount_to_kopecks(params.get("amount"))
-        decision = self._await_decision(amount_kopecks, "980")
+        decision = self._await_decision(
+            amount_kopecks, "980", kind=kind, reference=reference,
+        )
         if decision == "c":
-            return {"method": "Purchase", "error": True,
+            return {"method": method, "error": True,
                     "errorDescription": "Скасовано користувачем",
                     "params": {"responseCode": "1001", "trnStatus": "4"}}
         if decision == "d":
-            return {"method": "Purchase", "error": True,
+            return {"method": method, "error": True,
                     "errorDescription": "Відхилено (емулятор)",
                     "params": {"responseCode": "0500", "trnStatus": "2"}}
-        return {"method": "Purchase", "error": False, "params": {
+        return {"method": method, "error": False, "params": {
             "trnStatus": "1",
             "responseCode": "0000",
             "rrn": f"{random.randint(0, 999999999999):012d}",
