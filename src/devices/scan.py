@@ -116,26 +116,125 @@ def _select_printer_interface(dev):
     return fallback
 
 
-def discover_usb() -> list[PrinterDescriptor]:
+#: Why a USB device the scan walked past is not in the result. Kept as codes
+#: so the frontend can phrase them; the text here is what support reads in the
+#: log and in `/devices/discover`.
+SKIP_REASONS = {
+    "descriptor_unreadable": (
+        "не вдалось прочитати опис пристрою — найчастіше його тримає інший "
+        "драйвер (на маку це принтер, доданий у Системних параметрах)"
+    ),
+    "no_bulk_in": (
+        "є лише вихідний канал даних, а для друку потрібні обидва — такий "
+        "принтер реєструють вручну"
+    ),
+    "unrecognised_class": (
+        "клас інтерфейсу не схожий на принтер, і вендор невідомий"
+    ),
+    "split_interfaces": (
+        "вхідний і вихідний канали на різних інтерфейсах — такий принтер "
+        "реєструють вручну"
+    ),
+}
+
+#: How many skipped devices to name. A hub full of peripherals would otherwise
+#: push the real answer out of sight, in the response and in the log alike.
+MAX_REPORTED_SKIPS = 10
+
+
+def _usb_skip_reason(dev) -> Optional[str]:
+    """Why this device was skipped — or None when it is simply not a printer.
+
+    BH-179. A device with no bulk OUT endpoint anywhere cannot be a printer
+    (keyboards, hubs, cameras), and listing every one of those would bury the
+    answer support is looking for. Everything that COULD be a printer and was
+    still skipped gets named.
+
+    The reason is worked out the way `_select_printer_interface` decides, i.e.
+    per INTERFACE. Asking "does the device have a bulk IN somewhere and a bulk
+    OUT somewhere" answers a different question and gets the diagnosis wrong
+    for a device whose two channels sit on separate interfaces (found by
+    review).
+    """
+    any_out = any_in = paired = False
+    for cfg in dev:
+        for iface in cfg:
+            in_ep, out_ep = _bulk_endpoints(iface)
+            any_in = any_in or in_ep is not None
+            any_out = any_out or out_ep is not None
+            paired = paired or (in_ep is not None and out_ep is not None)
+    if not any_out:
+        return None
+    if paired:
+        # An interface offers both channels, so the class is what disqualified
+        # it — and a known vendor would already have been accepted, which is
+        # why this reason can say the vendor is unknown.
+        return "unrecognised_class"
+    if not any_in:
+        return "no_bulk_in"
+    return "split_interfaces"
+
+
+def _usb_device_summary(dev, reason: str) -> dict:
+    """Describe a skipped device. Never raises: a scan must not die while
+    explaining itself, and this runs on devices we already know are odd."""
+    summary = {"id": "????:????", "label": "", "reason": reason,
+               "message": SKIP_REASONS.get(reason, reason)}
+    try:
+        summary["id"] = (
+            f"{int(getattr(dev, 'idVendor', 0)):04x}"
+            f":{int(getattr(dev, 'idProduct', 0)):04x}"
+        )
+        summary["label"] = (
+            _safe_string(dev, getattr(dev, "iProduct", 0))
+            or _safe_string(dev, getattr(dev, "iManufacturer", 0))
+            or ""
+        )
+    except Exception:  # noqa: BLE001 — a device that just went away
+        pass
+    return summary
+
+
+def discover_usb(report: Optional[dict] = None) -> list[PrinterDescriptor]:
     # On Termux/Android pyusb's libusb backend can't reach the system
     # USB stack without per-device termux-usb permissions, and even
     # then the workflow is one-at-a-time + user-prompted. We've
     # decided to support only network printers on Android — skip
     # cleanly so the operator doesn't see noisy NoBackendError logs.
+    if report is not None:
+        # Filled in before anything can go wrong: a caller must never read a
+        # report that belongs to some earlier, luckier scan (found by review).
+        report.clear()
+        report.update({"seen": 0, "matched": 0, "skipped": [], "skipped_total": 0})
     if _is_termux():
         logger.debug("USB discovery skipped on Termux/Android (use network printers)")
         return []
     found: list[PrinterDescriptor] = []
+    skipped: list[dict] = []
+    seen = 0
     for dev in usb.core.find(find_all=True):
+        seen += 1
         try:
             selection = _select_printer_interface(dev)
         except Exception as exc:  # noqa: BLE001 — libusb can throw per-iface
-            logger.debug(
+            logger.info(
                 "USB scan: skipping %04x:%04x (descriptor read failed: %s)",
                 getattr(dev, "idVendor", 0), getattr(dev, "idProduct", 0), exc,
             )
+            skipped.append(_usb_device_summary(dev, "descriptor_unreadable"))
             continue
         if selection is None:
+            reason = None
+            try:
+                reason = _usb_skip_reason(dev)
+            except Exception:  # noqa: BLE001 — the descriptors just went away
+                reason = "descriptor_unreadable"
+            if reason is not None:
+                logger.info(
+                    "USB scan: skipping %04x:%04x (%s)",
+                    getattr(dev, "idVendor", 0), getattr(dev, "idProduct", 0), reason,
+                )
+                skipped.append(_usb_device_summary(dev, reason))
             continue
         in_ep, out_ep, match_kind = selection
         manufacturer = _safe_string(dev, dev.iManufacturer)
@@ -169,6 +268,21 @@ def discover_usb() -> list[PrinterDescriptor]:
                 dev.idVendor, dev.idProduct, match_kind, descriptor.label,
             )
         found.append(descriptor)
+    named = skipped[:MAX_REPORTED_SKIPS]
+    if report is not None:
+        report.update({
+            "seen": seen,
+            "matched": len(found),
+            "skipped": named,
+            "skipped_total": len(skipped),
+        })
+    logger.info(
+        "USB scan: %d device(s) on the bus, %d printer(s), %d skipped%s",
+        seen, len(found), len(skipped),
+        "" if not named else ": " + ", ".join(
+            f"{d['id']} ({d['reason']})" for d in named
+        ),
+    )
     return found
 
 
@@ -739,7 +853,7 @@ def discover_bluetooth() -> list[PrinterDescriptor]:
     return found
 
 
-def discover_all() -> list[PrinterDescriptor]:
+def discover_all(usb_report: Optional[dict] = None) -> list[PrinterDescriptor]:
     """Aggregate every transport into one list.
 
     Each transport is wrapped — a failure in one shouldn't sink the
@@ -750,11 +864,11 @@ def discover_all() -> list[PrinterDescriptor]:
     worse UX than "nothing found yet — plug your printer in."
     """
     out: list[PrinterDescriptor] = []
-    for transport_name, fn in (
-        ("Windows spooler", discover_windows_printers),  # no-op off Windows
-        ("USB", discover_usb),
-        ("network", discover_network),
-        ("Bluetooth", discover_bluetooth),
+    for transport_name, fn, is_usb in (
+        ("Windows spooler", discover_windows_printers, False),  # no-op off Windows
+        ("USB", lambda: discover_usb(report=usb_report), True),
+        ("network", discover_network, False),
+        ("Bluetooth", discover_bluetooth, False),
     ):
         try:
             out.extend(fn())
@@ -764,4 +878,13 @@ def discover_all() -> list[PrinterDescriptor]:
                 transport_name,
                 exc,
             )
+            if is_usb and usb_report is not None:
+                # `usb.core.find` can fail before a single device is walked
+                # (no libusb backend, for one). Saying nothing here would let
+                # the caller show the scan that came before as if it were this
+                # one (found by review).
+                usb_report.update({
+                    "seen": 0, "matched": 0, "skipped": [], "skipped_total": 0,
+                    "error": str(exc),
+                })
     return out
