@@ -106,6 +106,13 @@ class FiscalReceipt(BaseModel):
     # ---- QR ----
     qr_url: Optional[str] = None             # URL для перевірки чека (з фіск. оператора)
 
+    # ---- QR закладу (PET-921) ----
+    # Куди прийти після покупки: телеграм-бот розсилок, інстаграм, сайт. Вибирає
+    # заклад у налаштуваннях; порожньо — на чеку його немає. Друкується ПЕРЕД
+    # брендами (оператор + petshandler) і тим самим квадратом, що й податковий.
+    promo_qr: Optional[str] = None
+    promo_qr_caption: Optional[str] = None   # "Підписатися на новини"
+
     # ---- Operator brand ----
     operator: Optional[str] = None           # "checkbox" / "vchasno_kasa" / None
 
