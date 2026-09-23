@@ -293,6 +293,68 @@ class SSITerminalAdapter(TerminalAdapter):
             )
         return out
 
+    async def _resolve_merchant_id(
+        self, requested: Optional[str], *, operation: str = "operation",
+    ) -> str:
+        """Which merchant this operation belongs to.
+
+        Order: what the caller named, then the default recorded when the
+        terminal was registered, then the terminal itself.
+
+        BH-180 — that last step was missing, so a terminal carrying exactly
+        one merchant refused every request that did not name it. Nothing was
+        being chosen there: with one merchant there is no choice to make. It
+        showed up as a refund the till could not run (PET-918), because the
+        refund window sends no merchant and nobody had recorded a default.
+
+        With several merchants we still refuse, and now say which ones exist.
+        Taking the first would move money to the wrong merchant quietly, and
+        only the caller knows which one the original payment used.
+        """
+        if requested:
+            return requested
+        if self.registration.default_merchant_id:
+            return self.registration.default_merchant_id
+        try:
+            merchants = await self.list_merchants()
+        except TerminalUnavailable:
+            # Keep the terminal's own reason. Calling a busy or unreachable
+            # terminal "no merchant configured" sends support hunting the
+            # wrong thing (found by review).
+            raise
+        except Exception as exc:  # noqa: BLE001 — odd firmware, broken frame
+            raise TerminalUnavailable(
+                "could not ask the terminal which merchants it has: "
+                f"{exc}",
+                code="merchant_lookup_failed",
+            ) from exc
+        # Same id twice (one per terminalId) is one merchant, not a choice.
+        usable = list(dict.fromkeys(m.merchant_id for m in merchants if m.merchant_id))
+        if len(usable) == 1:
+            # Loud on purpose for a refund: the money goes to the merchant the
+            # terminal has TODAY, and only the caller knows which one the
+            # original payment used. Safe when there is one and always has
+            # been; a reconfigured terminal is the case this cannot see.
+            logger.warning(
+                "[%s] %s without a merchant_id — using the terminal's only "
+                "one (%s); the caller should name it",
+                self.descriptor.id, operation, usable[0],
+            )
+            # The protocol wants breathing room between requests, and the next
+            # one moves money (found by review).
+            await asyncio.sleep(INTER_REQUEST_PAUSE_S)
+            return usable[0]
+        if not usable:
+            raise TerminalUnavailable(
+                "no merchant_id provided and the terminal reports no merchants",
+                code="missing_merchant",
+            )
+        raise TerminalUnavailable(
+            "no merchant_id provided and the terminal has several: "
+            + ", ".join(usable),
+            code="missing_merchant",
+        )
+
     async def charge(self, request: ChargeRequest) -> AcquirerResult:
         """End-to-end Purchase flow per doc §3.1:
 
@@ -304,16 +366,9 @@ class SSITerminalAdapter(TerminalAdapter):
         Times out after STATUS_POLL_MAX_S (3 minutes) and Interrupts —
         a runaway transaction never blocks the manager event loop.
         """
-        merchant_id = (
-            request.merchant_id
-            or self.registration.default_merchant_id
-            or ""
+        merchant_id = await self._resolve_merchant_id(
+            request.merchant_id, operation="charge",
         )
-        if not merchant_id:
-            raise TerminalUnavailable(
-                "no merchant_id provided and registration has no default",
-                code="missing_merchant",
-            )
 
         params: dict = {
             "transAmount": str(request.amount_kopecks),
@@ -487,16 +542,9 @@ class SSITerminalAdapter(TerminalAdapter):
         вимагаємо їх ЯВНО — ``Void`` без номера чека або ``Refund`` без rrn і
         коду авторизації термінал прийняв би й відмовив уже перед людиною.
         """
-        merchant_id = (
-            request.merchant_id
-            or self.registration.default_merchant_id
-            or ""
+        merchant_id = await self._resolve_merchant_id(
+            request.merchant_id, operation="refund",
         )
-        if not merchant_id:
-            raise TerminalUnavailable(
-                "no merchant_id provided and registration has no default",
-                code="missing_merchant",
-            )
 
         operation = request.extras.get("operation") or "Refund"
         if operation not in ("Refund", "Void", "PartialVoid"):

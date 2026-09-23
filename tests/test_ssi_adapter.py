@@ -264,9 +264,11 @@ async def test_charge_request_carries_required_fields() -> None:
 
 
 @pytest.mark.asyncio
-async def test_charge_raises_when_no_merchant_id() -> None:
-    """Registration without a default_merchant_id + request without
-    one in the body → fast fail before we touch the network."""
+async def test_charge_without_a_merchant_asks_an_unreachable_terminal_and_says_so() -> None:
+    """No merchant in the request and none recorded at registration: since
+    BH-180 we ask the terminal rather than refusing outright. When it cannot
+    be reached, the caller hears THAT — not "no merchant configured", which
+    would send support looking in the wrong place."""
     reg = TerminalRegistration(
         descriptor=TerminalDescriptor(
             id="test",
@@ -280,7 +282,7 @@ async def test_charge_raises_when_no_merchant_id() -> None:
     adapter = SSITerminalAdapter(reg)
     with pytest.raises(TerminalUnavailable) as exc:
         await adapter.charge(ChargeRequest(amount_kopecks=100))
-    assert exc.value.code == "missing_merchant"
+    assert exc.value.code == "unreachable"
 
 
 @pytest.mark.asyncio
@@ -518,3 +520,241 @@ async def test_an_unknown_operation_never_reaches_the_terminal() -> None:
                 amount_kopecks=100, rrn="1", extras={"operation": "Purchase"},
             ))
         assert mock.requests == []
+
+
+# ---------------------------------------------------------------------
+# Which merchant the operation belongs to (BH-180)
+# ---------------------------------------------------------------------
+#
+# The step that asks the TERMINAL was missing, so a terminal carrying exactly
+# one merchant refused everything that did not name it — including the till's
+# refund window, which sends none (PET-918).
+
+
+def _no_default(port: int) -> TerminalRegistration:
+    reg = _registration(port)
+    reg.default_merchant_id = None
+    return reg
+
+
+def _merchant_list(*ids: str) -> dict:
+    return {"GetMerchantListDetailed": [{
+        "method": "GetMerchantListDetailed",
+        "error": False,
+        "params": {"merchantList": [
+            {"merchantId": mid, "terminalId": "T1", "merchantName": f"Shop {mid}"}
+            for mid in ids
+        ]},
+    }]}
+
+
+def _approved_refund() -> dict:
+    return {
+        "Refund": [{"method": "Refund", "error": False}],
+        "GetStatus": [{"error": False, "status": "S00"}],
+        "GetLastResult": [{"error": False, "params": {
+            "transactionResult": "APPROVED", "rrn": "123456789012",
+            "authCode": "654321", "responseCode": "00",
+        }}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_with_one_merchant_needs_no_merchant_id():
+    responses = {**_approved_refund(), **_merchant_list("000000060007176")}
+    async with MockTerminal(responses) as term:
+        adapter = SSITerminalAdapter(_no_default(term.port))
+
+        result = await adapter.refund(RefundRequest(
+            amount_kopecks=21900, rrn="123456789012", auth_code="654321",
+        ))
+
+    assert result.status == "ok"
+    refund = next(r for r in term.requests if r.get("method") == "Refund")
+    assert refund["params"]["merchantId"] == "000000060007176"
+
+
+@pytest.mark.asyncio
+async def test_several_merchants_still_refuse_and_name_them():
+    """Picking one would move money to the wrong merchant, and only the caller
+    knows which one the original payment used."""
+    responses = {**_approved_refund(), **_merchant_list("111", "222")}
+    async with MockTerminal(responses) as term:
+        adapter = SSITerminalAdapter(_no_default(term.port))
+
+        with pytest.raises(TerminalUnavailable) as err:
+            await adapter.refund(RefundRequest(
+                amount_kopecks=21900, rrn="123456789012",
+            ))
+
+    assert err.value.code == "missing_merchant"
+    assert "111" in str(err.value) and "222" in str(err.value)
+    assert not any(r.get("method") == "Refund" for r in term.requests), \
+        "the refund was sent despite the refusal"
+
+
+@pytest.mark.asyncio
+async def test_a_terminal_that_cannot_answer_is_refused_not_guessed():
+    responses = {**_approved_refund()}  # no merchant list → mock answers E05
+    async with MockTerminal(responses) as term:
+        adapter = SSITerminalAdapter(_no_default(term.port))
+
+        with pytest.raises(TerminalUnavailable) as err:
+            await adapter.refund(RefundRequest(
+                amount_kopecks=21900, rrn="123456789012",
+            ))
+
+    # The mock has no merchant list, so it answers the protocol's own "unknown
+    # method" error — and that code is what reaches the caller.
+    assert err.value.code == "e05"
+    assert any(
+        r.get("method") == "GetMerchantListDetailed" for r in term.requests
+    ), "the terminal was never asked — this is the old refuse-outright path"
+    assert not any(r.get("method") == "Refund" for r in term.requests)
+
+
+@pytest.mark.asyncio
+async def test_a_named_merchant_is_used_without_asking_the_terminal():
+    responses = {**_approved_refund(), **_merchant_list("111", "222")}
+    async with MockTerminal(responses) as term:
+        adapter = SSITerminalAdapter(_no_default(term.port))
+
+        result = await adapter.refund(RefundRequest(
+            amount_kopecks=21900, rrn="123456789012", merchant_id="222",
+        ))
+
+    assert result.status == "ok"
+    assert not any(
+        r.get("method") == "GetMerchantListDetailed" for r in term.requests
+    ), "asked the terminal although the caller had already said which merchant"
+    refund = next(r for r in term.requests if r.get("method") == "Refund")
+    assert refund["params"]["merchantId"] == "222"
+
+
+@pytest.mark.asyncio
+async def test_the_registered_default_is_used_without_asking_the_terminal():
+    responses = {**_approved_refund(), **_merchant_list("111", "222")}
+    async with MockTerminal(responses) as term:
+        adapter = SSITerminalAdapter(_registration(term.port))  # has a default
+
+        result = await adapter.refund(RefundRequest(
+            amount_kopecks=21900, rrn="123456789012",
+        ))
+
+    assert result.status == "ok"
+    assert not any(
+        r.get("method") == "GetMerchantListDetailed" for r in term.requests
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_charge_without_a_merchant_works_the_same_way():
+    """The same gap sat in the payment path; the till only hid it by sending
+    the merchant itself."""
+    responses = {
+        "Purchase": [{"method": "Purchase", "error": False}],
+        "GetStatus": [{"error": False, "status": "S00"}],
+        "GetLastResult": [{"error": False, "params": {
+            "transactionResult": "APPROVED", "rrn": "1", "authCode": "2",
+            "responseCode": "00",
+        }}],
+        **_merchant_list("000000060007176"),
+    }
+    async with MockTerminal(responses) as term:
+        adapter = SSITerminalAdapter(_no_default(term.port))
+
+        result = await adapter.charge(ChargeRequest(amount_kopecks=100))
+
+    assert result.status == "ok"
+    purchase = next(r for r in term.requests if r.get("method") == "Purchase")
+    assert purchase["params"]["merchantId"] == "000000060007176"
+
+
+@pytest.mark.asyncio
+async def test_the_same_merchant_listed_twice_is_still_one_merchant():
+    """Some firmware lists a merchant once per terminalId. That is one
+    merchant and no choice to make, not a reason to refuse."""
+    responses = {**_approved_refund(), **_merchant_list("111", "111")}
+    async with MockTerminal(responses) as term:
+        adapter = SSITerminalAdapter(_no_default(term.port))
+
+        result = await adapter.refund(RefundRequest(
+            amount_kopecks=21900, rrn="123456789012",
+        ))
+
+    assert result.status == "ok"
+    refund = next(r for r in term.requests if r.get("method") == "Refund")
+    assert refund["params"]["merchantId"] == "111"
+
+
+@pytest.mark.asyncio
+async def test_two_merchants_listed_twice_each_are_still_two():
+    """De-duplication must not turn a real choice into a guess."""
+    responses = {**_approved_refund(), **_merchant_list("111", "111", "222", "222")}
+    async with MockTerminal(responses) as term:
+        adapter = SSITerminalAdapter(_no_default(term.port))
+
+        with pytest.raises(TerminalUnavailable) as err:
+            await adapter.refund(RefundRequest(
+                amount_kopecks=21900, rrn="123456789012",
+            ))
+
+    assert "111" in str(err.value) and "222" in str(err.value)
+    assert not any(r.get("method") == "Refund" for r in term.requests)
+
+
+@pytest.mark.asyncio
+async def test_a_busy_terminal_keeps_its_own_reason():
+    """The terminal answering "busy" to the merchant question must not reach
+    the cashier as "no merchant configured" — support would chase the wrong
+    thing (found by review)."""
+    responses = {
+        **_approved_refund(),
+        "GetMerchantListDetailed": [{
+            "method": "GetMerchantListDetailed", "error": True,
+            "errorCode": "E06", "errorDescription": "Термінал зайнятий",
+        }],
+    }
+    async with MockTerminal(responses) as term:
+        adapter = SSITerminalAdapter(_no_default(term.port))
+
+        with pytest.raises(TerminalUnavailable) as err:
+            await adapter.refund(RefundRequest(
+                amount_kopecks=21900, rrn="123456789012",
+            ))
+
+    assert err.value.code == "e06", f"lost the terminal's own code: {err.value.code}"
+    assert not any(r.get("method") == "Refund" for r in term.requests)
+
+
+@pytest.mark.asyncio
+async def test_the_money_command_does_not_tread_on_the_merchant_question(monkeypatch):
+    """The protocol wants at least 0.25s between requests, and asking the
+    terminal for its merchants puts a new request immediately before the one
+    that moves money (found by review)."""
+    import time
+
+    from src.services.terminals import ssi as ssi_module
+
+    monkeypatch.setattr(ssi_module, "INTER_REQUEST_PAUSE_S", 0.4)
+
+    class _TimedTerminal(MockTerminal):
+        def __init__(self, responses: dict) -> None:
+            super().__init__(responses)
+            self.stamps: list[tuple[str, float]] = []
+
+        def _next_response(self, method: str) -> dict:
+            self.stamps.append((method, time.monotonic()))
+            return super()._next_response(method)
+
+    responses = {**_approved_refund(), **_merchant_list("111")}
+    async with _TimedTerminal(responses) as term:
+        adapter = SSITerminalAdapter(_no_default(term.port))
+
+        await adapter.refund(RefundRequest(
+            amount_kopecks=21900, rrn="123456789012",
+        ))
+
+    asked = next(t for m, t in term.stamps if m == "GetMerchantListDetailed")
+    sent = next(t for m, t in term.stamps if m == "Refund")
+    assert sent - asked >= 0.3, f"only {sent - asked:.3f}s between the two"
