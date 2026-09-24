@@ -74,6 +74,77 @@ def _qr_box_size(modules_across: int, paper_w: int) -> int:
     return max(1, min(box, fit))             # but never overflow the paper
 
 
+def _print_qr(printer, data: str, width: int, *, lead_blank: bool = True) -> None:
+    """Друк одного QR — і податкового, і власного QR закладу (PET-921).
+
+    Одна функція на обидва, щоб вони виходили ОДНАКОВИМ квадратом: розмір
+    задає `_qr_box_size` від цільової ширини (~3 см на 80 мм, ~4 см на 58 мм),
+    тож код із коротшим вмістом друкується тими самими сантиметрами, просто
+    товщими модулями. Друга копія цього коду неминуче розійшлася б із першою —
+    саме тут лежать ерозія проти розпливання чорного й підлога розміру модуля,
+    без яких дешева 58-мм голова не зчитується.
+    """
+    # Порожній рядок перед кодом — для ПОДАТКОВОГО, під яким іде суцільний
+    # текст. У QR закладу над кодом стоїть власний підпис, і цей рядок
+    # відривав підпис від коду (власник показав скріншотом).
+    if lead_blank:
+        printer.text("\n")
+    # Render the QR through PIL + the bitmap pipeline so it lands on the
+    # paper centred regardless of the current alignment command — the
+    # native printer.qr() bypasses our bitmap patch and was always
+    # left-justified on this hardware.
+    paper_w = 576 if width >= 48 else 384
+    # 80 mm scans fine and MUST stay exactly as it was — so the two
+    # fixes below (wider quiet zone, bigger modules, ink-spread erosion)
+    # apply to 58 mm ONLY. On 80 mm this is byte-for-byte the old code.
+    narrow = paper_w <= 384  # 58 mm — the cheap head that over-inks
+    #
+    # box_size is an integer and box_size * modules_across <= paper_w by
+    # construction, so we never resize (resizing a 1-bit QR misaligns
+    # modules and is exactly what breaks scanning).
+    #
+    # Quiet zone: 58 mm uses border=4 (ISO/IEC 18004 minimum) for a bit
+    # more breathing room; 80 mm keeps its original border=2.
+    border = 4 if narrow else 2
+    qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=border)
+    qr.add_data(data)
+    qr.make(fit=True)
+    modules_across = qr.modules_count + qr.border * 2
+    qr.box_size = _qr_box_size(modules_across, paper_w)
+    qr_img = qr.make_image(fill_color="black", back_color="white").convert("1")
+    if narrow:
+        # Ink-spread compensation — 58 mm ONLY. That head bleeds black
+        # outward ~1-2 dots; printing the modules a dot thinner cancels it
+        # so the white gaps survive and the code scans (proven by decoding
+        # a real failed print + a bleed simulation; the box>=7 floor keeps
+        # this from over-thinning a crisp printer). MaxFilter(3) grows
+        # white / shrinks black by 1 px. 80 mm skips this entirely.
+        qr_img = (
+            qr_img.convert("L")
+            .filter(ImageFilter.MaxFilter(3))
+            .point(lambda p: 255 if p >= 128 else 0)
+            .convert("1")
+        )
+    # Centre on the paper. A bottom gap is baked into the canvas instead
+    # of a trailing LF: GS v 0 already feeds its own height, and an extra
+    # "\n" would add a firmware-dependent feed. On 58 mm add a matching
+    # top gap so the quiet zone survives contact with the text above; on
+    # 80 mm keep it exactly as it was (bottom gap only, pasted at y=0).
+    bottom_gap = 8
+    top_gap = 8 if narrow else 0
+    canvas = Image.new("1", (paper_w, qr_img.height + top_gap + bottom_gap), 1)
+    canvas.paste(qr_img, ((paper_w - qr_img.width) // 2, top_gap))
+    # BH-162 — віддаємо картинку пристрою, а не жорстко ESC/POS-растром.
+    # Прямий `_raw(image_to_gs_v_0(...))` на TSPL-принтері означав чек БЕЗ
+    # QR: прошивка приймала байти й викидала. Хук ставить bitmap-шим; якщо
+    # його немає (render_mode="native"), лишається старий шлях.
+    emit = getattr(printer, "_bh_emit_image", None)
+    if callable(emit):
+        emit(canvas)
+    else:
+        printer._raw(image_to_gs_v_0(canvas))
+
+
 def _format_money(value: float) -> str:
     return f"{value:.2f}"
 
@@ -251,61 +322,7 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
 
     # ---- QR code ----
     if receipt.qr_url:
-        printer.text("\n")
-        # Render the QR through PIL + the bitmap pipeline so it lands on the
-        # paper centred regardless of the current alignment command — the
-        # native printer.qr() bypasses our bitmap patch and was always
-        # left-justified on this hardware.
-        paper_w = 576 if width >= 48 else 384
-        # 80 mm scans fine and MUST stay exactly as it was — so the two
-        # fixes below (wider quiet zone, bigger modules, ink-spread erosion)
-        # apply to 58 mm ONLY. On 80 mm this is byte-for-byte the old code.
-        narrow = paper_w <= 384  # 58 mm — the cheap head that over-inks
-        #
-        # box_size is an integer and box_size * modules_across <= paper_w by
-        # construction, so we never resize (resizing a 1-bit QR misaligns
-        # modules and is exactly what breaks scanning).
-        #
-        # Quiet zone: 58 mm uses border=4 (ISO/IEC 18004 minimum) for a bit
-        # more breathing room; 80 mm keeps its original border=2.
-        border = 4 if narrow else 2
-        qr = qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M, border=border)
-        qr.add_data(receipt.qr_url)
-        qr.make(fit=True)
-        modules_across = qr.modules_count + qr.border * 2
-        qr.box_size = _qr_box_size(modules_across, paper_w)
-        qr_img = qr.make_image(fill_color="black", back_color="white").convert("1")
-        if narrow:
-            # Ink-spread compensation — 58 mm ONLY. That head bleeds black
-            # outward ~1-2 dots; printing the modules a dot thinner cancels it
-            # so the white gaps survive and the code scans (proven by decoding
-            # a real failed print + a bleed simulation; the box>=7 floor keeps
-            # this from over-thinning a crisp printer). MaxFilter(3) grows
-            # white / shrinks black by 1 px. 80 mm skips this entirely.
-            qr_img = (
-                qr_img.convert("L")
-                .filter(ImageFilter.MaxFilter(3))
-                .point(lambda p: 255 if p >= 128 else 0)
-                .convert("1")
-            )
-        # Centre on the paper. A bottom gap is baked into the canvas instead
-        # of a trailing LF: GS v 0 already feeds its own height, and an extra
-        # "\n" would add a firmware-dependent feed. On 58 mm add a matching
-        # top gap so the quiet zone survives contact with the text above; on
-        # 80 mm keep it exactly as it was (bottom gap only, pasted at y=0).
-        bottom_gap = 8
-        top_gap = 8 if narrow else 0
-        canvas = Image.new("1", (paper_w, qr_img.height + top_gap + bottom_gap), 1)
-        canvas.paste(qr_img, ((paper_w - qr_img.width) // 2, top_gap))
-        # BH-162 — віддаємо картинку пристрою, а не жорстко ESC/POS-растром.
-        # Прямий `_raw(image_to_gs_v_0(...))` на TSPL-принтері означав чек БЕЗ
-        # QR: прошивка приймала байти й викидала. Хук ставить bitmap-шим; якщо
-        # його немає (render_mode="native"), лишається старий шлях.
-        emit = getattr(printer, "_bh_emit_image", None)
-        if callable(emit):
-            emit(canvas)
-        else:
-            printer._raw(image_to_gs_v_0(canvas))
+        _print_qr(printer, receipt.qr_url, width)
 
     # ---- Pos footer ----
     printer.text(_separator(width) + "\n")
@@ -315,6 +332,23 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
     printer.set(align="center", bold=True)
     printer.text(receipt.receipt_type + "\n")
     printer.set(align="left", bold=False)
+
+    # ---- QR закладу (PET-921) ----
+    # Саме тут, за словами власника: «перед petshandler та назвою фіскального
+    # оператора». Підпис над кодом, бо сам по собі QR не каже, нащо його
+    # сканувати.
+    if receipt.promo_qr:
+        caption = bool(receipt.promo_qr_caption)
+        if caption:
+            # Жирним, як і назва чека вище: це заклик прочитати, а не службовий
+            # рядок, і він мусить читатись першим.
+            printer.set(align="center", bold=True)
+            for line in _wrap_lines(receipt.promo_qr_caption, width):
+                printer.text(line + "\n")
+            printer.set(align="left", bold=False)
+        # Є підпис — код іде одразу під ним, без порожнього рядка між ними.
+        _print_qr(printer, receipt.promo_qr, width, lead_blank=not caption)
+
     if receipt.operator:
         printer.set(align="center")
         printer.text(receipt.operator.replace("_", ".").upper() + "\n")
