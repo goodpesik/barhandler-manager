@@ -35,8 +35,10 @@ class FakePrinter:
     def text(self, value: str) -> None:
         self.calls.append(("text", value))
 
-    def set(self, **_kw) -> None:
-        pass
+    def set(self, **kw) -> None:
+        # Записуємо й це: жирність підпису — така сама частина вигляду чека,
+        # як і сам текст, і перевіряти її більше нічим.
+        self.calls.append(("set", kw))
 
     def cut(self, **_kw) -> None:
         pass
@@ -143,3 +145,49 @@ def test_caption_is_optional():
     printer = _render(_receipt(promo_qr=BOT_URL))
 
     assert len(printer.images) == 2
+
+
+def test_nothing_stands_between_the_caption_and_the_code():
+    """Підпис і код — одна річ, і порожній рядок між ними їх роз'єднує.
+
+    Той рядок належить ПОДАТКОВОМУ коду, під яким іде суцільний текст; сюди
+    він потрапив разом зі спільною функцією друку, і власник показав це
+    скріншотом: між написом і квадратом зяяла смуга.
+    """
+    printer = _render(
+        _receipt(promo_qr=BOT_URL, promo_qr_caption="Підписатися на новини")
+    )
+
+    caption = printer.index_of_text("Підписатися на новини")
+    code = printer.index_of_image(1)
+    between = [
+        (kind, value)
+        for kind, value in printer.calls[caption + 1 : code]
+        if kind == "text"
+    ]
+
+    assert between == [], f"між підписом і кодом надрукувалось: {between!r}"
+
+
+def test_the_caption_is_printed_bold():
+    printer = _render(
+        _receipt(promo_qr=BOT_URL, promo_qr_caption="Підписатися на новини")
+    )
+
+    caption = printer.index_of_text("Підписатися на новини")
+    before = [kw for kind, kw in printer.calls[:caption] if kind == "set"]
+
+    assert before[-1].get("bold") is True, before[-1]
+    # І знімається одразу після нього: решта чека жирною бути не мусить.
+    after = [kw for kind, kw in printer.calls[caption + 1 :] if kind == "set"]
+    assert after[0].get("bold") is False, after[0]
+
+
+def test_the_tax_code_keeps_its_blank_line():
+    """Податковий код лишається байт у байт таким, як був."""
+    printer = _render(_receipt(promo_qr=BOT_URL, promo_qr_caption="Новини"))
+
+    tax = printer.index_of_image(0)
+    before = [v for kind, v in printer.calls[:tax] if kind == "text"]
+
+    assert before[-1] == "\n", before[-3:]

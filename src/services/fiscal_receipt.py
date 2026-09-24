@@ -74,7 +74,7 @@ def _qr_box_size(modules_across: int, paper_w: int) -> int:
     return max(1, min(box, fit))             # but never overflow the paper
 
 
-def _print_qr(printer, data: str, width: int) -> None:
+def _print_qr(printer, data: str, width: int, *, lead_blank: bool = True) -> None:
     """Друк одного QR — і податкового, і власного QR закладу (PET-921).
 
     Одна функція на обидва, щоб вони виходили ОДНАКОВИМ квадратом: розмір
@@ -84,7 +84,11 @@ def _print_qr(printer, data: str, width: int) -> None:
     саме тут лежать ерозія проти розпливання чорного й підлога розміру модуля,
     без яких дешева 58-мм голова не зчитується.
     """
-    printer.text("\n")
+    # Порожній рядок перед кодом — для ПОДАТКОВОГО, під яким іде суцільний
+    # текст. У QR закладу над кодом стоїть власний підпис, і цей рядок
+    # відривав підпис від коду (власник показав скріншотом).
+    if lead_blank:
+        printer.text("\n")
     # Render the QR through PIL + the bitmap pipeline so it lands on the
     # paper centred regardless of the current alignment command — the
     # native printer.qr() bypasses our bitmap patch and was always
@@ -334,12 +338,16 @@ def render_fiscal_receipt(printer, receipt: FiscalReceipt, *, chars_per_line: in
     # оператора». Підпис над кодом, бо сам по собі QR не каже, нащо його
     # сканувати.
     if receipt.promo_qr:
-        if receipt.promo_qr_caption:
-            printer.set(align="center")
+        caption = bool(receipt.promo_qr_caption)
+        if caption:
+            # Жирним, як і назва чека вище: це заклик прочитати, а не службовий
+            # рядок, і він мусить читатись першим.
+            printer.set(align="center", bold=True)
             for line in _wrap_lines(receipt.promo_qr_caption, width):
                 printer.text(line + "\n")
-            printer.set(align="left")
-        _print_qr(printer, receipt.promo_qr, width)
+            printer.set(align="left", bold=False)
+        # Є підпис — код іде одразу під ним, без порожнього рядка між ними.
+        _print_qr(printer, receipt.promo_qr, width, lead_blank=not caption)
 
     if receipt.operator:
         printer.set(align="center")
