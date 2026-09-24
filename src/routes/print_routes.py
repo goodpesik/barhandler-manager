@@ -23,7 +23,7 @@ from src.models.fiscal_receipt import FiscalReceipt
 from src.models.printer import PrintProtocol, PrinterKind
 from src.models.receipt import ReceiptPayload
 from src.services.bitmap_render import dots_for, image_to_gs_v_0
-from src.services.fiscal_receipt import render_fiscal_receipt
+from src.services.fiscal_receipt import _print_qr, render_fiscal_receipt
 from src.services.receipt import render_receipt
 from src.services.tspl_render import image_to_tspl_bitmap
 
@@ -161,6 +161,17 @@ class LinesPayload(BaseModel):
 
     lines: list[FormattedLine] = Field(default_factory=list)
     open_drawer: bool = False
+    # PET-921 — власний QR закладу під текстом. Нефіскальний чек їде саме цим
+    # шляхом, і без цих двох полів код був би лише на фіскальному — тобто на
+    # половині чеків продажу. Малюється тією ж функцією, що й податковий, тож
+    # виходить тим самим квадратом.
+    qr: Optional[str] = None
+    qr_caption: Optional[str] = None
+    # Рядки ПІСЛЯ коду — бренди («petshandler»). На фіскальному чеку вони
+    # окремим полем, тож менеджер знає, куди вставити код; тут вони просто
+    # останні в переліку, і без цього поля QR друкувався б ПІД ними, хоч
+    # власник просив над.
+    tail_lines: list[FormattedLine] = Field(default_factory=list)
 
 
 @router.post("/lines")
@@ -183,6 +194,25 @@ async def print_lines(
             )
             esc.text((line.text or "") + "\n")
         esc.set(align="left", bold=False, double_height=False, double_width=False)
+        if payload.qr:
+            if payload.qr_caption:
+                esc.set(align="center")
+                esc.text(payload.qr_caption + "\n")
+                esc.set(align="left")
+            _print_qr(esc, payload.qr, reg.chars_per_line)
+        if payload.tail_lines:
+            for line in payload.tail_lines:
+                esc.set(
+                    align=line.align,
+                    bold=line.bold,
+                    double_height=line.double_height,
+                    double_width=line.double_width,
+                )
+                esc.text((line.text or "") + "\n")
+            # Скидаємо формат ЛИШЕ якщо самі його й міняли: на «native»-принтері
+            # кожен `set` пише реальні байти, і зайвий скид міняв би вивід у
+            # чеків, які про QR і не знають (знайшло друге коло ревʼю).
+            esc.set(align="left", bold=False, double_height=False, double_width=False)
         esc.text("\n\n\n")
         esc.cut()
         _maybe_open_drawer(esc, reg, payload.open_drawer)
