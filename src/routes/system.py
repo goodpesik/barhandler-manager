@@ -700,6 +700,7 @@ def _render_uplink_block(
     tenant_id: str = "",
     tenant_name: str = "",
     url: str = _DEFAULT_UPLINK_URL,
+    enabled_at: str = "",
 ) -> str:
     # tenant_name may contain quotes/Cyrillic — YAML double-quoted scalar
     # only needs backslash + double-quote escaped.
@@ -717,6 +718,11 @@ def _render_uplink_block(
         f"  tenant: \"{tenant}\"\n"
         f"  tenant_id: \"{tenant_id}\"\n"
         f"  tenant_name: \"{safe_name}\"\n"
+        # PET-928 — when it was switched on. Remote diagnostics let support
+        # read logs and run commands on someone's machine, so it is not meant
+        # to stay on: this is what the day-long life is counted from, and it
+        # has to survive a restart or the clock would start again every boot.
+        f"  enabled_at: \"{enabled_at}\"\n"
         "  reconnect_delay: 2\n"
     )
 
@@ -728,8 +734,11 @@ def _replace_uplink_in_config(
     tenant_id: str = "",
     tenant_name: str = "",
     url: str = _DEFAULT_UPLINK_URL,
+    enabled_at: str = "",
 ) -> str:
-    new_block = _render_uplink_block(enabled, tenant, tenant_id, tenant_name, url)
+    new_block = _render_uplink_block(
+        enabled, tenant, tenant_id, tenant_name, url, enabled_at,
+    )
     m = _UPLINK_BLOCK_RE.search(text)
     if m:
         # Preserve a blank line before the new block if there was one.
@@ -739,6 +748,35 @@ def _replace_uplink_in_config(
     # No existing block — append.
     base = text.rstrip() + "\n\n"
     return base + new_block
+
+
+def persist_uplink_state(uplink: dict) -> None:
+    """Write the uplink block to config.yaml from an already-updated dict.
+
+    PET-928 — the dashboard endpoint below builds its own values and writes
+    them inline; this is the same write for the callers that have no request
+    behind them (the day running out, an order from the server). Raises on an
+    OSError so the caller can decide what that is worth — for a shutdown it is
+    worth a log line, not a refusal.
+    """
+    _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    text = (
+        _CONFIG_PATH.read_text(encoding="utf-8")
+        if _CONFIG_PATH.exists()
+        else "server:\n  port: 9999\n"
+    )
+    _CONFIG_PATH.write_text(
+        _replace_uplink_in_config(
+            text,
+            bool(uplink.get("enabled")),
+            str(uplink.get("tenant", "")),
+            tenant_id=str(uplink.get("tenant_id", "")),
+            tenant_name=str(uplink.get("tenant_name", "")),
+            url=str(uplink.get("url") or _DEFAULT_UPLINK_URL),
+            enabled_at=str(uplink.get("enabled_at", "")),
+        ),
+        encoding="utf-8",
+    )
 
 
 @router.get("/uplink")
@@ -803,6 +841,14 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
         tenant_name = saved.get("tenant_name", "")
         tenant = saved.get("tenant", "")
 
+    # PET-928 — the countdown starts now; switching off clears it.
+    from datetime import datetime, timezone
+    enabled_at = (
+        datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        if payload.enabled
+        else ""
+    )
+
     # Persist to config.yaml so the next boot reflects this state.
     try:
         # Файла може не бути: load_config() падає в дефолти в памʼяті, якщо
@@ -817,6 +863,7 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
         new_text = _replace_uplink_in_config(
             text, payload.enabled, tenant,
             tenant_id=tenant_id, tenant_name=tenant_name,
+            enabled_at=enabled_at,
         )
         _CONFIG_PATH.write_text(new_text, encoding="utf-8")
     except OSError as exc:
@@ -832,6 +879,7 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
     cfg["uplink"]["tenant_id"] = tenant_id
     cfg["uplink"]["tenant_name"] = tenant_name
     cfg["uplink"]["url"] = _DEFAULT_UPLINK_URL
+    cfg["uplink"]["enabled_at"] = enabled_at
 
     # Runtime toggle — start or stop the LogUplinkClient in place.
     from src.services.log_uplink import (
@@ -859,7 +907,7 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
             "reconnect_delay": 2,
         })
         client.attach_handler_to_root()
-        client.set_diagnostics_callback(make_callback(cfg))
+        client.set_diagnostics_callback(make_callback(cfg, state))
         set_active(client)
         state.uplink = client
         asyncio.create_task(client.start(install_id, version))

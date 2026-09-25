@@ -116,6 +116,10 @@ def _finalize(cfg: dict) -> dict:
         "tenant_id": str(uplink_cfg.get("tenant_id", "")),
         "tenant_name": str(uplink_cfg.get("tenant_name", "")),
         "reconnect_delay": int(uplink_cfg.get("reconnect_delay", 2)),
+        # PET-928 — when remote diagnostics were switched on, ISO-8601 UTC.
+        # Empty while off. Read at boot so a restart does not hand the session
+        # another full day.
+        "enabled_at": str(uplink_cfg.get("enabled_at", "")),
     }
     # install_id alone is enough to reach the install from the logs
     # server, so an enabled uplink no longer HARD-requires a tenant label

@@ -106,12 +106,23 @@ def create_app(config: dict) -> FastAPI:
             uplink = LogUplinkClient(uplink_cfg)
             uplink.attach_handler_to_root()
             from src.services.diagnostics import make_callback
-            uplink.set_diagnostics_callback(make_callback(config))
+            uplink.set_diagnostics_callback(make_callback(config, app.state))
             set_active(uplink)
             app.state.uplink = uplink
             asyncio.create_task(uplink.start(install_id, version))
 
+        # PET-928 — remote diagnostics have a life of one day, counted from
+        # when they were switched on rather than from this boot: a restart
+        # must not hand the session another day. Checked here in case the day
+        # ran out while the manager was down, and then on a timer.
+        from src.services.uplink_life import is_expired, shut_down, watch
+
+        if is_expired(config):
+            await shut_down(app.state, config, "a day passed while off")
+        uplink_watch = asyncio.create_task(watch(app.state, config))
+
         yield
+        uplink_watch.cancel()
 
         if uplink is not None:
             await uplink.stop()
