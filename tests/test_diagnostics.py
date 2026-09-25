@@ -76,9 +76,14 @@ async def test_uplink_off_is_not_an_unknown_command():
 
 
 @pytest.mark.asyncio
-async def test_uplink_off_answers_BEFORE_it_stops_the_socket(monkeypatch):
-    """The reply leaves first; afterwards there is nothing to answer on."""
-    import asyncio
+async def test_uplink_off_hands_the_shutdown_back_instead_of_doing_it(monkeypatch):
+    """The command answers; the socket goes only once that answer is sent.
+
+    Stopping it here would take away the very connection the reply travels on.
+    Sleeping «long enough» first was a guess at how long a send takes; the
+    shutdown is handed back as `_after_reply` so the caller can run it right
+    after awaiting the emit.
+    """
     from types import SimpleNamespace
 
     from src.services.diagnostics import make_callback
@@ -99,11 +104,88 @@ async def test_uplink_off_answers_BEFORE_it_stops_the_socket(monkeypatch):
 
     r = await cb("cmd-2", "uplink_off", {})
     assert r["ok"] is True
-    # Still up at the moment of the answer.
+    after = r["_after_reply"]
+    # Nothing has been taken away yet.
     assert stopped == []
-    await asyncio.sleep(0.7)
+    await after()
     assert stopped == ["stopped"]
     assert cfg["uplink"]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_reply_is_emitted_before_the_shutdown_runs(monkeypatch):
+    """Proven through the real dispatcher, in order, with no timing guess."""
+    from types import SimpleNamespace
+
+    from src.services.log_uplink import LogUplinkClient
+
+    order = []
+
+    client = LogUplinkClient({"url": "https://x", "tenant": "t", "reconnect_delay": 1})
+
+    async def fake_emit(event, payload):
+        order.append(("emit", event, payload.get("ok")))
+
+    monkeypatch.setattr(client, "_safe_emit", fake_emit)
+
+    async def after():
+        order.append(("shutdown",))
+
+    async def cb(cmd_id, cmd, args):
+        return {"cmd_id": cmd_id, "ok": True, "_after_reply": after}
+
+    client.set_diagnostics_callback(cb)
+    await client._on_diagnostic({"cmd_id": "c1", "cmd": "uplink_off", "args": {}})
+
+    assert order == [("emit", "diagnostic_result", True), ("shutdown",)]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_after_step_does_not_break_the_dispatcher(monkeypatch):
+    from src.services.log_uplink import LogUplinkClient
+
+    emitted = []
+    client = LogUplinkClient({"url": "https://x", "tenant": "t", "reconnect_delay": 1})
+
+    async def fake_emit(event, payload):
+        emitted.append(payload)
+
+    monkeypatch.setattr(client, "_safe_emit", fake_emit)
+
+    async def after():
+        raise RuntimeError("socket already gone")
+
+    async def cb(cmd_id, cmd, args):
+        return {"cmd_id": cmd_id, "ok": True, "_after_reply": after}
+
+    client.set_diagnostics_callback(cb)
+    # The answer still went out; the failure is logged, not raised.
+    await client._on_diagnostic({"cmd_id": "c1", "cmd": "uplink_off", "args": {}})
+    assert emitted and emitted[0]["ok"] is True
+
+
+@pytest.mark.asyncio
+async def test_the_marker_never_travels_to_the_server(monkeypatch):
+    # `_after_reply` is a local coroutine, not something to serialise.
+    from src.services.log_uplink import LogUplinkClient
+
+    emitted = []
+    client = LogUplinkClient({"url": "https://x", "tenant": "t", "reconnect_delay": 1})
+
+    async def fake_emit(event, payload):
+        emitted.append(payload)
+
+    monkeypatch.setattr(client, "_safe_emit", fake_emit)
+
+    async def after():
+        return None
+
+    async def cb(cmd_id, cmd, args):
+        return {"cmd_id": cmd_id, "ok": True, "_after_reply": after}
+
+    client.set_diagnostics_callback(cb)
+    await client._on_diagnostic({"cmd_id": "c1", "cmd": "uplink_off", "args": {}})
+    assert "_after_reply" not in emitted[0]
 
 
 @pytest.mark.asyncio

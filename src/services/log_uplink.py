@@ -322,7 +322,20 @@ class LogUplinkClient:
             result = await self._diagnostics_cb(cmd_id, cmd, args)
         except Exception as e:
             result = {"cmd_id": cmd_id, "ok": False, "error": f"{type(e).__name__}: {e}"}
+        # PET-928 — a command may need to act only AFTER its answer has left,
+        # because the action removes the very socket that would carry it.
+        # Sleeping «long enough» was a guess; this is the actual send.
+        after = result.pop("_after_reply", None) if isinstance(result, dict) else None
         await self._safe_emit("diagnostic_result", result)
+        if after is not None:
+            # The reply is on the wire; only now may the command do something
+            # that takes this socket away.
+            try:
+                await after()
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "post-reply step of %s failed: %s", cmd, e,
+                )
 
     def emit_event(self, event_type: str, **payload: Any) -> None:
         """Fire-and-forget business event. Safe from any async context;
@@ -352,6 +365,16 @@ _active: Optional[LogUplinkClient] = None
 def set_active(client: Optional[LogUplinkClient]) -> None:
     global _active
     _active = client
+
+
+def get_active() -> Optional[LogUplinkClient]:
+    """The client business events are reported through.
+
+    Readable so a shutdown can check whether the singleton still points at the
+    client IT stopped: clearing it blindly would silence `emit_event` for a
+    session somebody else had just opened.
+    """
+    return _active
 
 
 def emit_event(event_type: str, **payload: Any) -> None:

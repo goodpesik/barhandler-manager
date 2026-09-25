@@ -434,25 +434,24 @@ def make_callback(
 async def _stop_uplink(app_state: Optional[Any], config: dict) -> dict:
     """PET-928 — switch remote diagnostics off, asked from the server.
 
-    Whoever asked for the door to be opened is usually not the one sitting at
-    the machine, so closing it must not depend on them. The answer goes out
-    BEFORE the socket stops: afterwards there is nothing left to answer on.
+    Whoever asked for the door to be opened is rarely the one sitting at the
+    machine, so closing it must not depend on them.
+
+    The shutdown is handed back as `_after_reply` rather than done here: it
+    takes away the very socket this command's answer travels on, so it has to
+    wait until the answer has actually been sent. `_on_diagnostic` runs it
+    immediately after awaiting its own emit — a real ordering, not a guess at
+    how long a send takes.
     """
     if app_state is None:
         return {"ok": False, "error": "no app state on this manager"}
     from src.services.uplink_life import shut_down
 
-    async def _later() -> None:
-        # A beat before the socket goes. Returning the reply only hands it to
-        # the uplink client, which still has awaits ahead of it before the
-        # bytes are out; stopping the socket during those would lose the
-        # answer to the very command that asked for this.
-        #
-        # No unit test proves this: the shutdown task cannot start until the
-        # caller awaits anyway, so a test sees the same ordering with or
-        # without the wait. Only a real socket shows the difference.
-        await asyncio.sleep(0.5)
+    async def after() -> None:
         await shut_down(app_state, config, "switched off from the server")
 
-    asyncio.create_task(_later())
-    return {"ok": True, "output": "remote diagnostics will stop in a moment"}
+    return {
+        "ok": True,
+        "output": "remote diagnostics stopping",
+        "_after_reply": after,
+    }

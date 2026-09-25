@@ -226,3 +226,97 @@ async def test_a_session_switched_on_again_while_stopping_is_left_alone(monkeypa
     assert c["uplink"]["enabled"] is True
     assert state.uplink is not None
     assert saved == {}
+
+
+# ---------------------------------------------------------------------------
+# PET-928 — the dashboard switch is not a fourth way to do the same thing.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_the_dashboard_off_switch_goes_through_the_shared_shutdown(
+    monkeypatch, tmp_path,
+):
+    """Switching off from the dashboard must use `shut_down`, not its own copy.
+
+    It used to stop the client inline, which made four places doing the same
+    steps: the countdown, the boot check, the order from the server and this.
+    Four copies is how the singleton ends up cleared in three of them and left
+    dangling in the fourth.
+    """
+    from types import SimpleNamespace
+
+    import src.routes.system as system
+    import src.services.uplink_life as life
+
+    calls = []
+
+    async def fake_shut_down(app_state, cfg, reason):
+        calls.append(reason)
+        app_state.uplink = None
+        return True
+
+    monkeypatch.setattr(life, "shut_down", fake_shut_down)
+    monkeypatch.setattr(system, "_CONFIG_PATH", tmp_path / "config.yaml")
+
+    class Client:
+        def __init__(self):
+            self.stopped = False
+
+        async def stop(self):
+            self.stopped = True
+
+        def detach_handler_from_root(self):
+            pass
+
+    client = Client()
+    cfg = {"uplink": {"enabled": True, "tenant": "shop", "enabled_at": "2026-09-25T10:00:00+00:00"}}
+    state = SimpleNamespace(config=cfg, uplink=client)
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    await system.set_uplink(system.UplinkPayload(enabled=False), request)
+
+    assert calls == ["dashboard switch"], "the switch did its own shutdown again"
+    # And it did NOT also stop the client by hand — that is the shared
+    # function's job, and doing both is how the two drift apart.
+    assert client.stopped is False
+    assert state.uplink is None
+
+
+@pytest.mark.asyncio
+async def test_switching_off_from_the_dashboard_really_stops_the_client(
+    monkeypatch, tmp_path,
+):
+    """The same path, end to end, with the real `shut_down` underneath."""
+    from types import SimpleNamespace
+
+    import src.routes.system as system
+
+    monkeypatch.setattr(system, "_CONFIG_PATH", tmp_path / "config.yaml")
+    monkeypatch.setattr(system, "persist_uplink_state", lambda u: None)
+    monkeypatch.setattr(
+        "src.services.uplink_life.persist_uplink_state", lambda u: None, raising=False,
+    )
+
+    stopped = []
+    detached = []
+
+    class Client:
+        async def stop(self):
+            stopped.append(True)
+
+        def detach_handler_from_root(self):
+            detached.append(True)
+
+    client = Client()
+    cfg = {"uplink": {"enabled": True, "tenant": "shop", "enabled_at": "2026-09-25T10:00:00+00:00"}}
+    state = SimpleNamespace(config=cfg, uplink=client)
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+
+    await system.set_uplink(system.UplinkPayload(enabled=False), request)
+
+    assert stopped == [True]
+    assert detached == [True]
+    assert state.uplink is None
+    assert cfg["uplink"]["enabled"] is False
+    assert cfg["uplink"]["enabled_at"] == ""

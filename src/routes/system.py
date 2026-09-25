@@ -912,11 +912,15 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
         state.uplink = client
         asyncio.create_task(client.start(install_id, version))
     else:
-        if existing is not None:
-            await existing.stop()
-            existing.detach_handler_from_root()
-        set_active(None)
-        state.uplink = None
+        # One door, one way to close it. This used to stop the client here by
+        # hand, which made the dashboard switch a fourth shutdown path beside
+        # the countdown, the boot check and the order from the server — four
+        # copies of the same steps, free to drift apart. `shut_down` is
+        # tolerant of «already off» and clears the singleton only while it
+        # still points at the client it stopped.
+        from src.services.uplink_life import shut_down
+
+        await shut_down(state, cfg, "dashboard switch")
 
     return {
         "status": "saved",

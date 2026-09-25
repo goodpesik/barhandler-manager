@@ -100,7 +100,7 @@ def create_app(config: dict) -> FastAPI:
         # stop again — `disconnect()` on a client that has not connected yet
         # does nothing, and the scheduled `start()` goes on to connect anyway,
         # leaving a live session nobody has a handle on.
-        from src.services.uplink_life import expire_if_due, is_expired, watch
+        from src.services.uplink_life import expire_if_due, watch
 
         if uplink_cfg.get("enabled") and await expire_if_due(app.state, config):
             uplink_cfg = config.get("uplink", {})

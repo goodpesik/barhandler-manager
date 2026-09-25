@@ -91,12 +91,18 @@ async def shut_down(app_state: Any, cfg: dict, reason: str) -> bool:
 
     log.info("remote diagnostics off (%s)", reason)
     try:
-        from src.services.log_uplink import set_active
+        from src.services.log_uplink import get_active, set_active
 
         if client is not None:
             await client.stop()
             client.detach_handler_from_root()
-        set_active(None)
+        # Only clear the singleton if it still points at the client WE
+        # stopped. The dashboard's own enable sets it to a brand-new client
+        # without going through here, and clearing that one would silence
+        # `emit_event` — business events would stop while every screen still
+        # said the uplink was up.
+        if get_active() is client:
+            set_active(None)
     except Exception as e:  # noqa: BLE001 — never let this leave the door open
         log.warning("stopping the uplink client failed: %s", e)
 
@@ -104,7 +110,10 @@ async def shut_down(app_state: Any, cfg: dict, reason: str) -> bool:
     # place this coroutine let anything else run, and in that gap an operator
     # may have opened a NEW session from the dashboard — their request has
     # already answered «saved», so writing «off» here would kill it silently.
-    if uplink.get("enabled_at") != started_as:
+    # Both halves matter: the timestamp has second resolution, so a very fast
+    # re-enable could carry the same one, and the client object then tells
+    # them apart.
+    if uplink.get("enabled_at") != started_as or getattr(app_state, "uplink", None) is not client:
         log.info("remote diagnostics were switched on again while stopping — left on")
         return False
 
