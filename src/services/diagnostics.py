@@ -17,7 +17,7 @@ import re
 import socket
 import sys
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, Any
 
 
 from src.config import APP_DIR
@@ -415,11 +415,43 @@ async def run_diagnostic(cmd: str, args: dict, config: Optional[dict] = None) ->
     return await fn(args)
 
 
-def make_callback(config: dict) -> Callable[[str, str, dict], Awaitable[dict]]:
+def make_callback(
+    config: dict,
+    app_state: Optional[Any] = None,
+) -> Callable[[str, str, dict], Awaitable[dict]]:
     """Wraps run_diagnostic into the (cmd_id, cmd, args) -> result-dict shape
     that LogUplinkClient expects. Closes over `config` so dump_config can
-    redact it."""
+    redact it, and over the app state so PET-928's `uplink_off` can reach the
+    running client."""
     async def cb(cmd_id: str, cmd: str, args: dict) -> dict:
+        if cmd == "uplink_off":
+            return {"cmd_id": cmd_id, **await _stop_uplink(app_state, config)}
         result = await run_diagnostic(cmd, args, config=config)
         return {"cmd_id": cmd_id, **result}
     return cb
+
+
+async def _stop_uplink(app_state: Optional[Any], config: dict) -> dict:
+    """PET-928 — switch remote diagnostics off, asked from the server.
+
+    Whoever asked for the door to be opened is rarely the one sitting at the
+    machine, so closing it must not depend on them.
+
+    The shutdown is handed back as `_after_reply` rather than done here: it
+    takes away the very socket this command's answer travels on, so it has to
+    wait until the answer has actually been sent. `_on_diagnostic` runs it
+    immediately after awaiting its own emit — a real ordering, not a guess at
+    how long a send takes.
+    """
+    if app_state is None:
+        return {"ok": False, "error": "no app state on this manager"}
+    from src.services.uplink_life import shut_down
+
+    async def after() -> None:
+        await shut_down(app_state, config, "switched off from the server")
+
+    return {
+        "ok": True,
+        "output": "remote diagnostics stopping",
+        "_after_reply": after,
+    }

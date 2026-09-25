@@ -258,10 +258,87 @@ class LogUplinkClient:
         #    кроками, воно не переживе метод.
         await self._drain_tasks()
         self.detach_handler_from_root()
+        # The diagnostics channel dies with the socket, not after it. Left in
+        # place it would answer commands on any connection that came back.
+        self._diagnostics_cb = None
         try:
-            await self._sio.disconnect()
+            # `disconnect()` is NOT enough, and the difference is the whole
+            # point of PET-928. It closes a LIVE connection, but if the socket
+            # is mid-reconnect at this moment — an ordinary event on shop
+            # wi-fi — the library's own retry task is untouched: it sleeps out
+            # its backoff and connects again, with our handlers still bound.
+            # We would have written «off» in the config, cleared the singleton
+            # and told the operator it was off, while a working remote session
+            # came back up that nothing holds a handle on any more.
+            #
+            # `reconnection = False` stops a NEW retry loop from starting, and
+            # `shutdown()` aborts one already in flight (it calls
+            # `disconnect()` itself when the socket is live, so the ordinary
+            # case is unchanged).
+            self._sio.reconnection = False
         except Exception:
             pass
+
+        # Kill the retry loop BEFORE asking the library to shut down, and in
+        # its own try: `shutdown()` reaches for an abort flag that does not
+        # exist until the first successful connect, so on a client that has
+        # never connected it raises — and a shared `except` would swallow the
+        # cancellation below with it. That is exactly what happened when this
+        # was written the other way round.
+        #
+        # Cancelling is also the half that does not depend on winning a race:
+        # `shutdown()` only RAISES the abort flag, and the retry loop clears
+        # that flag as its first statement, so a flag raised before the loop
+        # body starts is simply wiped.
+        task = getattr(self._sio, "_reconnect_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                # Expected: we just cancelled it. Narrower than BaseException
+                # so a real interrupt still gets through.
+                pass
+
+        # Forget the task BEFORE `shutdown()` runs. The library clears this
+        # reference only on its own success path, so the one we just cancelled
+        # stays here — and `shutdown()` re-awaits whatever it finds. Awaiting
+        # an already-CANCELLED task raises `CancelledError`, which is a
+        # BaseException and would sail straight out of `stop()`: the day
+        # watcher re-raises it by design and would die for good, leaving this
+        # machine with nothing to ever close the door again, and lifespan
+        # shutdown would skip everything after `await uplink.stop()`.
+        try:
+            self._sio._reconnect_task = None
+            from socketio import base_client
+
+            if self._sio in base_client.reconnecting_clients:
+                base_client.reconnecting_clients.remove(self._sio)
+        except Exception:
+            pass
+
+        try:
+            await self._sio.shutdown()
+        except Exception:
+            # Not `CancelledError` too: clearing the reference above removes the
+            # only way this raised one, and catching it here would swallow a
+            # cancellation aimed at whoever called us — lifespan shutdown does
+            # exactly that.
+            pass
+
+        # Last: a `connect()` interrupted AFTER the transport came up but
+        # before the socket.io handshake finished leaves engine.io connected
+        # while `connected` stays False, so `shutdown()` takes neither of its
+        # branches and that transport lives on — free to finish its handshake
+        # later and announce this install to the server again, which is the
+        # very thing being switched off here.
+        try:
+            eio = getattr(self._sio, "eio", None)
+            if eio is not None and getattr(eio, "state", "disconnected") != "disconnected":
+                await eio.disconnect(abort=True)
+        except Exception:
+            pass
+
         await self._drain_tasks()
 
     async def _drain_tasks(self) -> None:
@@ -322,7 +399,20 @@ class LogUplinkClient:
             result = await self._diagnostics_cb(cmd_id, cmd, args)
         except Exception as e:
             result = {"cmd_id": cmd_id, "ok": False, "error": f"{type(e).__name__}: {e}"}
+        # PET-928 — a command may need to act only AFTER its answer has left,
+        # because the action removes the very socket that would carry it.
+        # Sleeping «long enough» was a guess; this is the actual send.
+        after = result.pop("_after_reply", None) if isinstance(result, dict) else None
         await self._safe_emit("diagnostic_result", result)
+        if after is not None:
+            # The reply is on the wire; only now may the command do something
+            # that takes this socket away.
+            try:
+                await after()
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger(__name__).warning(
+                    "post-reply step of %s failed: %s", cmd, e,
+                )
 
     def emit_event(self, event_type: str, **payload: Any) -> None:
         """Fire-and-forget business event. Safe from any async context;
@@ -352,6 +442,16 @@ _active: Optional[LogUplinkClient] = None
 def set_active(client: Optional[LogUplinkClient]) -> None:
     global _active
     _active = client
+
+
+def get_active() -> Optional[LogUplinkClient]:
+    """The client business events are reported through.
+
+    Readable so a shutdown can check whether the singleton still points at the
+    client IT stopped: clearing it blindly would silence `emit_event` for a
+    session somebody else had just opened.
+    """
+    return _active
 
 
 def emit_event(event_type: str, **payload: Any) -> None:
