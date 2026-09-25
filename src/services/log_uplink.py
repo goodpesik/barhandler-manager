@@ -300,10 +300,45 @@ class LogUplinkClient:
                 # so a real interrupt still gets through.
                 pass
 
+        # Forget the task BEFORE `shutdown()` runs. The library clears this
+        # reference only on its own success path, so the one we just cancelled
+        # stays here — and `shutdown()` re-awaits whatever it finds. Awaiting
+        # an already-CANCELLED task raises `CancelledError`, which is a
+        # BaseException and would sail straight out of `stop()`: the day
+        # watcher re-raises it by design and would die for good, leaving this
+        # machine with nothing to ever close the door again, and lifespan
+        # shutdown would skip everything after `await uplink.stop()`.
+        try:
+            self._sio._reconnect_task = None
+            from socketio import base_client
+
+            if self._sio in base_client.reconnecting_clients:
+                base_client.reconnecting_clients.remove(self._sio)
+        except Exception:
+            pass
+
         try:
             await self._sio.shutdown()
         except Exception:
+            # Not `CancelledError` too: clearing the reference above removes the
+            # only way this raised one, and catching it here would swallow a
+            # cancellation aimed at whoever called us — lifespan shutdown does
+            # exactly that.
             pass
+
+        # Last: a `connect()` interrupted AFTER the transport came up but
+        # before the socket.io handshake finished leaves engine.io connected
+        # while `connected` stays False, so `shutdown()` takes neither of its
+        # branches and that transport lives on — free to finish its handshake
+        # later and announce this install to the server again, which is the
+        # very thing being switched off here.
+        try:
+            eio = getattr(self._sio, "eio", None)
+            if eio is not None and getattr(eio, "state", "disconnected") != "disconnected":
+                await eio.disconnect(abort=True)
+        except Exception:
+            pass
+
         await self._drain_tasks()
 
     async def _drain_tasks(self) -> None:

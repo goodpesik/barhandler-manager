@@ -383,3 +383,72 @@ async def test_a_drop_arriving_after_stop_does_not_start_a_new_retry_loop():
     await sio._handle_eio_disconnect("transport error")
 
     assert sio._reconnect_task is None, "a late drop started the retry loop again"
+
+
+@pytest.mark.asyncio
+async def test_stopping_survives_a_retry_cancelled_in_the_middle_of_connecting():
+    """The retry can be cancelled while it is CONNECTING, not while it sleeps.
+
+    That is the ordinary case, because a connect attempt does real work — DNS,
+    TCP, TLS, the handshake — and takes time. The task then ends up *cancelled*
+    rather than gracefully aborted, and re-awaiting a cancelled task raises
+    `CancelledError`. It is a BaseException, so it escapes an `except
+    Exception` and leaves `stop()` by the front door: the day watcher re-raises
+    cancellation by design and would die for good, and the config would still
+    say the diagnostics are on.
+    """
+    from src.services.log_uplink import LogUplinkClient
+
+    client = LogUplinkClient({"url": "https://x", "tenant": "t", "reconnect_delay": 1})
+    sio = client._sio
+    sio.reconnection_delay = 0.01
+    sio.reconnection_delay_max = 0.01
+    sio.randomization_factor = 0
+
+    inside_connect = asyncio.Event()
+
+    async def connect_that_hangs(*a, **kw):
+        inside_connect.set()
+        await asyncio.Event().wait()  # suspended here when the cancel lands
+
+    sio.connect = connect_that_hangs
+
+    sio.eio.state = "connected"
+    await sio._handle_eio_disconnect("transport error")
+    await asyncio.wait_for(inside_connect.wait(), timeout=2)
+    assert sio._reconnect_task is not None, "precondition: the retry must be mid-connect"
+
+    # The assertion IS that this returns instead of raising.
+    await asyncio.wait_for(client.stop(), timeout=5)
+
+    assert sio._reconnect_task is None, "a cancelled task left behind for shutdown() to re-await"
+    # And stopping twice must stay harmless — the watcher and the dashboard can
+    # both reach this.
+    await asyncio.wait_for(client.stop(), timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_stopping_closes_a_transport_left_half_connected():
+    """Engine.io up, socket.io handshake never finished.
+
+    `shutdown()` checks `connected` (socket.io level) and the retry task, and
+    this state is neither — so nothing closed the transport, and it could still
+    complete its handshake and re-announce an install we had just switched off.
+    """
+    from src.services.log_uplink import LogUplinkClient
+
+    client = LogUplinkClient({"url": "https://x", "tenant": "t", "reconnect_delay": 1})
+    sio = client._sio
+    closed = []
+
+    async def fake_eio_disconnect(*a, **kw):
+        closed.append(kw.get("abort", False))
+        sio.eio.state = "disconnected"
+
+    sio.eio.disconnect = fake_eio_disconnect
+    sio.eio.state = "connected"
+    sio.connected = False  # the handshake never completed
+
+    await asyncio.wait_for(client.stop(), timeout=5)
+
+    assert closed, "the half-open transport was left running"
