@@ -258,8 +258,50 @@ class LogUplinkClient:
         #    кроками, воно не переживе метод.
         await self._drain_tasks()
         self.detach_handler_from_root()
+        # The diagnostics channel dies with the socket, not after it. Left in
+        # place it would answer commands on any connection that came back.
+        self._diagnostics_cb = None
         try:
-            await self._sio.disconnect()
+            # `disconnect()` is NOT enough, and the difference is the whole
+            # point of PET-928. It closes a LIVE connection, but if the socket
+            # is mid-reconnect at this moment — an ordinary event on shop
+            # wi-fi — the library's own retry task is untouched: it sleeps out
+            # its backoff and connects again, with our handlers still bound.
+            # We would have written «off» in the config, cleared the singleton
+            # and told the operator it was off, while a working remote session
+            # came back up that nothing holds a handle on any more.
+            #
+            # `reconnection = False` stops a NEW retry loop from starting, and
+            # `shutdown()` aborts one already in flight (it calls
+            # `disconnect()` itself when the socket is live, so the ordinary
+            # case is unchanged).
+            self._sio.reconnection = False
+        except Exception:
+            pass
+
+        # Kill the retry loop BEFORE asking the library to shut down, and in
+        # its own try: `shutdown()` reaches for an abort flag that does not
+        # exist until the first successful connect, so on a client that has
+        # never connected it raises — and a shared `except` would swallow the
+        # cancellation below with it. That is exactly what happened when this
+        # was written the other way round.
+        #
+        # Cancelling is also the half that does not depend on winning a race:
+        # `shutdown()` only RAISES the abort flag, and the retry loop clears
+        # that flag as its first statement, so a flag raised before the loop
+        # body starts is simply wiped.
+        task = getattr(self._sio, "_reconnect_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                # Expected: we just cancelled it. Narrower than BaseException
+                # so a real interrupt still gets through.
+                pass
+
+        try:
+            await self._sio.shutdown()
         except Exception:
             pass
         await self._drain_tasks()
