@@ -139,3 +139,90 @@ async def test_the_door_closes_even_if_stopping_the_client_throws(monkeypatch):
     assert await shut_down(state, c, "test") is True
     assert state.uplink is None
     assert c["uplink"]["enabled"] is False
+
+
+# --- what the first review round found -------------------------------------
+
+
+def test_a_yaml_parsed_datetime_is_understood():
+    """PyYAML turns an UNQUOTED 2026-09-25T12:00:00 into a datetime.
+
+    We write the value quoted, but the block says hand-editing is fine, and a
+    person copying the timestamp back rarely adds the quotes. Catching only
+    ValueError meant `fromisoformat(datetime)` raised TypeError — uncaught at
+    boot, which took the whole manager down.
+    """
+    assert enabled_at({"uplink": {"enabled_at": NOW}}) == NOW
+
+
+def test_a_naive_yaml_datetime_is_read_as_utc():
+    naive = datetime(2026, 9, 25, 12, 0, 0)
+    assert enabled_at({"uplink": {"enabled_at": naive}}) == NOW
+
+
+def test_a_nonsense_type_does_not_raise():
+    # A number, a list, whatever somebody typed — unknown means expired, not
+    # a crash.
+    assert enabled_at({"uplink": {"enabled_at": 12345}}) is None
+    assert is_expired({"uplink": {"enabled": True, "enabled_at": 12345}}) is True
+
+
+@pytest.mark.asyncio
+async def test_expire_if_due_never_raises(monkeypatch):
+    """It runs at boot, where an exception stops the manager starting.
+
+    Whatever the check itself does — a value nobody anticipated, a library
+    that changes its mind about an exception type — the manager must still
+    come up. Left to propagate, this took the whole service down.
+    """
+    import src.services.uplink_life as life
+
+    def boom(_cfg, now=None):
+        raise RuntimeError("something nobody thought of")
+
+    monkeypatch.setattr(life, "is_expired", boom)
+    state = SimpleNamespace(uplink=None)
+    assert await life.expire_if_due(state, cfg()) is False
+
+
+@pytest.mark.asyncio
+async def test_expire_if_due_closes_an_overdue_session(monkeypatch):
+    saved = {}
+    monkeypatch.setattr("src.routes.system.persist_uplink_state", lambda u: saved.update(u))
+    from src.services.uplink_life import expire_if_due
+
+    state = SimpleNamespace(uplink=FakeClient())
+    # Deliberately long ago: `expire_if_due` reads the real clock, so a date
+    # relative to this file's NOW would make the test depend on when it runs.
+    c = cfg(enabled_at="2020-01-01T00:00:00+00:00")
+    assert await expire_if_due(state, c) is True
+    assert c["uplink"]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_session_switched_on_again_while_stopping_is_left_alone(monkeypatch):
+    """The operator's re-enable must win over a shutdown already in flight.
+
+    Their own request has already answered «saved». Writing «off» afterwards
+    kills the support session they just opened, with nothing shown anywhere.
+    """
+    saved = {}
+    monkeypatch.setattr("src.routes.system.persist_uplink_state", lambda u: saved.update(u))
+
+    c = cfg()
+    state = SimpleNamespace(uplink=None)
+
+    class SlowClient(FakeClient):
+        async def stop(self):
+            # While we are tearing the old socket down, the dashboard opens a
+            # new session.
+            c["uplink"]["enabled_at"] = (NOW + timedelta(minutes=5)).isoformat()
+            c["uplink"]["enabled"] = True
+            state.uplink = FakeClient()
+            await super().stop()
+
+    state.uplink = SlowClient()
+    assert await shut_down(state, c, "a day has passed") is False
+    assert c["uplink"]["enabled"] is True
+    assert state.uplink is not None
+    assert saved == {}

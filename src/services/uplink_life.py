@@ -36,6 +36,14 @@ def enabled_at(cfg: dict) -> Optional[datetime]:
     raw = ((cfg or {}).get("uplink") or {}).get("enabled_at") or ""
     if not raw:
         return None
+    if isinstance(raw, datetime):
+        # PyYAML turns an UNQUOTED 2026-09-25T12:00:00 into a datetime. We
+        # write it quoted, but the block says hand-editing is fine, and a
+        # person copying the value back rarely adds the quotes.
+        return raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+    if not isinstance(raw, str):
+        log.warning("uplink enabled_at is not a date: %r", raw)
+        return None
     try:
         parsed = datetime.fromisoformat(raw)
     except ValueError:
@@ -78,6 +86,8 @@ async def shut_down(app_state: Any, cfg: dict, reason: str) -> bool:
     client = getattr(app_state, "uplink", None)
     if not uplink.get("enabled") and client is None:
         return False
+    # What we set out to close, remembered before the only await below.
+    started_as = uplink.get("enabled_at")
 
     log.info("remote diagnostics off (%s)", reason)
     try:
@@ -87,11 +97,18 @@ async def shut_down(app_state: Any, cfg: dict, reason: str) -> bool:
             await client.stop()
             client.detach_handler_from_root()
         set_active(None)
-        app_state.uplink = None
     except Exception as e:  # noqa: BLE001 — never let this leave the door open
         log.warning("stopping the uplink client failed: %s", e)
-        app_state.uplink = None
 
+    # Only now decide whether to write «off». Stopping the socket was the one
+    # place this coroutine let anything else run, and in that gap an operator
+    # may have opened a NEW session from the dashboard — their request has
+    # already answered «saved», so writing «off» here would kill it silently.
+    if uplink.get("enabled_at") != started_as:
+        log.info("remote diagnostics were switched on again while stopping — left on")
+        return False
+
+    app_state.uplink = None
     uplink["enabled"] = False
     uplink["enabled_at"] = ""
     try:
@@ -104,6 +121,21 @@ async def shut_down(app_state: Any, cfg: dict, reason: str) -> bool:
         # a loud line, but it is not worth keeping the socket open over.
         log.error("could not write the uplink state to config: %s", e)
     return True
+
+
+async def expire_if_due(app_state: Any, cfg: dict) -> bool:
+    """Close the door if its day is up. Never raises.
+
+    Called at boot, BEFORE the client is built: a socket that has been told to
+    connect cannot reliably be told to stop again, so an expired session must
+    never be started rather than started and then chased.
+    """
+    try:
+        if is_expired(cfg):
+            return await shut_down(app_state, cfg, "a day passed while off")
+    except Exception as e:  # noqa: BLE001 — a bad config must not stop the boot
+        log.warning("uplink expiry check failed at boot: %s", e)
+    return False
 
 
 async def watch(app_state: Any, cfg: dict) -> None:

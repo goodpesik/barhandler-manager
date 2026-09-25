@@ -92,6 +92,19 @@ def create_app(config: dict) -> FastAPI:
         # barhandler-manager-logs server. Fully opt-in via config.yaml.
         uplink = None
         uplink_cfg = config.get("uplink", {})
+
+        # PET-928 — remote diagnostics live one day, counted from when they
+        # were switched on rather than from this boot: a restart must not hand
+        # the session another day. Decided BEFORE the client is built, because
+        # a socket that has been told to connect cannot reliably be told to
+        # stop again — `disconnect()` on a client that has not connected yet
+        # does nothing, and the scheduled `start()` goes on to connect anyway,
+        # leaving a live session nobody has a handle on.
+        from src.services.uplink_life import expire_if_due, is_expired, watch
+
+        if uplink_cfg.get("enabled") and await expire_if_due(app.state, config):
+            uplink_cfg = config.get("uplink", {})
+
         if uplink_cfg.get("enabled"):
             from src.services.log_uplink import (
                 LogUplinkClient, get_or_create_install_id, set_active,
@@ -111,14 +124,6 @@ def create_app(config: dict) -> FastAPI:
             app.state.uplink = uplink
             asyncio.create_task(uplink.start(install_id, version))
 
-        # PET-928 — remote diagnostics have a life of one day, counted from
-        # when they were switched on rather than from this boot: a restart
-        # must not hand the session another day. Checked here in case the day
-        # ran out while the manager was down, and then on a timer.
-        from src.services.uplink_life import is_expired, shut_down, watch
-
-        if is_expired(config):
-            await shut_down(app.state, config, "a day passed while off")
         uplink_watch = asyncio.create_task(watch(app.state, config))
 
         yield
