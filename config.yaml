@@ -46,12 +46,16 @@ devices:
     host: null
     port: null
 
-# Remote log uplink. When enabled, the manager streams its bhm.log lines
-# and business events to the central server, and accepts whitelist
-# diagnostic commands from there. Tenant subdomain identifies this
-# install on the server side.
-# uplink:
-#   enabled: false
-#   url: "https://manager.barhandler.com"
-#   tenant: ""            # e.g. "biergarten-lviv.barhandler.com"
-#   reconnect_delay: 2
+# Remote log uplink — managed by the dashboard. Toggle via
+# POST /system/uplink. Editing this block by hand is fine, but the
+# UI overwrites the entire block on each save, so any comments you
+# add INSIDE the block will be lost on the next toggle.
+# Identity: install_id.txt is the stable key; tenant_id (appid) and
+# tenant_name are the auto-detected label of whoever is logged in.
+uplink:
+  enabled: true
+  url: "https://manager.barhandler.com"
+  tenant: "petshandler-dev.web.app"
+  tenant_id: "a73a544b-cf7c-4b14-ad6a-d480fc2b8c89"
+  tenant_name: "pets-dev-env"
+  reconnect_delay: 2
