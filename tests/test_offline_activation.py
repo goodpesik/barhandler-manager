@@ -261,8 +261,8 @@ def test_the_online_apps_settings_are_kept_for_the_offline_build(client_for, hom
     assert r.status_code == 200 and r.json()["count"] == 2
     got = c.get("/offline/local-settings", headers=KEY).json()
     assert got["items"] == items and got["savedAt"] and got["id"]
-    # Every save is a new snapshot for the offline build.
-    again = c.post("/offline/local-settings", json={"appid": "bark-01", "items": items}, headers=KEY)
+    # A change is a new snapshot for the offline build.
+    again = c.post("/offline/local-settings", json={"appid": "bark-01", "items": {**items, "petshandler:lang": "en"}}, headers=KEY)
     assert again.json()["id"] != got["id"]
     kept = home / "offline" / "bark-01" / "local-settings.json"
     assert stat.S_IMODE(os.stat(kept).st_mode) == 0o600
@@ -366,3 +366,30 @@ def test_a_local_manager_address_is_kept(client_for):
     for url in ("http://localhost:9999", "http://127.0.0.1:9999/"):
         r = c.post("/offline/local-settings", json={"appid": "bark-01", "items": {"phm.manager.url": url}}, headers=KEY)
         assert r.status_code == 200, url
+
+
+# ---- review round 2 (PET-972 / PET-973) ------------------------------------
+
+
+def test_a_copy_left_without_its_key_is_moved_aside_on_activation(client_for, home):
+    c = client_for(FakeService(0))
+    old = home / "offline" / "bark-01" / "data"
+    old.mkdir(parents=True)
+    (old / "offline.sqlite").write_text("encrypted with a key that is gone")
+    r = c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    assert r.status_code == 200
+    # The new key never meets the old copy.
+    assert not (home / "offline" / "bark-01" / "data").exists()
+    aside = [p for p in (home / "offline" / "bark-01").iterdir() if p.name.startswith("data.unreadable-")]
+    assert len(aside) == 1 and (aside[0] / "offline.sqlite").exists()
+
+
+def test_the_same_settings_keep_their_snapshot_id(client_for):
+    c = client_for(FakeService(0))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    body = {"appid": "bark-01", "items": {"phm.manager.fiscalPrinter": "p1"}}
+    first = c.post("/offline/local-settings", json=body, headers=KEY).json()["id"]
+    # An online reload sends the same settings again: nothing new to apply.
+    assert c.post("/offline/local-settings", json=body, headers=KEY).json()["id"] == first
+    changed = {"appid": "bark-01", "items": {"phm.manager.fiscalPrinter": "p2"}}
+    assert c.post("/offline/local-settings", json=changed, headers=KEY).json()["id"] != first

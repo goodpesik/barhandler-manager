@@ -102,7 +102,17 @@ def activate(payload: dict) -> dict:
     old = offline_secrets.load(appid, folder) if previous == appid else None
     # A re-activation (a new token) keeps the data key: the local copy was
     # encrypted with it, and a new key would make it unreadable.
-    data_key = (old or {}).get("dataKey") or base64.b64encode(pysecrets.token_bytes(32)).decode("ascii")
+    data_key = (old or {}).get("dataKey")
+    if not data_key:
+        data_key = base64.b64encode(pysecrets.token_bytes(32)).decode("ascii")
+        # A copy left from before (a switch-off that could not remove it all)
+        # was encrypted with a key that is gone: moved aside, never opened
+        # with the new one.
+        stale = folder / "data"
+        if stale.exists():
+            aside = folder / f"data.unreadable-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}"
+            stale.rename(aside)
+            log.warning("offline: shop %s had a local copy without its key, moved to %s", appid, aside.name)
     offline_secrets.save(appid, {"deviceToken": token, "dataKey": data_key}, folder)
     config = {
         "product": product,
@@ -245,10 +255,14 @@ def save_local_settings(appid: str, items: object) -> dict:
     for key, check in _VALUE_CHECKS.items():
         if key in items and not check.fullmatch(items[key]):
             raise ActivationError("Некоректні налаштування.")
-    # A new id on every save: the offline build applies a snapshot it has not
-    # applied yet, not «a later time» — the till's clock can jump back.
+    # A new id when the settings changed: the offline build applies a snapshot
+    # it has not applied yet, not «a later time» (the till's clock can jump
+    # back). The same settings again keep their id, so an online reload does
+    # not undo what was changed offline.
+    previous = load_local_settings()
+    same = previous is not None and previous.get("items") == items and isinstance(previous.get("id"), str)
     body = {
-        "id": uuid.uuid4().hex,
+        "id": previous["id"] if same else uuid.uuid4().hex,
         "savedAt": datetime.now(timezone.utc).isoformat(),
         "items": items,
     }

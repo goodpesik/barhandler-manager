@@ -129,6 +129,13 @@ fi
 
 echo "==> Перевіряю підпис застосунку"
 codesign --verify --deep --strict --verbose=2 "$APP"
+# PET-971 — --deep не заходить у Contents/Resources, тож вкладений Node
+# перевіряємо окремо: на нічному каналі нотаризації немає, і кривий підпис
+# інакше пройшов би непоміченим.
+for node in "$APP"/Contents/Resources/offline-runtime/*/device-handler-offline; do
+  [ -f "$node" ] || continue
+  codesign --verify --strict --verbose=2 "$node"
+done
 
 echo "==> Збираю .pkg, поки keychain із сертифікатами ще жива"
 bash scripts/mac_build_pkg.sh "$APP" "$PKG"

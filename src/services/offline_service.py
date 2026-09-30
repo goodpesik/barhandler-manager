@@ -464,8 +464,13 @@ class OfflineService:
                 # itself — but never wait on it without a limit.
                 try:
                     await asyncio.wait_for(asyncio.gather(pump, return_exceptions=True), timeout=3)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
+                except asyncio.TimeoutError:
                     pump.cancel()
+                except asyncio.CancelledError:
+                    # Cancelled by whoever stops us: tidy up, then let the
+                    # cancellation go on — swallowing it would hide it.
+                    pump.cancel()
+                    raise
 
     async def _end(self, proc: asyncio.subprocess.Process) -> None:
         # Closing stdin is the polite stop: the service shuts its server and

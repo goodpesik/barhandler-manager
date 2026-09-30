@@ -652,3 +652,78 @@ async def test_a_log_write_failure_does_not_stop_draining_the_child(fake, monkey
         await svc.stop()
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+# ---- review round 3 (PET-971) ---------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_cancelling_a_stop_while_it_waits_for_the_log_copy_is_not_swallowed(tmp_path):
+    svc = OfflineService(lambda: None, argv=["x", "y"], expected_version="1", log_path=tmp_path / "l.log")
+
+    async def slow_pump():
+        await asyncio.sleep(30)
+
+    svc._pump = asyncio.create_task(slow_pump())
+    stopping = asyncio.create_task(svc._stop_process())
+    await asyncio.sleep(0.3)  # inside the bounded wait for the copy
+    stopping.cancel()
+    outcome = (await asyncio.gather(stopping, return_exceptions=True))[0]
+    assert isinstance(outcome, asyncio.CancelledError)
+
+
+@pytest.mark.asyncio
+async def test_a_stray_switch_off_does_not_take_down_the_next_start(fake):
+    """stop_service() while nothing runs leaves its flag behind; the next
+    activation must still start and stay up."""
+    make, configs = fake
+    current = {"cfg": None}
+    svc = make(config={})
+    svc._load_config = lambda: current["cfg"]
+    await svc.stop_service()  # idle: nothing to stop
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        current["cfg"] = {"appid": "shop", "deviceToken": "pho_one", "dataKey": "k"}
+        assert await _until(lambda: svc.state.running, timeout=40)
+        await asyncio.sleep(0.5)
+        assert svc.state.running
+        assert len(configs()) == 1
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_kill_that_fails_is_logged_not_raised(caplog):
+    from src.services import offline_service as mod
+
+    class Proc:
+        pid = 4242
+        returncode = None
+        stdin = None
+
+        def terminate(self):
+            raise PermissionError("access denied")
+
+        def kill(self):
+            raise PermissionError("access denied")
+
+        async def wait(self):
+            await asyncio.sleep(10)
+
+    svc = OfflineService(lambda: None, argv=["x", "y"], expected_version="1")
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(mod.asyncio, "wait_for", _instant_timeout)
+    try:
+        with caplog.at_level("ERROR"):
+            await svc._end(Proc())
+    finally:
+        monkey.undo()
+    assert "could not be killed" in caplog.text
+
+
+async def _instant_timeout(aw, timeout):
+    if asyncio.iscoroutine(aw):
+        aw.close()
+    raise asyncio.TimeoutError
