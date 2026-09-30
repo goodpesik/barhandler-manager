@@ -533,3 +533,20 @@ def test_linux_would_not_find_the_service_by_its_short_name():
     full name is a no-op on Linux, so the shell scripts must use -f."""
     for path in ("installers/install.sh", "installers/install-android.sh", "installers/mac-postinstall.sh", "src/routes/system.py"):
         assert "-x device-handler-offline" not in (_ROOT / path).read_text(encoding="utf-8"), path
+
+
+
+def test_the_runtime_lies_beside_the_frozen_manager_not_inside_it(monkeypatch):
+    """Inside the one-file build it would be unpacked on every start."""
+    from src.services import offline_service as mod
+
+    monkeypatch.setattr(mod.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(mod.sys, "executable", "C:/Users/a/AppData/Local/DeviceHandler/bhm.exe")
+    assert mod.runtime_dir("petshandler").as_posix().endswith("DeviceHandler/offline-runtime/petshandler")
+
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    monkeypatch.setattr(mod.sys, "executable", "/Applications/Device Handler.app/Contents/MacOS/bhm")
+    assert mod.runtime_dir("petshandler") == Path(
+        "/Applications/Device Handler.app/Contents/Resources/offline-runtime/petshandler"
+    )

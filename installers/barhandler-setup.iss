@@ -31,6 +31,9 @@
 #ifndef ExePath
   #define ExePath "dist\bhm.exe"
 #endif
+; PET-971 — the offline runtime (Node, the offline service, the offline app)
+; laid out by scripts/build_offline_runtime.sh. Passed by CI as
+; /DOfflineDir=…\offline-runtime; without it the installer ships no offline mode.
 
 [Setup]
 ; Stable AppId so Inno recognises & replaces a previous setup install.
@@ -60,6 +63,17 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 
 [Files]
 Source: "{#ExePath}"; DestDir: "{app}"; Flags: ignoreversion
+#ifdef OfflineDir
+; Beside bhm.exe, not inside it: the one-file exe unpacks itself on every
+; start, and ~150 MB of Node and app would be unpacked with it each time.
+Source: "{#OfflineDir}\*"; DestDir: "{app}\offline-runtime"; Flags: ignoreversion recursesubdirs createallsubdirs
+#endif
+
+[InstallDelete]
+; PET-971 — the previous release's runtime goes whole (the offline app's
+; files are hashed and would pile up). Only offline-runtime: {app}\offline
+; holds the shops' data and the queue of operations not yet on the server.
+Type: filesandordirs; Name: "{app}\offline-runtime"
 
 [Icons]
 ; Start-menu shortcut that opens the dashboard in the browser.

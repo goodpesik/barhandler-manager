@@ -143,6 +143,13 @@ def test_another_shop_cannot_take_over_an_active_till(client_for):
         {"deviceToken": "not-a-device-token"},
         {"apiBase": "http://api.petshandler.com/api"},
         {"apiBase": "https://evil.example/steal"},
+        # Only the product's own servers: the manager's API key is public.
+        {"apiBase": "https://evil.com/api"},
+        {"apiBase": "https://api.petshandler.com.evil.com/api"},
+        {"apiBase": "https://api.petshandler.com:8443/api"},
+        # A newline would split a `security -i` line into two commands.
+        {"appid": "bark-01\n"},
+        {"deviceId": "till\n"},
         # Other products join PRODUCTS first (FitStudio, BarHandler: planned).
         {"product": "barhandler"},
     ],
@@ -291,3 +298,56 @@ def test_switching_off_removes_the_settings_too(client_for, home):
     c.post("/offline/local-settings", json={"appid": "bark-01", "items": {"a": "b"}}, headers=KEY)
     c.post("/offline/deactivate", headers=KEY)
     assert c.get("/offline/local-settings", headers=KEY).status_code == 404
+
+
+
+# ---- review round 1 (PET-972) --------------------------------------------
+
+
+@pytest.mark.parametrize("api", ["https://api.petshandler.com/api", "https://api-dev.petshandler.com/api/", "https://API.petshandler.com/api"])
+def test_the_products_own_servers_are_accepted(client_for, api):
+    c = client_for(FakeService(0))
+    assert c.post("/offline/activate", json={**PAYLOAD, "apiBase": api}, headers=KEY).status_code == 200
+
+
+def test_a_keychain_that_will_not_delete_keeps_the_shop_on(client_for, monkeypatch):
+    c = client_for(FakeService(0))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+
+    def refuse(appid, folder):
+        raise OSError("keychain refused to delete (code 51)")
+
+    monkeypatch.setattr(offline_secrets, "delete", refuse)
+    r = c.post("/offline/deactivate", headers=KEY)
+    assert r.status_code == 500
+    # Nothing half-done: still active, secrets and data in place.
+    assert offline_state.active_appid() == "bark-01"
+    assert offline_state.current_config() is not None
+
+
+def test_keychain_delete_reports_a_failure_and_accepts_not_found(monkeypatch):
+    codes = iter([51, 44])
+    monkeypatch.setattr(
+        offline_secrets.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, next(codes), "", ""),
+    )
+    with pytest.raises(OSError):
+        offline_secrets._mac_delete("bark-01")
+    offline_secrets._mac_delete("bark-01")  # already gone: fine
+
+
+def test_a_service_that_fails_to_stop_still_leaves_no_unreadable_data(client_for, home):
+    svc = FakeService(0)
+
+    async def broken_stop():
+        raise OSError("terminate failed")
+
+    svc.stop_service = broken_stop
+    c = client_for(svc)
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    (home / "offline" / "bark-01" / "data").mkdir()
+    r = c.post("/offline/deactivate", headers=KEY)
+    assert r.status_code == 200
+    # The key is gone, so the copy it encrypted goes too.
+    assert offline_state.active_appid() is None
+    assert not (home / "offline" / "bark-01").exists()

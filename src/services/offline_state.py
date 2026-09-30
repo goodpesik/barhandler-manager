@@ -37,9 +37,12 @@ from src.services.offline_service import DEFAULT_PRODUCT, PRODUCTS, runtime_dir
 log = logging.getLogger(__name__)
 
 #: A shop's appid and a device id: used in paths and in Keychain commands.
-_SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
-#: The server the token was issued by.
-_API_BASE = re.compile(r"^https://[A-Za-z0-9.-]+(:\d+)?/api/?$")
+# fullmatch everywhere: `$` also matches before a trailing newline, and a
+# newline inside a `security -i` line splits it into two commands.
+_SAFE_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+#: The server the token was issued by: https, /api, and a host on the
+#: product's own list (PRODUCTS[…].api_hosts).
+_API_BASE = re.compile(r"https://([A-Za-z0-9.-]+)/api/?")
 
 
 def offline_root() -> Path:
@@ -64,7 +67,7 @@ def active_appid() -> Optional[str]:
     except (OSError, ValueError):
         return None
     appid = raw.get("appid") if isinstance(raw, dict) else None
-    return appid if isinstance(appid, str) and _SAFE_ID.match(appid) else None
+    return appid if isinstance(appid, str) and _SAFE_ID.fullmatch(appid) else None
 
 
 def activate(payload: dict) -> dict:
@@ -77,13 +80,14 @@ def activate(payload: dict) -> dict:
     device_id = str(payload.get("deviceId") or "")
     token = str(payload.get("deviceToken") or "")
     api_base = str(payload.get("apiBase") or "")
-    if not _SAFE_ID.match(appid):
+    if not _SAFE_ID.fullmatch(appid):
         raise ActivationError("Некоректний ідентифікатор закладу.")
-    if not _SAFE_ID.match(device_id):
+    if not _SAFE_ID.fullmatch(device_id):
         raise ActivationError("Некоректний ідентифікатор пристрою.")
     if not token.startswith("pho_"):
         raise ActivationError("Некоректний токен пристрою.")
-    if not _API_BASE.match(api_base):
+    api = _API_BASE.fullmatch(api_base)
+    if not api or api.group(1).lower() not in PRODUCTS[product].api_hosts:
         raise ActivationError("Некоректна адреса сервера.")
 
     folder = shop_folder(appid)
@@ -147,8 +151,12 @@ def forget() -> Optional[str]:
 
 def remove_data(appid: str) -> None:
     """The shop's local copy, once the service that held it has stopped."""
-    shutil.rmtree(shop_folder(appid), ignore_errors=True)
-    log.info("offline data of shop %s removed", appid)
+    folder = shop_folder(appid)
+    shutil.rmtree(folder, ignore_errors=True)
+    if folder.exists():
+        log.error("offline data of shop %s could not be removed completely: %s", appid, folder)
+    else:
+        log.info("offline data of shop %s removed", appid)
 
 
 def current_config() -> Optional[dict]:
@@ -210,7 +218,7 @@ def public_status() -> dict:
 
 #: A snapshot is a handful of short preferences; anything bigger is not one.
 LOCAL_SETTINGS_MAX_BYTES = 64 * 1024
-_SETTING_KEY = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
+_SETTING_KEY = re.compile(r"[A-Za-z0-9_.:-]{1,100}")
 
 
 def save_local_settings(appid: str, items: object) -> dict:
@@ -226,7 +234,7 @@ def save_local_settings(appid: str, items: object) -> dict:
     if appid != active:
         raise ActivationError("Офлайн-режим на цьому компʼютері увімкнено для іншого закладу.")
     if not isinstance(items, dict) or not all(
-        isinstance(k, str) and _SETTING_KEY.match(k) and isinstance(v, str) for k, v in items.items()
+        isinstance(k, str) and _SETTING_KEY.fullmatch(k) and isinstance(v, str) for k, v in items.items()
     ):
         raise ActivationError("Некоректні налаштування.")
     body = {"savedAt": datetime.now(timezone.utc).isoformat(), "items": items}

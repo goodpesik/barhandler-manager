@@ -44,6 +44,10 @@ class OfflineProduct:
     service_name: str
     #: The loopback port its offline service listens on.
     port: int
+    #: The only servers a till of this product may sync with. The manager's
+    #: API key is public (it ships in the web apps), so an activation must not
+    #: be able to point a shop's data at any other host.
+    api_hosts: tuple[str, ...]
 
 
 #: PET-971 — the products the manager can run an offline service for. Only
@@ -51,7 +55,11 @@ class OfflineProduct:
 #: Android especially) and join here with their own service, port and
 #: runtime folder, while the supervision stays the same.
 PRODUCTS: dict[str, OfflineProduct] = {
-    "petshandler": OfflineProduct(service_name="petshandler-offline", port=9898),
+    "petshandler": OfflineProduct(
+        service_name="petshandler-offline",
+        port=9898,
+        api_hosts=("api.petshandler.com", "api-dev.petshandler.com"),
+    ),
 }
 DEFAULT_PRODUCT = "petshandler"
 SERVICE_NAME = PRODUCTS[DEFAULT_PRODUCT].service_name
@@ -76,6 +84,9 @@ IDLE_EVERY_SEC = 30.0
 LOG_MAX_BYTES = 5 * 1024 * 1024
 
 
+#: The runtime folder's name; the shops' data is in APP_DIR/offline.
+RUNTIME_FOLDER = "offline-runtime"
+
 #: The code root: `_MEIPASS` in a frozen build, the checkout from source.
 _CODE_ROOT = Path(__file__).resolve().parents[2]
 
@@ -83,11 +94,27 @@ _CODE_ROOT = Path(__file__).resolve().parents[2]
 def runtime_dir(product: str = DEFAULT_PRODUCT) -> Path:
     """Where a product's Node runtime, service and offline app are.
 
-    A packed resource, read only, addressed from the code like VERSION and
-    the fonts (BH-158): in a frozen build that is `_MEIPASS/offline/<product>`.
-    From source it is `offline/<product>/` in the checkout, filled by hand.
+    NOT inside the one-file build: that is unpacked into a temporary folder
+    on every start, and ~150 MB of Node and app would be unpacked with it
+    each time. The installers lay it down next to the manager instead:
+
+    * Windows — `{app}\\offline-runtime\\<product>` beside bhm.exe (Inno Setup);
+    * macOS — `Device Handler.app/Contents/Resources/offline-runtime/<product>`,
+      signed with the app (scripts/mac_sign_and_package.sh);
+    * from source — `offline-runtime/<product>/` in the checkout, by hand.
+
+    Read only in every case, and apart from the shops' data in
+    APP_DIR/offline (offline_state): on Windows APP_DIR is the install
+    folder itself, and an update replaces the runtime wholesale — it must
+    never touch the queue of operations waiting for the server.
     """
-    return _CODE_ROOT / "offline" / product
+    if getattr(sys, "frozen", False):
+        exe = Path(sys.executable).resolve()
+        if sys.platform == "darwin":
+            # …/Device Handler.app/Contents/MacOS/bhm → Contents/Resources
+            return exe.parents[1] / "Resources" / RUNTIME_FOLDER / product
+        return exe.parent / RUNTIME_FOLDER / product
+    return _CODE_ROOT / RUNTIME_FOLDER / product
 
 
 def node_path(root: Optional[Path] = None) -> Path:
@@ -428,12 +455,12 @@ class OfflineService:
         try:
             proc.terminate()
             await asyncio.wait_for(proc.wait(), timeout=3)
-        except (asyncio.TimeoutError, ProcessLookupError):
+        except (asyncio.TimeoutError, ProcessLookupError, OSError):
             try:
                 proc.kill()
                 await proc.wait()
-            except ProcessLookupError:
-                pass
+            except (ProcessLookupError, OSError) as e:
+                log.error("offline service pid %s could not be killed: %s", proc.pid, e)
         log.warning("offline service did not stop on its own and was terminated")
 
     def _next_wait(self) -> float:

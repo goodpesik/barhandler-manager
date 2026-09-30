@@ -101,12 +101,20 @@ def _mac_load(appid: str) -> Optional[dict]:
     return _decode(res.stdout)
 
 
+#: `security` exit code for «no such item»: already gone is what we want.
+_KEYCHAIN_NOT_FOUND = 44
+
+
 def _mac_delete(appid: str) -> None:
-    subprocess.run(
+    res = subprocess.run(
         ["/usr/bin/security", "delete-generic-password", "-s", KEYCHAIN_SERVICE, "-a", appid],
         capture_output=True,
         timeout=15,
     )
+    if res.returncode not in (0, _KEYCHAIN_NOT_FOUND):
+        # Saying «switched off» while the token and the key stay in the
+        # Keychain would be a lie; the caller keeps the shop active.
+        raise OSError(f"keychain refused to delete (code {res.returncode})")
 
 
 # ---- Windows ------------------------------------------------------------
@@ -123,7 +131,16 @@ def _dpapi(data: bytes, protect: bool) -> bytes:
     blob_in = DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
     blob_out = DATA_BLOB()
     crypt32 = ctypes.windll.crypt32  # type: ignore[attr-defined]
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
     fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+    # Pinned, not guessed: pointers must stay pointer-wide on 64-bit Windows.
+    fn.argtypes = [
+        ctypes.POINTER(DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(DATA_BLOB),
+    ]
+    fn.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
     CRYPTPROTECT_UI_FORBIDDEN = 0x1
     ok = fn(ctypes.byref(blob_in), None, None, None, None, CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out))
     if not ok:
@@ -131,7 +148,7 @@ def _dpapi(data: bytes, protect: bool) -> bytes:
     try:
         return ctypes.string_at(blob_out.pbData, blob_out.cbData)
     finally:
-        ctypes.windll.kernel32.LocalFree(blob_out.pbData)  # type: ignore[attr-defined]
+        kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
 
 
 # ---- the three calls ----------------------------------------------------
