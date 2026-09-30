@@ -108,11 +108,15 @@ def activate(payload: dict) -> dict:
         # A copy left from before (a switch-off that could not remove it all)
         # was encrypted with a key that is gone: moved aside, never opened
         # with the new one.
+        # Such folders are kept (not deleted: the lock that stopped the
+        # removal may still hold) and go with the shop's next full removal.
         stale = folder / "data"
-        if stale.exists():
-            aside = folder / f"data.unreadable-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}"
+        aside = folder / f"data.unreadable-{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}"
+        try:
             stale.rename(aside)
             log.warning("offline: shop %s had a local copy without its key, moved to %s", appid, aside.name)
+        except FileNotFoundError:
+            pass  # nothing left over — or a request sent twice already moved it
     offline_secrets.save(appid, {"deviceToken": token, "dataKey": data_key}, folder)
     config = {
         "product": product,

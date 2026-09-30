@@ -393,3 +393,27 @@ def test_the_same_settings_keep_their_snapshot_id(client_for):
     assert c.post("/offline/local-settings", json=body, headers=KEY).json()["id"] == first
     changed = {"appid": "bark-01", "items": {"phm.manager.fiscalPrinter": "p2"}}
     assert c.post("/offline/local-settings", json=changed, headers=KEY).json()["id"] != first
+
+
+
+def test_an_activation_sent_twice_at_once_does_not_fail(home):
+    import threading
+
+    old = home / "offline" / "bark-01" / "data"
+    old.mkdir(parents=True)
+    (old / "offline.sqlite").write_text("x")
+    errors = []
+
+    def go():
+        try:
+            offline_state.activate(dict(PAYLOAD))
+        except Exception as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=go) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == []
+    assert offline_state.active_appid() == "bark-01"

@@ -20,6 +20,7 @@ import logging
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -54,7 +55,9 @@ def _decode(raw: str) -> Optional[dict]:
 def _write_private(path: Path, data: bytes) -> None:
     """Write through a temporary file and a rename, readable by this user only."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
+    # A name of its own: two writers at once must not share (and steal) one
+    # temporary file.
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         os.write(fd, data)
