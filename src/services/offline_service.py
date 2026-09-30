@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 import urllib.request
@@ -219,6 +220,8 @@ class OfflineService:
                 await self._sleep(IDLE_EVERY_SEC)
                 continue
             self._cfg_key = _config_key(cfg)
+            # A switch-off belongs to the service it stopped, not to this one.
+            self._stopped_on_purpose = False
             started = await self._start(cfg)
             if started:
                 await self._watch()
@@ -303,7 +306,7 @@ class OfflineService:
         # Waiting for the right version, not for any answer.
         deadline = time.monotonic() + START_TIMEOUT_SEC
         while time.monotonic() < deadline:
-            if self._stopping or self._proc is not proc:
+            if self._stopping or self._stopped_on_purpose or self._proc is not proc:
                 return False
             if proc.returncode is not None:
                 self._fail(f"exited on start with code {proc.returncode}")
@@ -317,6 +320,8 @@ class OfflineService:
                     pid=proc.pid,
                     version=health.get("version"),
                     restarts=self.state.restarts,
+                    # Why it last had to be restarted stays visible.
+                    last_error=self.state.last_error,
                     started_at=time.monotonic(),
                 )
                 self._remember(health)
@@ -341,6 +346,14 @@ class OfflineService:
         pid = health.get("pid")
         if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
             return False
+        if not _orphaned(pid):
+            # Another manager (an overlapping update, a second session) may be
+            # supervising it right now: killing it would stop a working till.
+            log.warning(
+                "offline service: %s (pid %s) on the port still has its manager; left alone",
+                SERVICE_NAME, pid,
+            )
+            return False
         log.warning(
             "offline service: a stray %s %s (pid %s) holds the port, stopping it",
             SERVICE_NAME, health.get("version"), pid,
@@ -364,19 +377,27 @@ class OfflineService:
         written = out.tell() if out is not None else 0
         try:
             async for line in proc.stdout:
+                # Reading never stops while the child runs: a child whose
+                # pipe is not drained blocks on its next write.
                 if out is None:
                     continue
-                if written + len(line) > LOG_MAX_BYTES:
-                    out.close()
-                    out = self._open_log(rotate=True)
-                    written = 0
-                    if out is None:
-                        continue
-                out.write(line)
-                out.flush()
-                written += len(line)
-        except (OSError, ValueError) as e:
-            log.warning("offline service: log copy stopped: %s", e)
+                try:
+                    if written + len(line) > LOG_MAX_BYTES:
+                        out.close()
+                        out = self._open_log(rotate=True)
+                        written = 0
+                        if out is None:
+                            continue
+                    out.write(line)
+                    out.flush()
+                    written += len(line)
+                except (OSError, ValueError) as e:
+                    log.warning("offline service: log write failed, output dropped from now on: %s", e)
+                    try:
+                        out.close()
+                    except OSError:
+                        pass
+                    out = None
         finally:
             if out is not None:
                 out.close()
@@ -439,8 +460,12 @@ class OfflineService:
                 await self._end(proc)
         finally:
             if pump is not None:
-                # The pipe closes with the process; the copy then ends by itself.
-                await asyncio.gather(pump, return_exceptions=True)
+                # The pipe closes with the process; the copy then ends by
+                # itself — but never wait on it without a limit.
+                try:
+                    await asyncio.wait_for(asyncio.gather(pump, return_exceptions=True), timeout=3)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pump.cancel()
 
     async def _end(self, proc: asyncio.subprocess.Process) -> None:
         # Closing stdin is the polite stop: the service shuts its server and
@@ -450,6 +475,11 @@ class OfflineService:
                 proc.stdin.close()
             await asyncio.wait_for(proc.wait(), timeout=5)
             return
+        except asyncio.CancelledError:
+            # Cancelled while waiting politely (shutdown): the child must not
+            # outlive us, so it is killed before the cancellation goes on.
+            _hard_kill(proc)
+            raise
         except (asyncio.TimeoutError, ConnectionError):
             pass
         try:
@@ -495,6 +525,28 @@ class OfflineService:
 
 def _config_key(cfg: Optional[dict]) -> Optional[str]:
     return json.dumps(cfg, sort_keys=True) if cfg else None
+
+
+def _hard_kill(proc: asyncio.subprocess.Process) -> None:
+    try:
+        proc.kill()
+    except (ProcessLookupError, OSError):
+        pass
+
+
+def _orphaned(pid: int) -> bool:
+    """A service whose manager is gone. A child's stdin ends with its manager
+    and it stops by itself, so a stray is one that hung past that — and on
+    macOS/Linux it has been re-parented to launchd/init (ppid 1). On Windows
+    there is no cheap parent check, and a hard-killed manager's child exits
+    with its pipe anyway: nothing is killed there."""
+    if sys.platform == "win32":
+        return False
+    try:
+        out = subprocess.run(["ps", "-o", "ppid=", "-p", str(pid)], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.stdout.strip() == "1"
 
 
 def _no_window() -> dict:

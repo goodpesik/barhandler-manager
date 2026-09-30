@@ -146,8 +146,9 @@ async def test_a_service_that_dies_is_started_again(fake, monkeypatch):
     svc = make()
     task = asyncio.create_task(svc.run_forever())
     try:
-        assert await _until(lambda: len(configs()) >= 2, timeout=15)
+        assert await _until(lambda: len(configs()) >= 2 and svc.state.running, timeout=15)
         assert svc.state.restarts >= 1
+        # Running again, and why it had to be restarted is still shown.
         assert "exited" in (svc.state.last_error or "")
     finally:
         await svc.stop()
@@ -424,15 +425,23 @@ async def test_a_stray_service_of_ours_is_stopped_and_replaced(fake):
     make, configs = fake
     import subprocess as sp
 
-    stray = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-    try:
-        answers = [{"name": SERVICE_NAME, "version": "0.0.1", "pid": stray.pid}]
+    import os as _os
 
+    # An orphan, as a stray is: its parent is gone and it was re-parented.
+    out = sp.run(["sh", "-c", "sleep 60 >/dev/null 2>&1 & echo $!"], capture_output=True, text=True)
+    stray_pid = int(out.stdout.strip())
+
+    def alive(pid):
+        try:
+            _os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+
+    try:
         def fetch(port):
-            if answers:
-                if stray.poll() is None:
-                    return answers[0]
-                answers.clear()
+            if alive(stray_pid):
+                return {"name": SERVICE_NAME, "version": "0.0.1", "pid": stray_pid}
             from src.services.offline_service import _fetch_health
             return _fetch_health(port)
 
@@ -440,15 +449,35 @@ async def test_a_stray_service_of_ours_is_stopped_and_replaced(fake):
         task = asyncio.create_task(svc.run_forever())
         try:
             assert await _until(lambda: svc.state.running, timeout=15)
-            assert stray.wait(timeout=5) is not None
+            assert not alive(stray_pid)
             assert len(configs()) == 1
         finally:
             await svc.stop()
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
     finally:
-        if stray.poll() is None:
-            stray.kill()
+        if alive(stray_pid):
+            _os.kill(stray_pid, 9)
+
+
+@pytest.mark.asyncio
+async def test_our_service_with_a_live_manager_is_never_killed(fake):
+    """A second manager (an overlapping update) must not stop a working till."""
+    make, configs = fake
+    import subprocess as sp
+
+    supervised = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])  # parent alive: us
+    try:
+        svc = make(fetch_health=lambda p: {"name": SERVICE_NAME, "version": "1.2.3", "pid": supervised.pid})
+        task = asyncio.create_task(svc.run_forever())
+        assert await _until(lambda: svc.state.last_error is not None)
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert supervised.poll() is None
+        assert configs() == []
+    finally:
+        supervised.kill()
 
 
 @pytest.mark.asyncio
@@ -550,3 +579,76 @@ def test_the_runtime_lies_beside_the_frozen_manager_not_inside_it(monkeypatch):
     assert mod.runtime_dir("petshandler") == Path(
         "/Applications/Device Handler.app/Contents/Resources/offline-runtime/petshandler"
     )
+
+
+
+@pytest.mark.asyncio
+async def test_cancelled_while_stopping_politely_the_child_is_still_killed(fake, monkeypatch):
+    """Shutdown cancels the supervisor; a child that ignores the closed stdin
+    must not survive it, and the shutdown must not hang."""
+    make, _ = fake
+    import textwrap as tw
+
+    stubborn = tw.dedent(
+        """
+        import json, sys, threading, time, signal
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        cfg = json.loads(sys.stdin.readline())
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                b = json.dumps({"name": "petshandler-offline", "version": "1.2.3"}).encode()
+                self.send_response(200); self.end_headers(); self.wfile.write(b)
+            def log_message(self, *a): pass
+        srv = HTTPServer(("127.0.0.1", cfg["port"]), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        while True:
+            time.sleep(1)   # ignores stdin closing
+        """
+    )
+    svc = make()
+    path = Path(svc._argv[1]).with_name("stubborn.py")
+    path.write_text(stubborn)
+    svc._argv = [sys.executable, str(path)]
+    task = asyncio.create_task(svc.run_forever())
+    assert await _until(lambda: svc.state.running)
+    proc = svc._proc
+    stopping = asyncio.create_task(svc._stop_process())
+    await asyncio.sleep(0.5)  # inside the polite 5 s wait
+    stopping.cancel()
+    await asyncio.gather(stopping, return_exceptions=True)
+    await asyncio.wait_for(proc.wait(), timeout=5)
+    assert proc.returncode is not None
+    await svc.stop()
+    task.cancel()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=10)
+
+
+@pytest.mark.asyncio
+async def test_a_log_write_failure_does_not_stop_draining_the_child(fake, monkeypatch, tmp_path):
+    make, _ = fake
+    monkeypatch.setenv("FAKE_SPAM", "3000")  # ~270 KB, more than a pipe holds
+    svc = make()
+
+    class Broken:
+        def tell(self):
+            return 0
+
+        def write(self, b):
+            raise OSError("disk full")
+
+        def flush(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(svc, "_open_log", lambda rotate=False: Broken())
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        # Its /health comes after the spam: it only answers if we kept reading.
+        assert await _until(lambda: svc.state.running, timeout=15)
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

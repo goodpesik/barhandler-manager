@@ -26,6 +26,7 @@ import os
 import re
 import secrets as pysecrets
 import shutil
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -219,6 +220,10 @@ def public_status() -> dict:
 #: A snapshot is a handful of short preferences; anything bigger is not one.
 LOCAL_SETTINGS_MAX_BYTES = 64 * 1024
 _SETTING_KEY = re.compile(r"[A-Za-z0-9_.:-]{1,100}")
+#: The manager's own address may only be this computer: the offline build
+#: sends every print and status call there (the app checks it again).
+_LOCAL_URL = re.compile(r"https?://(localhost|127\.0\.0\.1)(:\d{1,5})?/?")
+_VALUE_CHECKS = {"phm.manager.url": _LOCAL_URL}
 
 
 def save_local_settings(appid: str, items: object) -> dict:
@@ -237,13 +242,22 @@ def save_local_settings(appid: str, items: object) -> dict:
         isinstance(k, str) and _SETTING_KEY.fullmatch(k) and isinstance(v, str) for k, v in items.items()
     ):
         raise ActivationError("Некоректні налаштування.")
-    body = {"savedAt": datetime.now(timezone.utc).isoformat(), "items": items}
+    for key, check in _VALUE_CHECKS.items():
+        if key in items and not check.fullmatch(items[key]):
+            raise ActivationError("Некоректні налаштування.")
+    # A new id on every save: the offline build applies a snapshot it has not
+    # applied yet, not «a later time» — the till's clock can jump back.
+    body = {
+        "id": uuid.uuid4().hex,
+        "savedAt": datetime.now(timezone.utc).isoformat(),
+        "items": items,
+    }
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
     if len(raw) > LOCAL_SETTINGS_MAX_BYTES:
         raise ActivationError("Налаштування завеликі.")
     offline_secrets._write_private(shop_folder(appid) / "local-settings.json", raw)
     log.info("offline: %d browser settings kept for shop %s", len(items), appid)
-    return {"savedAt": body["savedAt"], "count": len(items)}
+    return {"id": body["id"], "savedAt": body["savedAt"], "count": len(items)}
 
 
 def load_local_settings() -> Optional[dict]:

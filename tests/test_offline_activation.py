@@ -260,7 +260,10 @@ def test_the_online_apps_settings_are_kept_for_the_offline_build(client_for, hom
     r = c.post("/offline/local-settings", json={"appid": "bark-01", "items": items}, headers=KEY)
     assert r.status_code == 200 and r.json()["count"] == 2
     got = c.get("/offline/local-settings", headers=KEY).json()
-    assert got["items"] == items and got["savedAt"]
+    assert got["items"] == items and got["savedAt"] and got["id"]
+    # Every save is a new snapshot for the offline build.
+    again = c.post("/offline/local-settings", json={"appid": "bark-01", "items": items}, headers=KEY)
+    assert again.json()["id"] != got["id"]
     kept = home / "offline" / "bark-01" / "local-settings.json"
     assert stat.S_IMODE(os.stat(kept).st_mode) == 0o600
 
@@ -282,6 +285,9 @@ def test_settings_of_another_shop_or_before_activation_are_refused(client_for):
         {"key with spaces": "v"},
         {"k": 1},
         {"k": "x" * 70_000},
+        # The manager's own address may only be this computer.
+        {"phm.manager.url": "https://evil.example"},
+        {"phm.manager.url": "http://localhost:9999\n"},
     ],
 )
 def test_settings_that_are_not_a_small_string_map_are_refused(client_for, items):
@@ -351,3 +357,12 @@ def test_a_service_that_fails_to_stop_still_leaves_no_unreadable_data(client_for
     # The key is gone, so the copy it encrypted goes too.
     assert offline_state.active_appid() is None
     assert not (home / "offline" / "bark-01").exists()
+
+
+
+def test_a_local_manager_address_is_kept(client_for):
+    c = client_for(FakeService(0))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    for url in ("http://localhost:9999", "http://127.0.0.1:9999/"):
+        r = c.post("/offline/local-settings", json={"appid": "bark-01", "items": {"phm.manager.url": url}}, headers=KEY)
+        assert r.status_code == 200, url
