@@ -143,6 +143,8 @@ def test_another_shop_cannot_take_over_an_active_till(client_for):
         {"deviceToken": "not-a-device-token"},
         {"apiBase": "http://api.petshandler.com/api"},
         {"apiBase": "https://evil.example/steal"},
+        # Other products join PRODUCTS first (FitStudio, BarHandler: planned).
+        {"product": "barhandler"},
     ],
 )
 def test_what_cannot_activate_is_refused(client_for, bad):
@@ -227,3 +229,15 @@ def test_keychain_gets_the_secret_on_stdin_not_in_the_arguments(monkeypatch):
     # Nothing secret in the process list; the whole command goes through stdin.
     assert all(encoded not in a and "pho_top_secret" not in a for a in args)
     assert encoded in stdin
+
+
+
+def test_the_product_is_recorded_and_its_runtime_used(client_for, home):
+    from src.services.offline_service import runtime_dir
+
+    c = client_for(FakeService(0))
+    r = c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    assert r.json()["product"] == "petshandler"
+    assert c.get("/offline/status", headers=KEY).json()["product"] == "petshandler"
+    assert offline_state.current_config()["staticDir"] == str(runtime_dir("petshandler") / "app")
+    assert runtime_dir("petshandler").name == "petshandler"

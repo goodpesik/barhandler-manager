@@ -504,7 +504,7 @@ def _build_uninstall_script(purge_data: bool) -> str:
         'pkill -f "Device Handler.app/Contents/MacOS/bhm" 2>/dev/null || true; '
         'pkill -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true; '
         # PET-971 — the offline service the manager runs.
-        'pkill -x device-handler-offline 2>/dev/null || true',
+        'pkill -f device-handler-offline 2>/dev/null || true',
     )
     return " && ".join(steps[:-1]) + "; " + steps[-1]
 

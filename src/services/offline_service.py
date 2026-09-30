@@ -23,6 +23,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import signal
 import sys
 import time
 import urllib.request
@@ -34,9 +36,26 @@ from src.config import APP_DIR
 
 log = logging.getLogger(__name__)
 
-#: The service's own name in /health: a different program on the port is not ours.
-SERVICE_NAME = "petshandler-offline"
-DEFAULT_PORT = 9898
+@dataclass(frozen=True)
+class OfflineProduct:
+    """A product whose till can work offline through this manager."""
+
+    #: The service's own name in /health: a different program on the port is not ours.
+    service_name: str
+    #: The loopback port its offline service listens on.
+    port: int
+
+
+#: PET-971 — the products the manager can run an offline service for. Only
+#: Petshandler for now; FitStudio and BarHandler are planned (BarHandler on
+#: Android especially) and join here with their own service, port and
+#: runtime folder, while the supervision stays the same.
+PRODUCTS: dict[str, OfflineProduct] = {
+    "petshandler": OfflineProduct(service_name="petshandler-offline", port=9898),
+}
+DEFAULT_PRODUCT = "petshandler"
+SERVICE_NAME = PRODUCTS[DEFAULT_PRODUCT].service_name
+DEFAULT_PORT = PRODUCTS[DEFAULT_PRODUCT].port
 #: The Node runtime is shipped under this name so install, update and
 #: uninstall scripts can find and stop it (a bare «node» could be anybody's).
 NODE_PROCESS_NAME = "device-handler-offline"
@@ -61,14 +80,14 @@ LOG_MAX_BYTES = 5 * 1024 * 1024
 _CODE_ROOT = Path(__file__).resolve().parents[2]
 
 
-def runtime_dir() -> Path:
-    """Where the Node runtime, the service and the offline app are.
+def runtime_dir(product: str = DEFAULT_PRODUCT) -> Path:
+    """Where a product's Node runtime, service and offline app are.
 
     A packed resource, read only, addressed from the code like VERSION and
-    the fonts (BH-158): in a frozen build that is `_MEIPASS/offline`. From
-    source it is an `offline/` folder in the checkout, filled by hand.
+    the fonts (BH-158): in a frozen build that is `_MEIPASS/offline/<product>`.
+    From source it is `offline/<product>/` in the checkout, filled by hand.
     """
-    return _CODE_ROOT / "offline"
+    return _CODE_ROOT / "offline" / product
 
 
 def node_path(root: Optional[Path] = None) -> Path:
@@ -142,6 +161,7 @@ class OfflineService:
         # activation or a switch-off restarts it.
         self._cfg_key: Optional[str] = None
         self._stopped_on_purpose = False
+        self._pump: Optional[asyncio.Task] = None
         self._stopping = False
         self._failures = 0
         self.state = OfflineServiceState()
@@ -149,7 +169,15 @@ class OfflineService:
     # ---- public ------------------------------------------------------
 
     async def run_forever(self) -> None:
-        """The supervision loop, until stop()."""
+        """The supervision loop, until stop() — or cancellation, which also
+        stops the child rather than leaving it on the port."""
+        try:
+            await self._loop()
+        except asyncio.CancelledError:
+            await self._stop_process()
+            raise
+
+    async def _loop(self) -> None:
         told_idle = False
         while not self._stopping:
             cfg = self._load_config()
@@ -196,58 +224,70 @@ class OfflineService:
     def _runtime_ready(self) -> bool:
         missing = [p for p in self._argv[:2] if not Path(p).exists()]
         if missing:
-            self._fail(f"runtime missing: {', '.join(missing)}", level=logging.ERROR, once=True)
+            self._fail(f"runtime missing: {', '.join(missing)}", level=logging.ERROR, once=True, started=False)
             return False
         if not self._expected:
-            self._fail("the shipped service has no version.txt", level=logging.ERROR, once=True)
+            self._fail("the shipped service has no version.txt", level=logging.ERROR, once=True, started=False)
             return False
         return True
 
     async def _start(self, cfg: dict) -> bool:
-        # Something already answers on the port. Ours from a previous run
-        # would have stopped with its manager, so this is a stray or a
-        # different program: do not start a second one into a busy port.
         other = await asyncio.to_thread(self._fetch, self._port)
-        if other is not None:
-            self._fail(
-                f"port {self._port} is taken by {other.get('name')} {other.get('version')}"
-                f" (want {SERVICE_NAME} {self._expected})",
-            )
+        if self._stopping:
             return False
-        out = self._open_log()
+        if other is not None:
+            if other.get("name") == SERVICE_NAME and await self._stop_stray(other):
+                pass
+            else:
+                # A different program holds the port: do not start a second
+                # service into it.
+                self._fail(
+                    f"port {self._port} is taken by {other.get('name')} {other.get('version')}"
+                    f" (want {SERVICE_NAME} {self._expected})",
+                    started=False,
+                )
+                return False
         try:
-            self._proc = await asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(
                 *self._argv,
                 stdin=asyncio.subprocess.PIPE,
-                stdout=out,
-                stderr=out,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
                 env=_child_env(),
+                **_no_window(),
             )
         except OSError as e:
             self._fail(f"could not start: {e}", level=logging.ERROR)
             return False
-        finally:
-            if out is not None:
-                out.close()
+        self._proc = proc
+        self._pump = asyncio.create_task(self._copy_output(proc), name="offline-service-log")
+        if self._stopping:
+            # Stopped while the child was being spawned: it must not outlive us.
+            await self._stop_process()
+            return False
         line = json.dumps({**cfg, "port": self._port}) + "\n"
         try:
-            assert self._proc.stdin is not None
-            self._proc.stdin.write(line.encode("utf-8"))
-            await self._proc.stdin.drain()
+            assert proc.stdin is not None
+            proc.stdin.write(line.encode("utf-8"))
+            await proc.stdin.drain()
         except (ConnectionError, AssertionError) as e:
             self._fail(f"could not pass the config: {e}", level=logging.ERROR)
             return False
         # Waiting for the right version, not for any answer.
         deadline = time.monotonic() + START_TIMEOUT_SEC
         while time.monotonic() < deadline:
-            if self._proc.returncode is not None:
-                self._fail(f"exited on start with code {self._proc.returncode}")
+            if self._stopping or self._proc is not proc:
+                return False
+            if proc.returncode is not None:
+                self._fail(f"exited on start with code {proc.returncode}")
                 return False
             health = await asyncio.to_thread(self._fetch, self._port)
+            if self._stopping or self._proc is not proc:
+                return False
             if self._ours(health):
                 self.state = OfflineServiceState(
                     running=True,
-                    pid=self._proc.pid,
+                    pid=proc.pid,
                     version=health.get("version"),
                     restarts=self.state.restarts,
                     started_at=time.monotonic(),
@@ -255,7 +295,7 @@ class OfflineService:
                 self._remember(health)
                 log.info(
                     "offline service %s started (pid %s, shop %s)",
-                    self._expected, self._proc.pid, cfg.get("appid"),
+                    self._expected, proc.pid, cfg.get("appid"),
                 )
                 return True
             if health is not None:
@@ -267,6 +307,52 @@ class OfflineService:
             await self._sleep(0.5)
         self._fail(f"no answer on /health within {START_TIMEOUT_SEC:.0f}s")
         return False
+
+    async def _stop_stray(self, health: dict) -> bool:
+        """Our own service, left on the port by a manager that died hard: it
+        is not ours to supervise (we do not hold its stdin), so it goes."""
+        pid = health.get("pid")
+        if not isinstance(pid, int) or pid <= 0 or pid == os.getpid():
+            return False
+        log.warning(
+            "offline service: a stray %s %s (pid %s) holds the port, stopping it",
+            SERVICE_NAME, health.get("version"), pid,
+        )
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError) as e:
+            log.warning("offline service: could not stop pid %s: %s", pid, e)
+            return False
+        for _ in range(20):
+            await self._sleep(0.25)
+            if await asyncio.to_thread(self._fetch, self._port) is None:
+                return True
+        return False
+
+    async def _copy_output(self, proc: asyncio.subprocess.Process) -> None:
+        """The child's output into service.log, capped: rotated as it grows,
+        not only when the service restarts."""
+        assert proc.stdout is not None
+        out = self._open_log()
+        written = out.tell() if out is not None else 0
+        try:
+            async for line in proc.stdout:
+                if out is None:
+                    continue
+                if written + len(line) > LOG_MAX_BYTES:
+                    out.close()
+                    out = self._open_log(rotate=True)
+                    written = 0
+                    if out is None:
+                        continue
+                out.write(line)
+                out.flush()
+                written += len(line)
+        except (OSError, ValueError) as e:
+            log.warning("offline service: log copy stopped: %s", e)
+        finally:
+            if out is not None:
+                out.close()
 
     async def _watch(self) -> None:
         misses = 0
@@ -318,10 +404,18 @@ class OfflineService:
 
     async def _stop_process(self) -> None:
         proc, self._proc = self._proc, None
+        pump, self._pump = self._pump, None
         self.state.running = False
         self.state.pid = None
-        if proc is None or proc.returncode is not None:
-            return
+        try:
+            if proc is not None and proc.returncode is None:
+                await self._end(proc)
+        finally:
+            if pump is not None:
+                # The pipe closes with the process; the copy then ends by itself.
+                await asyncio.gather(pump, return_exceptions=True)
+
+    async def _end(self, proc: asyncio.subprocess.Process) -> None:
         # Closing stdin is the polite stop: the service shuts its server and
         # its database. Then SIGTERM, then SIGKILL.
         try:
@@ -347,27 +441,41 @@ class OfflineService:
         log.info("offline service: next start in %.0fs (failure %d)", wait, self._failures)
         return wait
 
-    def _fail(self, why: str, *, level: int = logging.WARNING, once: bool = False) -> None:
+    def _fail(
+        self, why: str, *, level: int = logging.WARNING, once: bool = False, started: bool = True,
+    ) -> None:
         if once and self.state.last_error == why:
             return
         self._failures += 1
-        self.state.restarts += 1
+        if started:
+            # Shown as «restarts»: only a service that was really started.
+            self.state.restarts += 1
         self.state.last_error = why
         log.log(level, "offline service: %s", why)
 
-    def _open_log(self):
+    def _open_log(self, rotate: bool = False):
         try:
             self._log_path.parent.mkdir(parents=True, exist_ok=True)
-            if self._log_path.exists() and self._log_path.stat().st_size > LOG_MAX_BYTES:
+            if rotate or (self._log_path.exists() and self._log_path.stat().st_size > LOG_MAX_BYTES):
                 self._log_path.replace(self._log_path.with_suffix(".log.1"))
             return open(self._log_path, "ab")
         except OSError as e:
+            # The output is then dropped (read and discarded), never mixed
+            # into the manager's own log.
             log.warning("offline service: no log file (%s)", e)
             return None
 
 
 def _config_key(cfg: Optional[dict]) -> Optional[str]:
     return json.dumps(cfg, sort_keys=True) if cfg else None
+
+
+def _no_window() -> dict:
+    """Windows: no console window for the child (as for every process the
+    manager starts, see src/routes/system.py)."""
+    if sys.platform == "win32":
+        return {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+    return {}
 
 
 def _child_env() -> dict:

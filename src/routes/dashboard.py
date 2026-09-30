@@ -387,7 +387,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
         <span data-i18n="offline_queue_label">Не синхронізовано операцій</span>
         <span id="offline-queue" class="muted">—</span>
       </label>
-      <p id="offline-hint" class="modal-desc" data-i18n="offline_hint" style="margin-top:8px;">Увімкнення офлайн-режиму: Petshandler → Налаштування → Пристрої → «Увімкнути офлайн-режим».</p>
+      <p id="offline-hint" class="modal-desc" data-i18n="offline_hint" style="margin-top:8px;">Увімкнення офлайн-режиму: Petshandler → Налаштування → Інтеграції → Пристрої → «Увімкнути офлайн-режим».</p>
       <div class="modal-actions">
         <button class="btn btn-default" data-i18n="btn_close" onclick="closeOfflineModal()">Закрити</button>
         <button id="offline-disable" class="btn btn-default" data-i18n="offline_disable" onclick="disableOffline()" style="display:none;">Вимкнути</button>
@@ -521,7 +521,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       offline_shop_label: "Заклад",
       offline_data_label: "Дані станом на",
       offline_queue_label: "Не синхронізовано операцій",
-      offline_hint: "Увімкнення офлайн-режиму: Petshandler → Налаштування → Пристрої → «Увімкнути офлайн-режим».",
+      offline_hint: "Увімкнення офлайн-режиму: Petshandler → Налаштування → Інтеграції → Пристрої → «Увімкнути офлайн-режим».",
       offline_disable: "Вимкнути",
       offline_off: "вимкнено",
       offline_on: "увімкнено, сервіс працює",
@@ -669,7 +669,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       offline_shop_label: "Shop",
       offline_data_label: "Data as of",
       offline_queue_label: "Operations not synchronised",
-      offline_hint: "To switch offline mode on: Petshandler → Settings → Devices → «Enable offline mode».",
+      offline_hint: "To switch offline mode on: Petshandler → Settings → Integrations → Devices → «Enable offline mode».",
       offline_disable: "Switch off",
       offline_off: "off",
       offline_on: "on, the service is running",

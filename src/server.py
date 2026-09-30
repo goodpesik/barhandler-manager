@@ -154,6 +154,10 @@ def create_app(config: dict) -> FastAPI:
             await offline.stop()
         if offline_task is not None:
             offline_task.cancel()
+            # Its outcome is read here, at shutdown, not lost to the GC.
+            for outcome in await asyncio.gather(offline_task, return_exceptions=True):
+                if isinstance(outcome, Exception):
+                    logger.warning("offline service task ended with %r", outcome)
         uplink_watch.cancel()
         if extract_keeper is not None:
             extract_keeper.cancel()

@@ -40,6 +40,9 @@ FAKE = textwrap.dedent(
         def log_message(self, *a):
             pass
 
+    for i in range(int(os.environ.get("FAKE_SPAM", "0"))):
+        print("line %05d " % i + "x" * 80, flush=True)
+    time.sleep(float(os.environ.get("FAKE_HEALTH_DELAY", "0")))
     srv = HTTPServer(("127.0.0.1", cfg["port"]), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     if die_after:
@@ -116,6 +119,7 @@ async def test_starts_with_the_config_on_stdin_and_reports_our_version(fake):
     finally:
         await svc.stop()
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -132,6 +136,7 @@ async def test_stop_closes_stdin_and_the_service_exits_on_its_own(fake):
         assert not svc.state.running
     finally:
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -147,6 +152,7 @@ async def test_a_service_that_dies_is_started_again(fake, monkeypatch):
     finally:
         await svc.stop()
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -162,6 +168,7 @@ async def test_another_version_answering_is_not_ours(fake, monkeypatch):
     finally:
         await svc.stop()
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -176,6 +183,7 @@ async def test_a_shop_not_activated_starts_nothing(fake):
     finally:
         await svc.stop()
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -193,6 +201,7 @@ async def test_a_port_held_by_another_program_is_left_alone(fake):
     finally:
         await svc.stop()
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def test_the_runtime_is_shipped_under_its_own_process_name():
@@ -209,10 +218,11 @@ _ROOT = Path(__file__).resolve().parent.parent
 _KILL_SITES = [
     # (file, a line that stops the manager, a line that stops the offline service)
     ("installers/barhandler-setup.iss", "taskkill /F /IM {#MyAppExeAltName}", "taskkill /F /IM device-handler-offline.exe"),
-    ("installers/install.sh", 'pkill', "-x device-handler-offline"),
+    ("installers/install.sh", 'pkill', "-f device-handler-offline"),
     ("installers/install.ps1", "Stop-Process -Id $p.ProcessId", 'Stop-Process -Name "device-handler-offline"'),
-    ("installers/mac-postinstall.sh", "pkill -9", "-x device-handler-offline"),
-    ("src/routes/system.py", "pkill -f \"BarhandlerManager.app", "pkill -x device-handler-offline"),
+    ("installers/mac-postinstall.sh", "pkill -9", "-f device-handler-offline"),
+    ("installers/install-android.sh", "pkill-main", "pkill -9 -f device-handler-offline|pkill -f device-handler-offline"),
+    ("src/routes/system.py", "pkill -f \"BarhandlerManager.app", "pkill -f device-handler-offline"),
 ]
 
 
@@ -222,9 +232,12 @@ def test_whatever_stops_the_manager_stops_the_offline_service(path, manager, off
     if manager == "pkill" or manager == "pkill -9":
         # The shell scripts stop the manager by its bundle path.
         managers = [l for l in lines if manager in l and "BarhandlerManager.app/Contents/MacOS/bhm" in l]
+    elif manager == "pkill-main":
+        # The Android install stops the manager by its main.py.
+        managers = [l for l in lines if l.lstrip().startswith("pkill") and "main.py" in l]
     else:
         managers = [l for l in lines if manager in l]
-    offlines = [l for l in lines if offline in l]
+    offlines = [l for l in lines if any(o in l for o in offline.split("|"))]
     assert managers, f"{path}: the manager's stop lines moved — update this test"
     assert len(offlines) == len(managers), (path, len(managers), len(offlines))
 
@@ -291,6 +304,7 @@ async def test_a_new_activation_restarts_the_service_with_it(fake, monkeypatch):
     finally:
         await svc.stop()
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
@@ -311,3 +325,211 @@ async def test_switching_off_stops_it_without_calling_it_a_failure(fake):
     finally:
         await svc.stop()
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+
+# ---- review round 1 (PET-971) -------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stopped_while_checking_the_port_starts_nothing(fake):
+    make, configs = fake
+    import time as _t
+
+    def slow_fetch(port):
+        _t.sleep(0.4)
+        return None
+
+    from src.services import offline_service as mod
+
+    spawned = []
+    real = mod.asyncio.create_subprocess_exec
+
+    async def spy(*args, **kw):
+        spawned.append(args)
+        return await real(*args, **kw)
+
+    monkeypatch_attr = pytest.MonkeyPatch()
+    monkeypatch_attr.setattr(mod.asyncio, "create_subprocess_exec", spy)
+    try:
+        svc = make(fetch_health=slow_fetch)
+        task = asyncio.create_task(svc.run_forever())
+        await asyncio.sleep(0.1)  # inside the port check
+        await svc.stop()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0.5)
+        # Not even started: the port check is where it stops.
+        assert spawned == []
+        assert configs() == []
+        assert svc._proc is None
+    finally:
+        monkeypatch_attr.undo()
+
+
+@pytest.mark.asyncio
+async def test_stopped_while_the_child_is_being_spawned_does_not_keep_it(fake, monkeypatch):
+    make, configs = fake
+    from src.services import offline_service as mod
+
+    real = mod.asyncio.create_subprocess_exec
+    children = []
+
+    async def slow_spawn(*args, **kw):
+        proc = await real(*args, **kw)
+        children.append(proc)
+        await asyncio.sleep(0.3)  # the stop lands here
+        return proc
+
+    monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", slow_spawn)
+    svc = make()
+    task = asyncio.create_task(svc.run_forever())
+    assert await _until(lambda: children)
+    await svc.stop()
+    await asyncio.gather(task, return_exceptions=True)
+    await children[0].wait()
+    # Stopped before the config went in: nothing ever served, nothing left.
+    assert children[0].returncode is not None
+    assert configs() == []
+
+
+@pytest.mark.asyncio
+async def test_stopped_while_waiting_for_health_leaves_no_child(fake, monkeypatch):
+    make, configs = fake
+    monkeypatch.setenv("FAKE_HEALTH_DELAY", "5")
+    svc = make()
+    task = asyncio.create_task(svc.run_forever())
+    assert await _until(lambda: svc._proc is not None and len(configs()) == 1)
+    proc = svc._proc
+    await svc.stop()
+    outcome = (await asyncio.gather(task, return_exceptions=True))[0]
+    assert not isinstance(outcome, Exception), outcome
+    assert proc.returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_supervisor_stops_the_child(fake):
+    make, _ = fake
+    svc = make()
+    task = asyncio.create_task(svc.run_forever())
+    assert await _until(lambda: svc.state.running)
+    proc = svc._proc
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert proc.returncode is not None
+
+
+@pytest.mark.asyncio
+async def test_a_stray_service_of_ours_is_stopped_and_replaced(fake):
+    make, configs = fake
+    import subprocess as sp
+
+    stray = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        answers = [{"name": SERVICE_NAME, "version": "0.0.1", "pid": stray.pid}]
+
+        def fetch(port):
+            if answers:
+                if stray.poll() is None:
+                    return answers[0]
+                answers.clear()
+            from src.services.offline_service import _fetch_health
+            return _fetch_health(port)
+
+        svc = make(fetch_health=fetch)
+        task = asyncio.create_task(svc.run_forever())
+        try:
+            assert await _until(lambda: svc.state.running, timeout=15)
+            assert stray.wait(timeout=5) is not None
+            assert len(configs()) == 1
+        finally:
+            await svc.stop()
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    finally:
+        if stray.poll() is None:
+            stray.kill()
+
+
+@pytest.mark.asyncio
+async def test_another_program_on_the_port_is_never_killed(fake):
+    make, _ = fake
+    import subprocess as sp
+
+    other = sp.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    try:
+        svc = make(fetch_health=lambda p: {"name": "someone-else", "pid": other.pid})
+        task = asyncio.create_task(svc.run_forever())
+        assert await _until(lambda: svc.state.last_error is not None)
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        assert other.poll() is None
+    finally:
+        other.kill()
+
+
+@pytest.mark.asyncio
+async def test_the_service_log_is_capped_while_it_runs(fake, monkeypatch, tmp_path):
+    make, _ = fake
+    monkeypatch.setattr("src.services.offline_service.LOG_MAX_BYTES", 20_000)
+    monkeypatch.setenv("FAKE_SPAM", "600")  # ~55 KB of output
+    svc = make()
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: svc.state.running)
+        log_file = tmp_path / "service.log"
+        assert await _until(lambda: (tmp_path / "service.log.1").exists())
+        assert log_file.stat().st_size <= 20_000
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_missing_runtime_is_not_counted_as_a_restart(tmp_path):
+    svc = OfflineService(
+        lambda: {"appid": "shop"},
+        argv=[str(tmp_path / "no-node"), str(tmp_path / "no-main.js")],
+        expected_version="1.2.3",
+        sleep=_fast_sleep,
+        log_path=tmp_path / "service.log",
+    )
+    task = asyncio.create_task(svc.run_forever())
+    await asyncio.sleep(0.3)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert "runtime missing" in svc.state.last_error
+    assert svc.state.restarts == 0
+
+
+def test_no_console_window_for_the_child_on_windows(monkeypatch):
+    from src.services import offline_service as mod
+
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    assert mod._no_window() == {"creationflags": 0x08000000}
+    monkeypatch.setattr(mod.sys, "platform", "darwin")
+    assert mod._no_window() == {}
+
+
+
+def test_every_installer_that_stops_the_manager_is_checked_above():
+    """A new install/update script must join the table, not slip past it."""
+    import re
+
+    listed = {path for path, _, _ in _KILL_SITES}
+    kills = re.compile(r"^\s*(pkill|taskkill|Exec\('cmd\.exe', '/c taskkill|Filename: \"\{cmd\}\"; Parameters: \"/c taskkill|Stop-Process)")
+    for path in sorted((_ROOT / "installers").iterdir()):
+        if not path.is_file():
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if any(kills.search(line) for line in text.splitlines()):
+            assert f"installers/{path.name}" in listed, path.name
+
+
+def test_linux_would_not_find_the_service_by_its_short_name():
+    """The kernel keeps 15 characters of a process name: `pkill -x` with the
+    full name is a no-op on Linux, so the shell scripts must use -f."""
+    for path in ("installers/install.sh", "installers/install-android.sh", "installers/mac-postinstall.sh", "src/routes/system.py"):
+        assert "-x device-handler-offline" not in (_ROOT / path).read_text(encoding="utf-8"), path

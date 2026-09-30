@@ -32,7 +32,7 @@ from typing import Optional
 
 from src.config import APP_DIR
 from src.services import offline_secrets
-from src.services.offline_service import runtime_dir
+from src.services.offline_service import DEFAULT_PRODUCT, PRODUCTS, runtime_dir
 
 log = logging.getLogger(__name__)
 
@@ -69,6 +69,10 @@ def active_appid() -> Optional[str]:
 
 def activate(payload: dict) -> dict:
     """Store what the online app sent; returns the public part for the answer."""
+    # Which product's till this is (only Petshandler so far, see PRODUCTS).
+    product = str(payload.get("product") or DEFAULT_PRODUCT)
+    if product not in PRODUCTS:
+        raise ActivationError("Офлайн-режим для цього продукту не підтримується.")
     appid = str(payload.get("appid") or "")
     device_id = str(payload.get("deviceId") or "")
     token = str(payload.get("deviceToken") or "")
@@ -96,6 +100,7 @@ def activate(payload: dict) -> dict:
     data_key = (old or {}).get("dataKey") or base64.b64encode(pysecrets.token_bytes(32)).decode("ascii")
     offline_secrets.save(appid, {"deviceToken": token, "dataKey": data_key}, folder)
     config = {
+        "product": product,
         "appid": appid,
         "apiBase": api_base.rstrip("/"),
         "deviceId": device_id,
@@ -109,7 +114,7 @@ def activate(payload: dict) -> dict:
         "offline mode activated for shop %s, device %s (%s)",
         appid, device_id, "new token" if previous == appid else "first activation",
     )
-    return {k: config[k] for k in ("appid", "deviceId", "shopName", "tokenExpiresAt", "activatedAt")}
+    return {k: config[k] for k in ("product", "appid", "deviceId", "shopName", "tokenExpiresAt", "activatedAt")}
 
 
 def check_can_deactivate(queued: Optional[int]) -> None:
@@ -177,7 +182,7 @@ def current_config() -> Optional[dict]:
         "deviceToken": kept["deviceToken"],
         "dataKey": kept["dataKey"],
         "dataDir": str(folder / "data"),
-        "staticDir": str(runtime_dir() / "app"),
+        "staticDir": str(runtime_dir(stored.get("product") or DEFAULT_PRODUCT) / "app"),
     }
 
 
@@ -192,6 +197,7 @@ def public_status() -> dict:
         stored = {}
     return {
         "activated": True,
+        "product": stored.get("product") or DEFAULT_PRODUCT,
         "appid": appid,
         "shopName": stored.get("shopName") or "",
         "deviceId": stored.get("deviceId"),

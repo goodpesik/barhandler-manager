@@ -407,7 +407,7 @@ EOF
         pkill -f "Device Handler.app/Contents/MacOS/bhm" 2>/dev/null || true
         pkill -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true
         # PET-971 — the offline service the manager runs (Node, its own name).
-        pkill -x device-handler-offline 2>/dev/null || true
+        pkill -f device-handler-offline 2>/dev/null || true
         # SIGTERM triggers uvicorn's graceful shutdown which can take
         # 5+ seconds. Wait up to 10s for the process to actually exit;
         # if it's still alive after that, escalate to SIGKILL so the
@@ -427,7 +427,7 @@ EOF
         pkill -9 -f "$INSTALL_DIR/main.py" 2>/dev/null || true
         pkill -9 -f "Device Handler.app/Contents/MacOS/bhm" 2>/dev/null || true
         pkill -9 -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true
-        pkill -9 -x device-handler-offline 2>/dev/null || true
+        pkill -9 -f device-handler-offline 2>/dev/null || true
         sleep 1
         launchctl bootstrap "$LAUNCH_DOMAIN" "$PLIST" 2>&1 || \
             { warn "launchctl bootstrap failed — trying legacy load"; \
@@ -599,7 +599,7 @@ pkill -f "$INSTALL_DIR/main.py" 2>/dev/null || true
 pkill -f "Device Handler.app/Contents/MacOS/bhm" 2>/dev/null || true
 pkill -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true
 # PET-971 — the offline service the manager runs.
-pkill -x device-handler-offline 2>/dev/null || true
+pkill -f device-handler-offline 2>/dev/null || true
 EOF
 
 cat > "$INSTALL_DIR/status.sh" <<EOF

@@ -238,6 +238,9 @@ mkdir -p "$INSTALL_DIR/log"
 # the operator sees the old version forever.
 sv down "$SERVICE_NAME" >/dev/null 2>&1 || true
 pkill -f "$INSTALL_DIR/main.py" 2>/dev/null || true
+# PET-971 — the offline service the manager runs (Node, its own name). -f:
+# the kernel keeps only 15 characters of a process name, so -x never matches.
+pkill -f device-handler-offline 2>/dev/null || true
 # SIGTERM triggers uvicorn's graceful shutdown which can take 5+ seconds.
 # Wait up to 10s for actual exit; SIGKILL fallback so the new process
 # can bind port 9999.
@@ -246,6 +249,7 @@ for i in 1 2 3 4 5 6 7 8 9 10; do
     sleep 1
 done
 pkill -9 -f "$INSTALL_DIR/main.py" 2>/dev/null || true
+pkill -9 -f device-handler-offline 2>/dev/null || true
 sleep 1
 
 # Enable + start. `sv` talks to `runsv` over named pipes inside
