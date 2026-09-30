@@ -182,6 +182,10 @@ jobs:
   build-windows-exe:
     needs: [release, test]
     runs-on: windows-latest
+    env:
+      # PET-971 — read access to the offline service and app repos; unset =
+      # no offline runtime in this build.
+      OFFLINE_REPO_TOKEN: ${{ secrets.OFFLINE_REPO_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -193,13 +197,24 @@ jobs:
         run: pip install -r requirements.txt pyinstaller libusb-package
       - name: Build exe
         run: pyinstaller --noconfirm bhm.spec
+      # PET-971 — the Petshandler offline runtime, only when its secrets are set.
+      - name: Offline runtime
+        if: ${{ env.OFFLINE_REPO_TOKEN != '' }}
+        uses: ./.github/actions/offline-runtime
+        with:
+          platform: win-x64
+          out: offline-runtime/petshandler
+          token: ${{ env.OFFLINE_REPO_TOKEN }}
+          app-env: ${{ secrets.PETSHANDLER_APP_ENV }}
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
           choco install innosetup -y --no-progress
           $exe = (Resolve-Path dist\bhm.exe).Path
           $out = (Resolve-Path dist).Path
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=${{ needs.release.outputs.version }} "/DExePath=$exe" "/O$out" installers\barhandler-setup.iss
+          $offline = @()
+          if (Test-Path offline-runtime) { $offline = @("/DOfflineDir=$((Resolve-Path offline-runtime).Path)") }
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DMyAppVersion=${{ needs.release.outputs.version }} "/DExePath=$exe" "/O$out" @offline installers\barhandler-setup.iss
       # Нові імена активів — device-handler-*, бо продукт називається Handler
       # Device Manager. Старі (bhm.exe, barhandler-setup.exe) лишаються КОПІЯМИ
       # того самого файлу: кнопка «Оновити» у копіях, уже встановлених у полі,
@@ -244,6 +259,10 @@ jobs:
           - runner: macos-15-intel
             arch: intel
     runs-on: ${{ matrix.runner }}
+    env:
+      # PET-971 — read access to the offline service and app repos; unset =
+      # no offline runtime in this build.
+      OFFLINE_REPO_TOKEN: ${{ secrets.OFFLINE_REPO_TOKEN }}
     # Тверда межа: підпис, який чекає на вікно авторизації, або нотаризація,
     # що зависла в черзі Apple, не мають тримати CI годинами. Реліз v0.5.0
     # простояв 2+ години саме так.
@@ -287,6 +306,15 @@ jobs:
         run: pip install -r requirements.txt pyinstaller libusb-package
       - name: Build .app
         run: pyinstaller --noconfirm bhm.spec
+      # PET-971 — the Petshandler offline runtime inside the .app, signed with it.
+      - name: Offline runtime
+        if: ${{ env.OFFLINE_REPO_TOKEN != '' }}
+        uses: ./.github/actions/offline-runtime
+        with:
+          platform: ${{ matrix.arch == 'intel' && 'darwin-x64' || 'darwin-arm64' }}
+          out: "dist/Device Handler.app/Contents/Resources/offline-runtime/petshandler"
+          token: ${{ env.OFFLINE_REPO_TOKEN }}
+          app-env: ${{ secrets.PETSHANDLER_APP_ENV }}
       - name: Sign, package and notarize
         env:
           MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}

@@ -101,3 +101,45 @@ def test_the_manager_finds_the_runtime_where_the_script_puts_it(tmp_path):
     assert node_path(out).is_file()
     assert service_script(out).is_file()
     assert shipped_version(out) == "0.3.1"
+
+
+# ---- the release pipeline --------------------------------------------------
+
+import yaml
+
+
+@pytest.mark.parametrize(
+    "workflow,windows,mac",
+    [
+        (".github/workflows/publish.yml", "build-windows-exe", "build-macos-app"),
+        (".github/workflows/build-exe-dev.yml", "build-windows", "build-macos"),
+    ],
+)
+def test_both_installers_carry_the_runtime_when_its_secrets_are_set(workflow, windows, mac):
+    jobs = yaml.safe_load((ROOT / workflow).read_text())["jobs"]
+    for job in (windows, mac):
+        steps = jobs[job]["steps"]
+        assert jobs[job]["env"]["OFFLINE_REPO_TOKEN"] == "${{ secrets.OFFLINE_REPO_TOKEN }}"
+        uses = [s for s in steps if s.get("uses") == "./.github/actions/offline-runtime"]
+        assert len(uses) == 1, job
+        # Only with the secret: a release without it builds as before.
+        assert uses[0]["if"] == "${{ env.OFFLINE_REPO_TOKEN != '' }}"
+    win_steps = jobs[windows]["steps"]
+    names = [s.get("name") for s in win_steps]
+    assert names.index("Offline runtime") < names.index("Build installer (Inno Setup)")
+    iscc = next(s for s in win_steps if s.get("name") == "Build installer (Inno Setup)")["run"]
+    assert "@offline installers\\barhandler-setup.iss" in iscc
+    mac_steps = jobs[mac]["steps"]
+    mac_names = [s.get("name") for s in mac_steps]
+    sign = next(n for n in mac_names if n and n.startswith("Sign"))
+    # Inside the .app before it is signed.
+    assert mac_names.index("Offline runtime") < mac_names.index(sign)
+    runtime = next(s for s in mac_steps if s.get("name") == "Offline runtime")
+    assert runtime["with"]["out"].startswith("dist/Device Handler.app/Contents/Resources/offline-runtime/")
+
+
+def test_the_mac_script_signs_the_nested_node_before_the_app():
+    script = (ROOT / "scripts" / "mac_sign_and_package.sh").read_text()
+    node = script.index("entitlements-offline-node.plist")
+    app = script.index('--entitlements "$ENTITLEMENTS"')
+    assert node < app
