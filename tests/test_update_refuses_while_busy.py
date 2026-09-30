@@ -156,6 +156,9 @@ GUARDED_ROUTERS: list[tuple[str, str]] = [
 # Роутери, яким охорона не потрібна: службові й читання стану.
 UNGUARDED_ROUTERS: frozenset[str] = frozenset({
     "health", "version", "dashboard", "devices", "system",
+    # PET-972 — offline-mode activation, state and switch-off: settings, not
+    # money or printing. The offline queue itself is part of busy_refusal.
+    "offline",
 })
 
 

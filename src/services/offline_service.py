@@ -138,6 +138,10 @@ class OfflineService:
         self._fetch = fetch_health
         self._sleep = sleep
         self._proc: Optional[asyncio.subprocess.Process] = None
+        # PET-972 — the config the running service was started with: a new
+        # activation or a switch-off restarts it.
+        self._cfg_key: Optional[str] = None
+        self._stopped_on_purpose = False
         self._stopping = False
         self._failures = 0
         self.state = OfflineServiceState()
@@ -159,6 +163,7 @@ class OfflineService:
             if not self._runtime_ready():
                 await self._sleep(IDLE_EVERY_SEC)
                 continue
+            self._cfg_key = _config_key(cfg)
             started = await self._start(cfg)
             if started:
                 await self._watch()
@@ -171,6 +176,20 @@ class OfflineService:
         """Stop supervising and stop the service (manager shutdown)."""
         self._stopping = True
         await self._stop_process()
+
+    async def stop_service(self) -> None:
+        """Stop the running service now (switching offline mode off); the loop
+        goes on and starts nothing until a shop is activated again."""
+        self._stopped_on_purpose = True
+        await self._stop_process()
+
+    async def refresh(self) -> Optional[dict]:
+        """Ask /health now; the answer, when it is our service, or None."""
+        health = await asyncio.to_thread(self._fetch, self._port)
+        if not self._ours(health):
+            return None
+        self._remember(health)
+        return health
 
     # ---- internals ---------------------------------------------------
 
@@ -233,6 +252,7 @@ class OfflineService:
                     restarts=self.state.restarts,
                     started_at=time.monotonic(),
                 )
+                self._remember(health)
                 log.info(
                     "offline service %s started (pid %s, shop %s)",
                     self._expected, self._proc.pid, cfg.get("appid"),
@@ -255,11 +275,20 @@ class OfflineService:
             if self._stopping:
                 return
             proc = self._proc
+            if self._stopped_on_purpose:
+                # Switched off from the dashboard or Petshandler: not a failure.
+                self._stopped_on_purpose = False
+                return
             if proc is None or proc.returncode is not None:
                 self._fail(f"exited with code {proc.returncode if proc else '?'}")
                 return
+            if _config_key(self._load_config()) != self._cfg_key:
+                log.info("offline service: the activation changed, restarting")
+                self._failures = 0
+                return
             health = await asyncio.to_thread(self._fetch, self._port)
             if self._ours(health):
+                self._remember(health)
                 misses = 0
                 started = self.state.started_at or time.monotonic()
                 if self._failures and time.monotonic() - started >= STABLE_AFTER_SEC:
@@ -270,6 +299,15 @@ class OfflineService:
             if misses >= HEALTH_MISSES:
                 self._fail(f"did not answer /health {misses} times in a row")
                 return
+
+    def _remember(self, health: dict) -> None:
+        """What the dashboard shows and what the update guard asks."""
+        self.state.extra = {
+            "queued": health.get("queued"),
+            "dataAsOf": health.get("dataAsOf"),
+            "needsPairing": bool(health.get("needsPairing")),
+            "appid": health.get("appid"),
+        }
 
     def _ours(self, health: Optional[dict]) -> bool:
         return (
@@ -326,6 +364,10 @@ class OfflineService:
         except OSError as e:
             log.warning("offline service: no log file (%s)", e)
             return None
+
+
+def _config_key(cfg: Optional[dict]) -> Optional[str]:
+    return json.dumps(cfg, sort_keys=True) if cfg else None
 
 
 def _child_env() -> dict:

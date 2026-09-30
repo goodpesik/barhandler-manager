@@ -19,7 +19,7 @@ from src.constants import DEFAULT_API_KEY
 from src.devices.registry import PrinterRegistry
 from src.devices.terminal_registry import TerminalRegistry
 from src.routes import (
-    dashboard, devices, drawer, fiscal_it, health, print_routes, system, terminal, version,
+    dashboard, devices, drawer, fiscal_it, health, offline, print_routes, system, terminal, version,
 )
 from src.services.busy import BusyTracker, guard_critical
 from src.services.update_check import UpdateChecker
@@ -381,5 +381,7 @@ def create_app(config: dict) -> FastAPI:
     app.include_router(drawer.router, prefix="/drawer", dependencies=[Depends(verify_key), Depends(guard_critical("/drawer"))])
     app.include_router(terminal.router, prefix="/terminal", dependencies=[Depends(verify_key), Depends(guard_critical("/terminal"))])
     app.include_router(system.router, prefix="/system", dependencies=[Depends(verify_key)])
+    # PET-972 — Petshandler offline mode: activation, state, switching off.
+    app.include_router(offline.router, prefix="/offline", dependencies=[Depends(verify_key)])
 
     return app

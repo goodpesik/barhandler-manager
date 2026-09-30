@@ -216,6 +216,12 @@ def busy_refusal(request: Request) -> Optional[dict]:
     pending = printers_with_pending_jobs(request)
     if pending:
         reasons.append("друк у черзі: " + ", ".join(sorted(pending)))
+    # PET-972 — sales made offline still waiting for the server: an update
+    # replaces the offline service and could lose what it has not sent.
+    offline = getattr(request.app.state, "offline_service", None)
+    queued = (offline.state.extra or {}).get("queued") if offline is not None else None
+    if isinstance(queued, int) and queued > 0:
+        reasons.append(f"офлайн-операції ще не надійшли на сервер: {queued}")
     if not reasons:
         return None
     return {

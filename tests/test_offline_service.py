@@ -271,3 +271,43 @@ def test_a_build_without_the_runtime_leaves_it_alone(config, monkeypatch):
     events, has_service = _lifespan(config, monkeypatch, runtime_present=False)
     assert not has_service
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_a_new_activation_restarts_the_service_with_it(fake, monkeypatch):
+    make, configs = fake
+    monkeypatch.setattr("src.services.offline_service.HEALTH_EVERY_SEC", 0.01)
+    current = {"appid": "shop", "deviceToken": "pho_one", "dataKey": "k"}
+    svc = make(config=current)
+    svc._load_config = lambda: dict(current)
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: svc.state.running)
+        current["deviceToken"] = "pho_two"
+        assert await _until(lambda: len(configs()) >= 2 and svc.state.running)
+        assert configs()[-1]["deviceToken"] == "pho_two"
+        # A change of activation is not a failure.
+        assert svc.state.last_error is None
+    finally:
+        await svc.stop()
+        task.cancel()
+
+
+@pytest.mark.asyncio
+async def test_switching_off_stops_it_without_calling_it_a_failure(fake):
+    make, configs = fake
+    current = {"cfg": {"appid": "shop", "deviceToken": "pho_one", "dataKey": "k"}}
+    svc = make(config={})
+    svc._load_config = lambda: current["cfg"]
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: svc.state.running)
+        current["cfg"] = None
+        await svc.stop_service()
+        await asyncio.sleep(0.5)
+        assert not svc.state.running
+        assert svc.state.last_error is None
+        assert len(configs()) == 1
+    finally:
+        await svc.stop()
+        task.cancel()

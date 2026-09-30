@@ -201,6 +201,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
     <button class="btn btn-default" data-i18n="btn_add_printer_manual" onclick="openManualPrinterModal()">➕ Додати фіскальний принтер</button>
     <button class="btn btn-default" data-i18n="btn_logs" onclick="openLogs()">📋 Логи</button>
     <button class="btn btn-default" data-i18n="btn_usb" onclick="runUsbProbe()">🔌 USB діагностика</button>
+    <!-- PET-972 — офлайн-режим Petshandler: лише у збірці, що має його рантайм. -->
+    <button id="btn-offline" class="btn btn-default" data-i18n="btn_offline" onclick="openOfflineModal()" style="display:none;">🌐 Офлайн режим</button>
     <button id="btn-uplink" class="btn btn-default" onclick="openUplinkModal()"><span data-i18n="btn_uplink">📡 Віддалена діагностика</span><span id="uplink-badge" class="badge" data-i18n="uplink_badge_connected" style="display:none;">● підключено</span></button>
     <!-- BH-150 — видалення менеджера. Показуємо ЛИШЕ для встановленого
          мак-застосунку (/version віддає mac_app_install): у скриптовій
@@ -365,6 +367,34 @@ _HTML_TEMPLATE = r"""<!doctype html>
     </div>
   </div>
 
+  <div id="offline-modal" class="modal-backdrop" style="display:none;">
+    <div class="modal">
+      <h2 data-i18n="offline_title">Офлайн режим</h2>
+      <p class="modal-desc" data-i18n="offline_desc">Каса Petshandler працює без інтернету: продажі, зміна й записи зберігаються на цьому компʼютері й надсилаються на сервер автоматично після відновлення звʼязку.</p>
+      <label class="modal-row">
+        <span data-i18n="offline_status_label">Статус</span>
+        <span id="offline-status" class="muted">—</span>
+      </label>
+      <label class="modal-row" id="offline-shop-row">
+        <span data-i18n="offline_shop_label">Заклад</span>
+        <span id="offline-shop" class="muted">—</span>
+      </label>
+      <label class="modal-row" id="offline-data-row">
+        <span data-i18n="offline_data_label">Дані станом на</span>
+        <span id="offline-data" class="muted">—</span>
+      </label>
+      <label class="modal-row" id="offline-queue-row">
+        <span data-i18n="offline_queue_label">Не синхронізовано операцій</span>
+        <span id="offline-queue" class="muted">—</span>
+      </label>
+      <p id="offline-hint" class="modal-desc" data-i18n="offline_hint" style="margin-top:8px;">Увімкнення офлайн-режиму: Petshandler → Налаштування → Пристрої → «Увімкнути офлайн-режим».</p>
+      <div class="modal-actions">
+        <button class="btn btn-default" data-i18n="btn_close" onclick="closeOfflineModal()">Закрити</button>
+        <button id="offline-disable" class="btn btn-default" data-i18n="offline_disable" onclick="disableOffline()" style="display:none;">Вимкнути</button>
+      </div>
+    </div>
+  </div>
+
   <section id="logs-panel" style="display:none;">
     <h2>
       <span data-i18n="logs_title">Логи</span>
@@ -484,6 +514,21 @@ _HTML_TEMPLATE = r"""<!doctype html>
       btn_logs: "📋 Логи",
       btn_usb: "🔌 USB діагностика",
       btn_uplink: "📡 Віддалена діагностика",
+      btn_offline: "🌐 Офлайн режим",
+      offline_title: "Офлайн режим",
+      offline_desc: "Каса Petshandler працює без інтернету: продажі, зміна й записи зберігаються на цьому компʼютері й надсилаються на сервер автоматично після відновлення звʼязку.",
+      offline_status_label: "Статус",
+      offline_shop_label: "Заклад",
+      offline_data_label: "Дані станом на",
+      offline_queue_label: "Не синхронізовано операцій",
+      offline_hint: "Увімкнення офлайн-режиму: Petshandler → Налаштування → Пристрої → «Увімкнути офлайн-режим».",
+      offline_disable: "Вимкнути",
+      offline_off: "вимкнено",
+      offline_on: "увімкнено, сервіс працює",
+      offline_on_stopped: "увімкнено, сервіс не працює: {err}",
+      offline_needs_pairing: "потрібне повторне увімкнення в Petshandler",
+      offline_disable_confirm: "Вимкнути офлайн-режим на цьому компʼютері? Локальні дані закладу буде видалено.",
+      offline_disabled: "Офлайн-режим вимкнено",
       uplink_badge_connected: "● підключено",
       mt_title: "Додати термінал вручну",
       mt_desc: "Резерв на випадок коли скан не побачив (CGNAT мобільного оператора, hotspot планшета з нестандартним subnet, окрема VLAN). IP терміналу дивись у його admin меню.",
@@ -617,6 +662,21 @@ _HTML_TEMPLATE = r"""<!doctype html>
       btn_logs: "📋 Logs",
       btn_usb: "🔌 USB diagnostics",
       btn_uplink: "📡 Remote diagnostics",
+      btn_offline: "🌐 Offline mode",
+      offline_title: "Offline mode",
+      offline_desc: "The Petshandler till works without the internet: sales, the shift and bookings are kept on this computer and sent to the server automatically once the connection is back.",
+      offline_status_label: "Status",
+      offline_shop_label: "Shop",
+      offline_data_label: "Data as of",
+      offline_queue_label: "Operations not synchronised",
+      offline_hint: "To switch offline mode on: Petshandler → Settings → Devices → «Enable offline mode».",
+      offline_disable: "Switch off",
+      offline_off: "off",
+      offline_on: "on, the service is running",
+      offline_on_stopped: "on, the service is not running: {err}",
+      offline_needs_pairing: "needs to be switched on again in Petshandler",
+      offline_disable_confirm: "Switch offline mode off on this computer? The shop's local data will be removed.",
+      offline_disabled: "Offline mode switched off",
       uplink_badge_connected: "● connected",
       mt_title: "Add terminal manually",
       mt_desc: "A fallback for when the scan didn't find it (mobile operator CGNAT, a tablet hotspot on a non-standard subnet, a separate VLAN). Find the terminal's IP in its admin menu.",
@@ -1416,6 +1476,59 @@ _HTML_TEMPLATE = r"""<!doctype html>
     setTimeout(tick, POLL_MS);
   }
 
+  // ---- offline mode (PET-972) ---------------------------------------------
+
+  async function refreshOfflineButton() {
+    try {
+      const st = await api("GET", "/offline/status", true);
+      if (st && st.available) $("btn-offline").style.display = "";
+    } catch (_) {}
+  }
+
+  async function openOfflineModal() {
+    $("offline-modal").style.display = "flex";
+    try {
+      const st = await api("GET", "/offline/status", true);
+      const svc = st.service || {};
+      const on = !!st.activated;
+      let status;
+      if (!on) status = "<span class='muted'>" + escHtml(t("offline_off")) + "</span>";
+      else if (svc.needsPairing) status = "<span class='err-text'>" + escHtml(t("offline_needs_pairing")) + "</span>";
+      else if (svc.running) status = "<span class='ok-text'>" + escHtml(t("offline_on")) + "</span>";
+      else status = "<span class='err-text'>" + escHtml(t("offline_on_stopped", { err: svc.lastError || "—" })) + "</span>";
+      $("offline-status").innerHTML = status;
+      $("offline-shop").textContent = on ? (st.shopName || st.appid || "—") : "—";
+      $("offline-data").textContent = svc.dataAsOf ? new Date(svc.dataAsOf).toLocaleString(localeTag()) : "—";
+      $("offline-queue").textContent = on && svc.queued != null ? String(svc.queued) : "—";
+      $("offline-shop-row").style.display = on ? "" : "none";
+      $("offline-data-row").style.display = on ? "" : "none";
+      $("offline-queue-row").style.display = on ? "" : "none";
+      $("offline-hint").style.display = on ? "none" : "";
+      $("offline-disable").style.display = on ? "" : "none";
+      $("offline-disable").disabled = false;
+    } catch (e) {
+      $("offline-status").innerHTML = "<span class='err-text'>" + escHtml(t("error_prefix", { err: e.message })) + "</span>";
+    }
+  }
+
+  function closeOfflineModal() {
+    $("offline-modal").style.display = "none";
+  }
+
+  async function disableOffline() {
+    if (!confirm(t("offline_disable_confirm"))) return;
+    $("offline-disable").disabled = true;
+    try {
+      await api("POST", "/offline/deactivate", true);
+      showToast(t("offline_disabled"), "ok", 5000);
+      await openOfflineModal();
+    } catch (e) {
+      // The server's own words: e.g. how many operations still wait.
+      showToast(t("error_prefix", { err: e.message }), "err", 8000);
+      $("offline-disable").disabled = false;
+    }
+  }
+
   // ---- uplink modal --------------------------------------------------------
 
   async function openUplinkModal() {
@@ -1504,6 +1617,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       $("uplink-badge").style.display = (uplink && uplink.connected) ? "" : "none";
       $("updated").textContent = new Date().toLocaleTimeString(localeTag());
       refreshUninstallButton();
+      refreshOfflineButton();
       $("status-dot").className = "dot ok";
       $("error-banner").className = "error-banner";
     } catch (e) {
