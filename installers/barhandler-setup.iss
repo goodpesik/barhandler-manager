@@ -76,6 +76,8 @@ Filename: "{#MyAppUrl}"; Description: "Відкрити дашборд / Open da
 [UninstallRun]
 Filename: "{cmd}"; Parameters: "/c taskkill /F /IM {#MyAppExeName}"; Flags: runhidden; RunOnceId: "killexe"
 Filename: "{cmd}"; Parameters: "/c taskkill /F /IM {#MyAppExeAltName}"; Flags: runhidden; RunOnceId: "killexealt"
+; PET-971 — the offline service the manager runs (Node, shipped under its own name).
+Filename: "{cmd}"; Parameters: "/c taskkill /F /IM device-handler-offline.exe"; Flags: runhidden; RunOnceId: "killoffline"
 
 [Code]
 { Wipe any previous barhandler-manager before installing — the Python install
@@ -94,6 +96,9 @@ begin
     downloaded the exe directly is running. }
   Exec('cmd.exe', '/c taskkill /F /IM {#MyAppExeName}', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   Exec('cmd.exe', '/c taskkill /F /IM {#MyAppExeAltName}', '', SW_HIDE, ewWaitUntilTerminated, Rc);
+  { PET-971 — the offline service. It stops with the manager on its own, but a
+    running exe locks its file and the copy below would fail. }
+  Exec('cmd.exe', '/c taskkill /F /IM device-handler-offline.exe', '', SW_HIDE, ewWaitUntilTerminated, Rc);
 
   { Kill the OLD python-based manager, targeted by its command line so we
     don't touch unrelated python processes. }

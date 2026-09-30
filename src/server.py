@@ -137,7 +137,23 @@ def create_app(config: dict) -> FastAPI:
 
         uplink_watch = asyncio.create_task(watch(app.state, config))
 
+        # PET-971 — the Petshandler offline service. Only a build that ships
+        # its runtime runs it; everywhere else there is nothing to start.
+        from src.services.offline_service import OfflineService, node_path
+        from src.services.offline_state import current_config
+
+        offline = None
+        offline_task = None
+        if node_path().exists():
+            offline = OfflineService(current_config)
+            app.state.offline_service = offline
+            offline_task = asyncio.create_task(offline.run_forever(), name="offline-service")
+
         yield
+        if offline is not None:
+            await offline.stop()
+        if offline_task is not None:
+            offline_task.cancel()
         uplink_watch.cancel()
         if extract_keeper is not None:
             extract_keeper.cancel()
