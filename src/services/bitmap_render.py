@@ -13,6 +13,8 @@ on USB and fast enough for normal POS use.
 
 from __future__ import annotations
 
+import io
+import logging
 from pathlib import Path
 from typing import Literal
 
@@ -21,6 +23,27 @@ from PIL import Image, ImageDraw, ImageFont
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 FONT_REGULAR = ASSETS_DIR / "NotoSansMono-Regular.ttf"
 FONT_BOLD = ASSETS_DIR / "NotoSansMono-Bold.ttf"
+
+logger = logging.getLogger(__name__)
+
+
+def _read_font(path: Path) -> bytes | None:
+    try:
+        return path.read_bytes()
+    except OSError as exc:
+        logger.error("[bitmap] cannot read font %s: %s", path, exc)
+        return None
+
+
+# BH-182 — the fonts are read into memory once, at import (i.e. at startup).
+# In the frozen build they live in the extracted temp folder, which the OS
+# cleans of files untouched for days; a manager running that long lost them
+# and every print failed with «cannot open resource». Rendering must not
+# depend on the disk after start.
+_FONT_BYTES: dict[bool, bytes | None] = {
+    False: _read_font(FONT_REGULAR),
+    True: _read_font(FONT_BOLD),
+}
 
 # Dot widths of common thermal printer paper sizes.
 # 48mm label (XP-246B): 8 dots/mm × 48mm = 384 printable dots (same pitch as 58mm).
@@ -44,9 +67,16 @@ def dots_for(paper_width_mm: int) -> int:
 
 
 def _font(*, bold: bool, scale: float) -> ImageFont.FreeTypeFont:
-    path = FONT_BOLD if bold else FONT_REGULAR
-    size = max(8, int(BASE_FONT_PX * scale))
-    return ImageFont.truetype(str(path), size)
+    return _font_at(bold, max(8, int(BASE_FONT_PX * scale)))
+
+
+def _font_at(bold: bool, size: int) -> ImageFont.FreeTypeFont:
+    data = _FONT_BYTES[bold]
+    if data is None:
+        # Not readable at start (a broken build): try the disk once more so
+        # the error names the real file.
+        return ImageFont.truetype(str(FONT_BOLD if bold else FONT_REGULAR), size)
+    return ImageFont.truetype(io.BytesIO(data), size)
 
 
 def measure(text: str, *, bold: bool = False, scale: float = 1.0) -> tuple[int, int]:

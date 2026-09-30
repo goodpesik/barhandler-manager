@@ -82,6 +82,17 @@ def create_app(config: dict) -> FastAPI:
             _printer_connect_watcher(), name="printer-connect",
         )
 
+        # BH-182 — the frozen build runs from the system temp folder, which
+        # the OS cleans of files untouched for days; keep ours fresh.
+        from src.services.extract_keeper import extraction_dir, keep_extraction_alive
+
+        extract_root = extraction_dir()
+        extract_keeper = (
+            asyncio.create_task(keep_extraction_alive(extract_root), name="extract-keeper")
+            if extract_root
+            else None
+        )
+
         update_checker = UpdateChecker(current_version=current_version)
         app.state.update_checker = update_checker
         update_task = asyncio.create_task(
@@ -128,6 +139,8 @@ def create_app(config: dict) -> FastAPI:
 
         yield
         uplink_watch.cancel()
+        if extract_keeper is not None:
+            extract_keeper.cancel()
 
         if uplink is not None:
             await uplink.stop()

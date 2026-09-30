@@ -93,6 +93,25 @@ def _settle_from(source: asyncio.Future, target: asyncio.Future) -> None:
     source.add_done_callback(_copy)
 
 
+class PrintRenderError(PrinterUnavailable):
+    """BH-182 — building the job's bytes failed; the printer was not touched.
+
+    Rendering runs before any socket write, but a font Pillow cannot open
+    raises OSError too — and the worker's OSError branch took it for a lost
+    connection: «socket error — marking disconnected», printer shown offline,
+    while the real cause (missing fonts) stayed out of the log.
+
+    Code «render_failed», so every route that already turns PrinterUnavailable
+    into a structured 503 hands it to the frontend too (found by review: the
+    /print routes caught only PrinterUnavailable, and a plain error would have
+    been a bare 500). The worker does not drop the connection for it: only its
+    OSError branch does that.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="render_failed")
+
+
 class PrinterDevice:
     """A single ESC/POS printer (USB or network) with a FIFO job queue."""
 
@@ -916,6 +935,14 @@ class PrinterDevice:
                         # до зливу — інакше він поїде окремим джобом або не
                         # поїде взагалі.
                         self._finalize_tspl()
+                    except OSError as exc:
+                        # BH-182 — nothing has been written to the printer yet:
+                        # this is a render failure, not a lost connection. That
+                        # holds only while every byte of a job goes through the
+                        # patched `_raw` (see `_buffered`): a job that queried
+                        # the device here (is_online, paper_status) would have a
+                        # real connection loss filed as a render failure.
+                        raise PrintRenderError(f"render failed: {exc}") from exc
                     finally:
                         self._reset_render_state()
 
