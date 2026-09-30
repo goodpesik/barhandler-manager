@@ -241,3 +241,53 @@ def test_the_product_is_recorded_and_its_runtime_used(client_for, home):
     assert c.get("/offline/status", headers=KEY).json()["product"] == "petshandler"
     assert offline_state.current_config()["staticDir"] == str(runtime_dir("petshandler") / "app")
     assert runtime_dir("petshandler").name == "petshandler"
+
+
+# ---- PET-973: the browser settings snapshot ------------------------------
+
+
+def test_the_online_apps_settings_are_kept_for_the_offline_build(client_for, home):
+    c = client_for(FakeService(0))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    items = {"phm.manager.fiscalPrinter": "p1", "petshandler:lang": "uk"}
+    r = c.post("/offline/local-settings", json={"appid": "bark-01", "items": items}, headers=KEY)
+    assert r.status_code == 200 and r.json()["count"] == 2
+    got = c.get("/offline/local-settings", headers=KEY).json()
+    assert got["items"] == items and got["savedAt"]
+    kept = home / "offline" / "bark-01" / "local-settings.json"
+    assert stat.S_IMODE(os.stat(kept).st_mode) == 0o600
+
+
+def test_settings_of_another_shop_or_before_activation_are_refused(client_for):
+    c = client_for(FakeService(0))
+    body = {"appid": "bark-01", "items": {"a": "b"}}
+    assert c.post("/offline/local-settings", json=body, headers=KEY).status_code == 409
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    other = {"appid": "other", "items": {"a": "b"}}
+    assert c.post("/offline/local-settings", json=other, headers=KEY).status_code == 409
+    assert c.get("/offline/local-settings", headers=KEY).status_code == 404
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        ["not", "a", "dict"],
+        {"key with spaces": "v"},
+        {"k": 1},
+        {"k": "x" * 70_000},
+    ],
+)
+def test_settings_that_are_not_a_small_string_map_are_refused(client_for, items):
+    c = client_for(FakeService(0))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    r = c.post("/offline/local-settings", json={"appid": "bark-01", "items": items}, headers=KEY)
+    assert r.status_code == 409
+    assert c.get("/offline/local-settings", headers=KEY).status_code == 404
+
+
+def test_switching_off_removes_the_settings_too(client_for, home):
+    c = client_for(FakeService(0))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    c.post("/offline/local-settings", json={"appid": "bark-01", "items": {"a": "b"}}, headers=KEY)
+    c.post("/offline/deactivate", headers=KEY)
+    assert c.get("/offline/local-settings", headers=KEY).status_code == 404

@@ -94,3 +94,30 @@ async def deactivate(request: Request) -> dict:
     if appid:
         await asyncio.to_thread(offline_state.remove_data, appid)
     return {"ok": True}
+
+
+@router.post("/local-settings")
+async def save_local_settings(request: Request) -> dict:
+    """PET-973 — the online app leaves its device settings for the offline build."""
+    try:
+        payload = await request.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "Некоректний запит."})
+    try:
+        return await asyncio.to_thread(
+            offline_state.save_local_settings, str(payload.get("appid") or ""), payload.get("items"),
+        )
+    except offline_state.ActivationError as e:
+        # Not activated, or for another shop: the app simply has nothing to leave.
+        raise HTTPException(status_code=409, detail={"code": "offline_not_active", "message": str(e)})
+
+
+@router.get("/local-settings")
+async def load_local_settings() -> dict:
+    """PET-973 — the offline build takes them when it starts."""
+    body = await asyncio.to_thread(offline_state.load_local_settings)
+    if body is None:
+        raise HTTPException(status_code=404, detail={"code": "no_local_settings", "message": "Немає збережених налаштувань."})
+    return body

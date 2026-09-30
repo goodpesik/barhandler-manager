@@ -204,3 +204,47 @@ def public_status() -> dict:
         "tokenExpiresAt": stored.get("tokenExpiresAt"),
         "activatedAt": stored.get("activatedAt"),
     }
+
+
+# ---- PET-973: the online app's device settings, for the offline build ----
+
+#: A snapshot is a handful of short preferences; anything bigger is not one.
+LOCAL_SETTINGS_MAX_BYTES = 64 * 1024
+_SETTING_KEY = re.compile(r"^[A-Za-z0-9_.:-]{1,100}$")
+
+
+def save_local_settings(appid: str, items: object) -> dict:
+    """Keep what the online app sent for the offline build of the same shop.
+
+    Which keys go is decided by the app (an allow-list there: device and
+    printer settings, language, list views — never the session, the tenant or
+    temporary state). Here only the shape is checked.
+    """
+    active = active_appid()
+    if not active:
+        raise ActivationError("Офлайн-режим на цьому компʼютері не увімкнено.")
+    if appid != active:
+        raise ActivationError("Офлайн-режим на цьому компʼютері увімкнено для іншого закладу.")
+    if not isinstance(items, dict) or not all(
+        isinstance(k, str) and _SETTING_KEY.match(k) and isinstance(v, str) for k, v in items.items()
+    ):
+        raise ActivationError("Некоректні налаштування.")
+    body = {"savedAt": datetime.now(timezone.utc).isoformat(), "items": items}
+    raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    if len(raw) > LOCAL_SETTINGS_MAX_BYTES:
+        raise ActivationError("Налаштування завеликі.")
+    offline_secrets._write_private(shop_folder(appid) / "local-settings.json", raw)
+    log.info("offline: %d browser settings kept for shop %s", len(items), appid)
+    return {"savedAt": body["savedAt"], "count": len(items)}
+
+
+def load_local_settings() -> Optional[dict]:
+    """The active shop's snapshot: {savedAt, items}, or None."""
+    appid = active_appid()
+    if not appid:
+        return None
+    try:
+        body = json.loads((shop_folder(appid) / "local-settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return body if isinstance(body, dict) and isinstance(body.get("items"), dict) else None
