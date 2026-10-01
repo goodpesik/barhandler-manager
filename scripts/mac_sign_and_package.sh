@@ -109,6 +109,16 @@ if [ -n "${MAC_CERT_P12_BASE64:-}" ] && [ -n "${MAC_CERT_PASSWORD:-}" ]; then
     exit 1
   }
   echo "==> Підписую як: $sign_identity"
+  # PET-971 — вкладений Node офлайн-сервісу підписуємо ПЕРШИМ і зі своїми
+  # entitlements (JIT для V8): підпис застосунку накриває його лише як
+  # ресурс, а нотаризація перевіряє кожен Mach-O окремо.
+  for node in "$APP"/Contents/Resources/offline-runtime/*/device-handler-offline; do
+    [ -f "$node" ] || continue
+    echo "==> Підписую офлайн-рантайм: ${node#"$APP"/}"
+    codesign --force --timestamp --options runtime \
+      --entitlements installers/entitlements-offline-node.plist \
+      --sign "$sign_identity" "$node"
+  done
   codesign --force --timestamp --options runtime \
     --entitlements "$ENTITLEMENTS" \
     --sign "$sign_identity" "$APP"
@@ -119,6 +129,13 @@ fi
 
 echo "==> Перевіряю підпис застосунку"
 codesign --verify --deep --strict --verbose=2 "$APP"
+# PET-971 — --deep не заходить у Contents/Resources, тож вкладений Node
+# перевіряємо окремо: на нічному каналі нотаризації немає, і кривий підпис
+# інакше пройшов би непоміченим.
+for node in "$APP"/Contents/Resources/offline-runtime/*/device-handler-offline; do
+  [ -f "$node" ] || continue
+  codesign --verify --strict --verbose=2 "$node"
+done
 
 echo "==> Збираю .pkg, поки keychain із сертифікатами ще жива"
 bash scripts/mac_build_pkg.sh "$APP" "$PKG"

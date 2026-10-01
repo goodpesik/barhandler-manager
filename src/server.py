@@ -19,7 +19,7 @@ from src.constants import DEFAULT_API_KEY
 from src.devices.registry import PrinterRegistry
 from src.devices.terminal_registry import TerminalRegistry
 from src.routes import (
-    dashboard, devices, drawer, fiscal_it, health, print_routes, system, terminal, version,
+    dashboard, devices, drawer, fiscal_it, health, offline, print_routes, system, terminal, version,
 )
 from src.services.busy import BusyTracker, guard_critical
 from src.services.update_check import UpdateChecker
@@ -137,7 +137,27 @@ def create_app(config: dict) -> FastAPI:
 
         uplink_watch = asyncio.create_task(watch(app.state, config))
 
+        # PET-971 — the Petshandler offline service. Only a build that ships
+        # its runtime runs it; everywhere else there is nothing to start.
+        from src.services.offline_service import OfflineService, node_path
+        from src.services.offline_state import current_config
+
+        offline = None
+        offline_task = None
+        if node_path().exists():
+            offline = OfflineService(current_config)
+            app.state.offline_service = offline
+            offline_task = asyncio.create_task(offline.run_forever(), name="offline-service")
+
         yield
+        if offline is not None:
+            await offline.stop()
+        if offline_task is not None:
+            offline_task.cancel()
+            # Its outcome is read here, at shutdown, not lost to the GC.
+            for outcome in await asyncio.gather(offline_task, return_exceptions=True):
+                if isinstance(outcome, Exception):
+                    logger.warning("offline service task ended with %r", outcome)
         uplink_watch.cancel()
         if extract_keeper is not None:
             extract_keeper.cancel()
@@ -365,5 +385,7 @@ def create_app(config: dict) -> FastAPI:
     app.include_router(drawer.router, prefix="/drawer", dependencies=[Depends(verify_key), Depends(guard_critical("/drawer"))])
     app.include_router(terminal.router, prefix="/terminal", dependencies=[Depends(verify_key), Depends(guard_critical("/terminal"))])
     app.include_router(system.router, prefix="/system", dependencies=[Depends(verify_key)])
+    # PET-972 — Petshandler offline mode: activation, state, switching off.
+    app.include_router(offline.router, prefix="/offline", dependencies=[Depends(verify_key)])
 
     return app

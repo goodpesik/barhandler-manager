@@ -263,6 +263,9 @@ if manager_running; then
   pkill -9 -u "$CONSOLE_UID" -f "BarhandlerManager.app/Contents/MacOS/bhm" 2>/dev/null || true
   sleep 1
 fi
+# PET-971 — the offline service the manager runs. It stops with the manager
+# on its own; this catches one that did not, before its files are replaced.
+pkill -9 -u "$CONSOLE_UID" -f device-handler-offline 2>/dev/null || true
 
 booted=0
 for attempt in 1 2 3; do

@@ -35,3 +35,7 @@ install_id.txt
 # 28-мегабайтним бінарником — саме те, чого в репо бути не має.
 dist/
 build/
+
+# PET-971 — the offline runtime is packed at build time; a dev copy lives here.
+/offline/
+/offline-runtime/
