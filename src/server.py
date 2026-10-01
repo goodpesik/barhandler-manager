@@ -202,6 +202,10 @@ def create_app(config: dict) -> FastAPI:
     cors_origin_regex = config["server"].get("cors_origin_regex") or (
         r"^("
         r"https?://localhost(:\d+)?"
+        # PET-996 — the offline till is served from 127.0.0.1:9898 (it
+        # listens on IPv4 loopback only), and it prints through this
+        # manager; without this its preflight got 400 and nothing printed.
+        r"|https?://127\.0\.0\.1(:\d+)?"
         r"|capacitor://localhost"
         r"|https://[a-zA-Z0-9-]+\.(web\.app|firebaseapp\.com)"
         r"|https://([a-zA-Z0-9-]+\.)*barhandler\.com"
