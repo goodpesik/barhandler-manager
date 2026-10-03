@@ -14,7 +14,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
 
-from src.services import offline_state
+from src.services import offline_secrets, offline_state
 from src.services.offline_service import OfflineService
 
 log = logging.getLogger(__name__)
@@ -66,6 +66,16 @@ async def activate(request: Request) -> dict:
     except offline_state.ActivationError as e:
         log.warning("offline activation refused: %s", e)
         raise HTTPException(status_code=400, detail={"code": "activation_refused", "message": str(e)})
+    except offline_secrets.SecretsUnreadable as e:
+        # The key of the local copy may be in that file: nothing was changed.
+        log.error("offline activation stopped, the secrets file is unreadable: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "secrets_unreadable",
+                "message": "Не вдалося прочитати збережений ключ офлайн-режиму. Нічого не змінено — спробуйте ще раз.",
+            },
+        )
     except OSError as e:
         log.error("offline activation failed: %s", e)
         raise HTTPException(
