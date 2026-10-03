@@ -1,8 +1,8 @@
 """PET-972 — offline mode is switched on from Petshandler and kept here.
 
 The online app takes a device token from the server and hands it to the
-manager; the manager keeps the secrets with the operating system, the rest of
-the config in a private file, and refuses to switch off (or to update) while
+manager; the manager keeps the secrets and the rest of the config in private
+files, and refuses to switch off (or to update) while
 operations made offline have not reached the server.
 """
 
@@ -57,7 +57,6 @@ class FakeService:
 @pytest.fixture
 def home(tmp_path, monkeypatch):
     monkeypatch.setattr(offline_state, "APP_DIR", tmp_path)
-    monkeypatch.setattr(offline_secrets, "_backend", lambda: "file")
     monkeypatch.delenv("BHM_OFFLINE_CONFIG_FILE", raising=False)
     return tmp_path
 
@@ -222,21 +221,25 @@ def test_nothing_unsent_does_not_hold_an_update(client_for):
     assert c.get("/busy").json()["busy"] is False
 
 
-def test_keychain_gets_the_secret_on_stdin_not_in_the_arguments(monkeypatch):
-    calls = []
+def test_secrets_are_one_private_file_and_no_system_store_is_asked(client_for, home, monkeypatch):
+    """The Keychain locked after sleep and stopped the till: no system store at all."""
+    import subprocess as sp
 
-    def fake_run(args, **kw):
-        calls.append((args, kw.get("input")))
-        return subprocess.CompletedProcess(args, 0, "", "")
+    def no_store(*a, **k):
+        raise AssertionError(f"a system store was asked: {a}")
 
-    monkeypatch.setattr(offline_secrets.subprocess, "run", fake_run)
-    offline_secrets._mac_save("bark-01", {"deviceToken": "pho_top_secret", "dataKey": "k"})
-    args, stdin = calls[0]
-    encoded = offline_secrets._encode({"deviceToken": "pho_top_secret", "dataKey": "k"})
-    # Nothing secret in the process list; the whole command goes through stdin.
-    assert all(encoded not in a and "pho_top_secret" not in a for a in args)
-    assert encoded in stdin
-
+    monkeypatch.setattr(sp, "run", no_store)
+    c = client_for(FakeService(0))
+    assert c.post("/offline/activate", json=PAYLOAD, headers=KEY).status_code == 200
+    kept = home / "offline" / "bark-01" / "secrets.b64"
+    assert stat.S_IMODE(os.stat(kept).st_mode) == 0o600
+    assert "pho_secret_token_value" not in kept.read_text()
+    assert offline_state.current_config()["deviceToken"] == "pho_secret_token_value"
+    # A new token for the same shop keeps the data key.
+    key = offline_state.current_config()["dataKey"]
+    c.post("/offline/activate", json={**PAYLOAD, "deviceToken": "pho_renewed"}, headers=KEY)
+    assert offline_state.current_config()["dataKey"] == key
+    assert offline_state.current_config()["deviceToken"] == "pho_renewed"
 
 
 def test_the_product_is_recorded_and_its_runtime_used(client_for, home):
@@ -316,12 +319,12 @@ def test_the_products_own_servers_are_accepted(client_for, api):
     assert c.post("/offline/activate", json={**PAYLOAD, "apiBase": api}, headers=KEY).status_code == 200
 
 
-def test_a_keychain_that_will_not_delete_keeps_the_shop_on(client_for, monkeypatch):
+def test_secrets_that_will_not_delete_keep_the_shop_on(client_for, monkeypatch):
     c = client_for(FakeService(0))
     c.post("/offline/activate", json=PAYLOAD, headers=KEY)
 
     def refuse(appid, folder):
-        raise OSError("keychain refused to delete (code 51)")
+        raise OSError("secrets file could not be removed")
 
     monkeypatch.setattr(offline_secrets, "delete", refuse)
     r = c.post("/offline/deactivate", headers=KEY)
@@ -329,17 +332,6 @@ def test_a_keychain_that_will_not_delete_keeps_the_shop_on(client_for, monkeypat
     # Nothing half-done: still active, secrets and data in place.
     assert offline_state.active_appid() == "bark-01"
     assert offline_state.current_config() is not None
-
-
-def test_keychain_delete_reports_a_failure_and_accepts_not_found(monkeypatch):
-    codes = iter([51, 44])
-    monkeypatch.setattr(
-        offline_secrets.subprocess, "run",
-        lambda *a, **k: subprocess.CompletedProcess(a, next(codes), "", ""),
-    )
-    with pytest.raises(OSError):
-        offline_secrets._mac_delete("bark-01")
-    offline_secrets._mac_delete("bark-01")  # already gone: fine
 
 
 def test_a_service_that_fails_to_stop_still_leaves_no_unreadable_data(client_for, home):
@@ -382,6 +374,83 @@ def test_a_copy_left_without_its_key_is_moved_aside_on_activation(client_for, ho
     assert not (home / "offline" / "bark-01" / "data").exists()
     aside = [p for p in (home / "offline" / "bark-01").iterdir() if p.name.startswith("data.unreadable-")]
     assert len(aside) == 1 and (aside[0] / "offline.sqlite").exists()
+
+
+def test_an_unreadable_secrets_file_stops_the_activation_and_moves_nothing(client_for, home):
+    """A file that cannot be read now may hold the data key: it is not «no key»."""
+    c = client_for(FakeService(0))
+    assert c.post("/offline/activate", json=PAYLOAD, headers=KEY).status_code == 200
+    shop = home / "offline" / "bark-01"
+    (shop / "data").mkdir()
+    (shop / "data" / "offline.sqlite").write_text("encrypted with the kept key")
+    secrets = shop / "secrets.b64"
+    kept = secrets.read_text()
+    secrets.unlink()
+    secrets.mkdir()  # reading it now fails with an OSError, not «not found»
+    r = c.post("/offline/activate", json={**PAYLOAD, "deviceToken": "pho_renewed"}, headers=KEY)
+    assert r.status_code == 500 and r.json()["detail"]["code"] == "secrets_unreadable"
+    assert (shop / "data" / "offline.sqlite").exists()
+    assert not [p for p in shop.iterdir() if p.name.startswith("data.unreadable-")]
+    # Readable again: the same key, the copy untouched.
+    secrets.rmdir()
+    secrets.write_text(kept)
+    assert c.post("/offline/activate", json={**PAYLOAD, "deviceToken": "pho_renewed"}, headers=KEY).status_code == 200
+    assert offline_secrets._decode(secrets.read_text())["dataKey"] == offline_secrets._decode(kept)["dataKey"]
+    assert (shop / "data" / "offline.sqlite").exists()
+
+
+def test_current_config_says_unreadable_rather_than_not_activated(client_for, home):
+    c = client_for(FakeService(0))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    secrets = home / "offline" / "bark-01" / "secrets.b64"
+    secrets.unlink()
+    secrets.mkdir()
+    with pytest.raises(offline_secrets.SecretsUnreadable):
+        offline_state.current_config()
+
+
+@pytest.mark.parametrize("stored", ["[]", "{}", '{"apiBase": "https://api.petshandler.com/api"}'])
+def test_an_incomplete_config_is_not_activated_rather_than_an_error(client_for, home, stored):
+    c = client_for(FakeService(0))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    (home / "offline" / "bark-01" / "config.json").write_text(stored)
+    assert offline_state.current_config() is None
+
+
+def test_a_damaged_secrets_file_is_no_secrets(client_for, home):
+    c = client_for(FakeService(0))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    (home / "offline" / "bark-01" / "secrets.b64").write_bytes(b"\xff\xfe not base64")
+    assert offline_state.current_config() is None
+
+
+def test_a_failed_write_leaves_no_temporary_file_with_a_secret(home, monkeypatch):
+    folder = home / "offline" / "bark-01"
+
+    def broken_replace(a, b):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(offline_secrets.os, "replace", broken_replace)
+    with pytest.raises(OSError):
+        offline_secrets.save("bark-01", {"deviceToken": "pho_x", "dataKey": "k"}, folder)
+    assert [p.name for p in folder.iterdir()] == []
+
+
+def test_a_short_write_is_finished(home, monkeypatch):
+    real_write = os.write
+    monkeypatch.setattr(offline_secrets.os, "write", lambda fd, data: real_write(fd, bytes(data[:3])))
+    folder = home / "offline" / "bark-01"
+    offline_secrets.save("bark-01", {"deviceToken": "pho_x", "dataKey": "k"}, folder)
+    assert offline_secrets.load("bark-01", folder) == {"deviceToken": "pho_x", "dataKey": "k"}
+
+
+def test_a_lost_active_marker_does_not_throw_the_key_away(client_for, home):
+    c = client_for(FakeService(0))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    key = offline_state.current_config()["dataKey"]
+    (home / "offline" / "active.json").unlink()
+    assert c.post("/offline/activate", json=PAYLOAD, headers=KEY).status_code == 200
+    assert offline_state.current_config()["dataKey"] == key
 
 
 def test_the_same_settings_keep_their_snapshot_id(client_for):

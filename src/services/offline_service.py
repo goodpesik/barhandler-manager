@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from src.config import APP_DIR
+from src.services.offline_secrets import SecretsUnreadable
 
 log = logging.getLogger(__name__)
 
@@ -208,7 +209,14 @@ class OfflineService:
     async def _loop(self) -> None:
         told_idle = False
         while not self._stopping:
-            cfg = self._load_config()
+            try:
+                cfg = self._load_config()
+            except SecretsUnreadable as e:
+                # Not «not activated»: the secrets are there, just not readable
+                # now. Nothing to start with; try again shortly.
+                log.warning("offline service: secrets unreadable, not starting yet: %s", e)
+                await self._sleep(IDLE_EVERY_SEC)
+                continue
             if not cfg:
                 if not told_idle:
                     log.info("offline service: the shop is not activated, nothing to start")
@@ -416,7 +424,14 @@ class OfflineService:
             if proc is None or proc.returncode is not None:
                 self._fail(f"exited with code {proc.returncode if proc else '?'}")
                 return
-            if _config_key(self._load_config()) != self._cfg_key:
+            try:
+                now_key = _config_key(self._load_config())
+            except SecretsUnreadable as e:
+                # A read that fails now says nothing about the activation:
+                # the running service keeps going.
+                log.warning("offline service: secrets unreadable, keeping the running service: %s", e)
+                now_key = self._cfg_key
+            if now_key != self._cfg_key:
                 log.info("offline service: the activation changed, restarting")
                 self._failures = 0
                 return

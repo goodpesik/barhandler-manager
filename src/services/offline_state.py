@@ -5,7 +5,7 @@ device token from the server, so the online app takes one and hands it to the
 manager (POST /offline/activate). The manager then:
 
 * makes a fresh data key for the shop's local copy;
-* keeps the token and the key with the operating system (offline_secrets);
+* keeps the token and the key in a private file (offline_secrets);
 * writes the rest of the config — no secrets — to
   APP_DIR/offline/<appid>/config.json, readable by this user only, through a
   temporary file and a rename;
@@ -37,9 +37,8 @@ from src.services.offline_service import DEFAULT_PRODUCT, PRODUCTS, runtime_dir
 
 log = logging.getLogger(__name__)
 
-#: A shop's appid and a device id: used in paths and in Keychain commands.
-# fullmatch everywhere: `$` also matches before a trailing newline, and a
-# newline inside a `security -i` line splits it into two commands.
+#: A shop's appid and a device id: used in paths.
+# fullmatch everywhere: `$` also matches before a trailing newline.
 _SAFE_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 #: The server the token was issued by: https, /api, and a host on the
 #: product's own list (PRODUCTS[…].api_hosts).
@@ -99,7 +98,10 @@ def activate(payload: dict) -> dict:
         raise ActivationError(
             "Офлайн-режим уже увімкнено для іншого закладу. Спершу вимкніть його там.",
         )
-    old = offline_secrets.load(appid, folder) if previous == appid else None
+    # Read even when active.json was lost: the shop's own secrets file decides
+    # whether its data key still exists. A file that cannot be read now raises
+    # (SecretsUnreadable): the activation fails and nothing is moved aside.
+    old = offline_secrets.load(appid, folder)
     # A re-activation (a new token) keeps the data key: the local copy was
     # encrypted with it, and a new key would make it unreadable.
     data_key = (old or {}).get("dataKey")
@@ -194,6 +196,13 @@ def current_config() -> Optional[dict]:
     except (OSError, ValueError) as e:
         log.warning("offline config for shop %s unreadable: %s", appid, e)
         return None
+    # A config without what the service needs is not activated — returned as
+    # None, not raised: an exception here would end the supervisor.
+    if not isinstance(stored, dict) or not stored.get("apiBase") or not stored.get("deviceId"):
+        log.warning("offline config for shop %s is incomplete: activate again from Petshandler", appid)
+        return None
+    # SecretsUnreadable goes up: «cannot read it now» is not «not activated»,
+    # and the supervisor keeps a running service on it.
     kept = offline_secrets.load(appid, folder)
     if not kept or not kept.get("deviceToken") or not kept.get("dataKey"):
         log.warning("offline secrets for shop %s are missing: activate again from Petshandler", appid)

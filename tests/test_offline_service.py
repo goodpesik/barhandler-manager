@@ -309,6 +309,71 @@ async def test_a_new_activation_restarts_the_service_with_it(fake, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_secrets_unreadable_for_a_moment_keep_the_running_service(fake, monkeypatch):
+    """A locked or busy secrets file is not «not activated»: nothing is stopped."""
+    from src.services.offline_secrets import SecretsUnreadable
+
+    make, configs = fake
+    monkeypatch.setattr("src.services.offline_service.HEALTH_EVERY_SEC", 0.01)
+    cfg = {"appid": "shop", "deviceToken": "pho_one", "dataKey": "k"}
+    unreadable = {"now": False}
+
+    def load():
+        if unreadable["now"]:
+            raise SecretsUnreadable("locked")
+        return dict(cfg)
+
+    svc = make(config=cfg)
+    svc._load_config = load
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: svc.state.running)
+        pid = svc._proc.pid
+        unreadable["now"] = True
+        await asyncio.sleep(0.5)  # many health checks with the file unreadable
+        assert svc._proc is not None and svc._proc.pid == pid and svc._proc.returncode is None
+        assert len(configs()) == 1
+        assert not task.done()  # the supervisor itself is still alive
+        unreadable["now"] = False
+        await asyncio.sleep(0.2)
+        assert svc._proc.pid == pid and len(configs()) == 1
+        # And it still watches: a new activation restarts the service.
+        cfg["deviceToken"] = "pho_two"
+        assert await _until(lambda: len(configs()) >= 2 and svc.state.running)
+        assert configs()[-1]["deviceToken"] == "pho_two"
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_secrets_unreadable_at_start_wait_and_then_start(fake):
+    from src.services.offline_secrets import SecretsUnreadable
+
+    make, configs = fake
+    calls = {"n": 0}
+    cfg = {"appid": "shop", "deviceToken": "pho_one", "dataKey": "k"}
+
+    def load():
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise SecretsUnreadable("locked")
+        return dict(cfg)
+
+    svc = make(config=cfg)
+    svc._load_config = load
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: svc.state.running)
+        assert configs()[-1]["deviceToken"] == "pho_one"
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_switching_off_stops_it_without_calling_it_a_failure(fake):
     make, configs = fake
     current = {"cfg": {"appid": "shop", "deviceToken": "pho_one", "dataKey": "k"}}
