@@ -220,6 +220,16 @@ def busy_refusal(request: Request) -> Optional[dict]:
     # replaces the offline service and could lose what it has not sent.
     offline = getattr(request.app.state, "offline_service", None)
     queued = (offline.state.extra or {}).get("queued") if offline is not None else None
+    if not isinstance(queued, int):
+        # The service is down (no secrets) or silent: its queue is on disk,
+        # read the same way switching off reads it. Unreadable stays «free»:
+        # an update must stay possible exactly when something is broken.
+        from src.services import offline_state
+
+        appid = offline_state.active_appid()
+        # Called on the event loop: a short wait, never the manager frozen
+        # behind a locked file (the service writes in WAL mode, readers do not wait).
+        queued = offline_state.queued_on_disk(appid, timeout=0.2, quiet=True) if appid else None
     if isinstance(queued, int) and queued > 0:
         reasons.append(f"офлайн-операції ще не надійшли на сервер: {queued}")
     if not reasons:

@@ -191,8 +191,92 @@ def test_switching_off_waits_for_the_queue(client_for, home):
     assert offline_state.active_appid() == "bark-01"
     assert svc.stopped == 0
 
-    svc.queued = None  # the service does not answer: we cannot know
+
+def _local_copy(home, statuses):
+    """The offline service's local copy, as it lays out its queue (status in plain text)."""
+    import sqlite3
+
+    data = home / "offline" / "bark-01" / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(data / "offline.sqlite")
+    con.execute(
+        "CREATE TABLE outbox (seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,"
+        " occurred_at TEXT NOT NULL, payload BLOB NOT NULL, status TEXT NOT NULL DEFAULT 'queued', result BLOB,"
+        " attempts INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)"
+    )
+    for i, st in enumerate(statuses):
+        con.execute(
+            "INSERT INTO outbox (id, kind, occurred_at, payload, status, updated_at) VALUES (?, 'sale', 't', x'00', ?, 't')",
+            (f"op{i}", st),
+        )
+    con.commit()
+    con.close()
+
+
+def test_a_silent_service_with_unsent_operations_on_disk_is_not_switched_off(client_for, home):
+    """The service does not answer (no secrets, so it never started): the queue is read from disk."""
+    svc = FakeService(None)
+    c = client_for(svc)
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    _local_copy(home, ["queued", "applied", "queued"])
+    r = c.post("/offline/deactivate", headers=KEY)
+    assert r.status_code == 409 and "2" in r.json()["detail"]["message"]
+    assert offline_state.active_appid() == "bark-01"
+
+
+@pytest.mark.parametrize("statuses", [None, [], ["applied", "rejected"]])
+def test_a_silent_service_with_nothing_unsent_is_switched_off(client_for, home, statuses):
+    svc = FakeService(None)
+    c = client_for(svc)
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    if statuses is not None:
+        _local_copy(home, statuses)
+    assert c.post("/offline/deactivate", headers=KEY).status_code == 200
+    assert offline_state.active_appid() is None
+
+
+def test_an_update_waits_for_unsent_operations_on_disk_when_the_service_is_down(client_for, home):
+    c = client_for(FakeService(None))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    _local_copy(home, ["queued", "queued", "queued", "applied"])
+    body = c.get("/busy").json()
+    assert body["busy"] is True and "3" in body["message"]
+
+
+def test_a_copy_that_raises_an_os_error_refuses_switch_off_and_does_not_hold_an_update(client_for, home, monkeypatch):
+    import sqlite3
+
+    c = client_for(FakeService(None))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    _local_copy(home, ["queued"])
+
+    def denied(*a, **k):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(sqlite3, "connect", denied)
     assert c.post("/offline/deactivate", headers=KEY).status_code == 409
+    assert offline_state.active_appid() == "bark-01"
+    assert c.get("/busy").json()["busy"] is False
+
+
+def test_an_unreadable_copy_does_not_hold_an_update(client_for, home):
+    c = client_for(FakeService(None))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    data = home / "offline" / "bark-01" / "data"
+    data.mkdir()
+    (data / "offline.sqlite").write_bytes(b"not a database at all" * 100)
+    assert c.get("/busy").json()["busy"] is False
+
+
+def test_a_silent_service_and_an_unreadable_copy_are_not_switched_off(client_for, home):
+    svc = FakeService(None)
+    c = client_for(svc)
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    data = home / "offline" / "bark-01" / "data"
+    data.mkdir()
+    (data / "offline.sqlite").write_bytes(b"not a database at all" * 100)
+    assert c.post("/offline/deactivate", headers=KEY).status_code == 409
+    assert offline_state.active_appid() == "bark-01"
 
 
 def test_switching_off_stops_the_service_and_removes_the_shop(client_for, home):

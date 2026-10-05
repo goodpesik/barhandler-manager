@@ -88,11 +88,18 @@ async def activate(request: Request) -> dict:
 @router.post("/deactivate")
 async def deactivate(request: Request) -> dict:
     svc = _service(request)
-    if not offline_state.active_appid():
+    appid = offline_state.active_appid()
+    if not appid:
         return {"ok": True}
     # What the service says right now, not what it said a minute ago.
     health = await svc.refresh() if svc is not None else None
     queued = health.get("queued") if health else None
+    if not isinstance(queued, int):
+        # Not running (it never starts without its secrets) or not answering:
+        # the queue is read from the local copy, so switching off does not
+        # depend on the service it would switch off.
+        queued = await asyncio.to_thread(offline_state.queued_on_disk, appid)
+        log.info("offline switch-off: the service did not answer, queue on disk: %s", queued)
     try:
         offline_state.check_can_deactivate(queued if isinstance(queued, int) else None)
     except offline_state.ActivationError as e:

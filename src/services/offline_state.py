@@ -26,6 +26,7 @@ import os
 import re
 import secrets as pysecrets
 import shutil
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -138,6 +139,43 @@ def activate(payload: dict) -> dict:
     return {k: config[k] for k in ("product", "appid", "deviceId", "shopName", "tokenExpiresAt", "activatedAt")}
 
 
+def queued_on_disk(appid: str, timeout: float = 5, quiet: bool = False) -> Optional[int]:
+    """Operations still waiting for the server, read from the local copy itself.
+
+    For when the service is not running and cannot be asked — without its
+    secrets it never starts, and switching off must not depend on it. The
+    queue's status column is plain text (only the payload is sealed), so no
+    key is needed. None when the copy is there but cannot be read.
+
+    `quiet` leaves out the routine lines for callers that poll (the update
+    guard asks every few seconds); a copy that cannot be read is always logged.
+    """
+    path = shop_folder(appid) / "data" / "offline.sqlite"
+    try:
+        if not path.exists():
+            if not quiet:
+                log.info("offline: shop %s has no local copy, nothing queued", appid)
+            return 0
+        con = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=timeout)
+        try:
+            (n,) = con.execute("SELECT count(*) FROM outbox WHERE status = 'queued'").fetchone()
+        finally:
+            con.close()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            if not quiet:
+                log.info("offline: shop %s local copy has no queue yet", appid)
+            return 0
+        log.warning("offline: queue of shop %s unreadable on disk: %s", appid, e)
+        return None
+    except (sqlite3.DatabaseError, OSError, ValueError) as e:
+        log.warning("offline: queue of shop %s unreadable on disk: %s", appid, e)
+        return None
+    if not quiet or n:
+        log.info("offline: shop %s queue read from disk: %s waiting", appid, n)
+    return int(n)
+
+
 def check_can_deactivate(queued: Optional[int]) -> None:
     """Refuse while operations made offline have not reached the server."""
     if queued:
@@ -147,8 +185,7 @@ def check_can_deactivate(queued: Optional[int]) -> None:
         )
     if queued is None:
         raise ActivationError(
-            "Не вдалося перевірити чергу офлайн-операцій. "
-            "Вимкнення можливе, коли офлайн-сервіс працює.",
+            "Не вдалося перевірити чергу офлайн-операцій. Спробуйте ще раз.",
         )
 
 
