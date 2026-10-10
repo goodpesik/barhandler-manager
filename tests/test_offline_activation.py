@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import stat
 import subprocess
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch
 
@@ -36,10 +38,15 @@ PAYLOAD = {
 class FakeService:
     """The supervisor, reduced to what the routes and the busy guard use."""
 
-    def __init__(self, queued):
+    def __init__(self, queued, running=True, sync_answer=None):
         self.queued = queued
         self.stopped = 0
-        self.state = offline_service.OfflineServiceState(running=True, extra={"queued": queued})
+        self.synced = 0
+        self.sync_answer = sync_answer
+        self.state = offline_service.OfflineServiceState(
+            running=running,
+            extra={"queued": queued, "dataAsOf": "2026-10-10T00:05:00.000Z"},
+        )
 
     async def run_forever(self):
         return None
@@ -52,6 +59,11 @@ class FakeService:
 
     async def refresh(self):
         return None if self.queued is None else {"queued": self.queued}
+
+    async def sync_now(self):
+        """PET-1057 — what the service answered, or None when it could not."""
+        self.synced += 1
+        return self.sync_answer
 
 
 @pytest.fixture
@@ -570,3 +582,112 @@ def test_an_activation_sent_twice_at_once_does_not_fail(home):
         t.join()
     assert errors == []
     assert offline_state.active_appid() == "bark-01"
+
+
+# PET-1057 — «Синхронізувати» from the shop's settings card.
+
+
+def test_sync_now_runs_the_sync_and_answers_with_the_state_after_it(client_for):
+    svc = FakeService(0, sync_answer={"ran": "push", "queued": 0, "dataAsOf": "old"})
+    c = client_for(svc)
+    r = c.post("/offline/sync", headers=KEY)
+    assert svc.synced == 1
+    assert r.status_code == 200
+    # The «as of» is the one the state holds after the sync, not the one the
+    # service answered with before it was refreshed.
+    assert r.json() == {
+        "ran": "push",
+        "failed": False,
+        "needsPairing": False,
+        "dataAsOf": "2026-10-10T00:05:00.000Z",
+        "queued": 0,
+    }
+
+
+def test_sync_now_says_nothing_was_due_without_pretending_it_failed(client_for):
+    svc = FakeService(0, sync_answer={"ran": None, "failed": False, "queued": 0})
+    c = client_for(svc)
+    r = c.post("/offline/sync", headers=KEY)
+    assert [r.status_code, r.json()["ran"], r.json()["failed"]] == [200, None, False]
+
+
+def test_sync_now_passes_on_a_device_refused_during_the_sync(client_for):
+    """PET-1057 — the token was revoked a moment ago: syncing cannot help."""
+    svc = FakeService(2, sync_answer={"ran": None, "failed": False, "needsPairing": True})
+    c = client_for(svc)
+    r = c.post("/offline/sync", headers=KEY)
+    assert [r.status_code, r.json()["failed"], r.json()["needsPairing"]] == [200, False, True]
+
+
+def test_sync_now_does_not_let_a_failed_try_read_as_nothing_to_send(client_for):
+    """PET-1057 — the service does nothing for two very different reasons."""
+    svc = FakeService(3, sync_answer={"ran": None, "failed": True})
+    c = client_for(svc)
+    r = c.post("/offline/sync", headers=KEY)
+    assert [r.status_code, r.json()["ran"], r.json()["failed"]] == [200, None, True]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        # Reading the answer ran out of time: a bare TimeoutError.
+        TimeoutError("timed out"),
+        # Connecting ran out of time: urllib wraps it.
+        urllib.error.URLError(socket.timeout("timed out")),
+    ],
+    ids=["reading", "connecting"],
+)
+def test_sync_now_calls_a_long_sync_running_rather_than_failed(monkeypatch, error):
+    """A sync that outlives our patience is not a sync that went wrong."""
+
+    def slow(req, timeout=None):
+        raise error
+
+    monkeypatch.setattr(offline_service.urllib.request, "urlopen", slow)
+    assert offline_service._post_sync(9898) == {"ran": "running", "failed": False}
+
+
+def test_sync_now_says_nothing_when_the_service_refused_the_call(monkeypatch):
+    """A 409/503 from the service is a real answer «no», not «still going»."""
+
+    def refused(req, timeout=None):
+        raise urllib.error.HTTPError("http://127.0.0.1:9898/api/sync", 409, "conflict", {}, None)
+
+    monkeypatch.setattr(offline_service.urllib.request, "urlopen", refused)
+    assert offline_service._post_sync(9898) is None
+
+
+def test_sync_now_says_nothing_when_the_service_really_refused(monkeypatch):
+    def refused(req, timeout=None):
+        raise ConnectionRefusedError("refused")
+
+    monkeypatch.setattr(offline_service.urllib.request, "urlopen", refused)
+    assert offline_service._post_sync(9898) is None
+
+
+def test_sync_now_is_refused_while_the_service_is_not_running(client_for):
+    svc = FakeService(0, running=False, sync_answer={"ran": "push"})
+    c = client_for(svc)
+    r = c.post("/offline/sync", headers=KEY)
+    assert [r.status_code, r.json()["detail"]["code"]] == [409, "offline_not_running"]
+    assert svc.synced == 0
+
+
+def test_sync_now_says_so_when_the_service_could_not_be_asked(client_for):
+    svc = FakeService(0, sync_answer=None)
+    c = client_for(svc)
+    r = c.post("/offline/sync", headers=KEY)
+    assert [r.status_code, r.json()["detail"]["code"]] == [502, "offline_sync_failed"]
+
+
+def test_sync_now_is_refused_by_a_build_without_the_runtime(client_for):
+    c = client_for(None)
+    r = c.post("/offline/sync", headers=KEY)
+    assert [r.status_code, r.json()["detail"]["code"]] == [409, "offline_unavailable"]
+
+
+def test_sync_now_needs_the_managers_key(client_for):
+    svc = FakeService(0, sync_answer={"ran": "push"})
+    c = client_for(svc)
+    assert c.post("/offline/sync").status_code in (401, 403)
+    assert svc.synced == 0

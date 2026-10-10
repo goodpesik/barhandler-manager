@@ -150,6 +150,41 @@ def _fetch_health(port: int, timeout: float = 2.0) -> Optional[dict]:
     return body if isinstance(body, dict) else None
 
 
+#: PET-1057 — the service answers only once its sync is over, and a long
+#: queue takes longer than anyone wants to hold a browser request open.
+SYNC_NOW_TIMEOUT = 25.0
+
+
+def _timed_out(e: BaseException) -> bool:
+    """Whether this is «it is taking too long», not «it went wrong»."""
+    return isinstance(e, TimeoutError) or isinstance(getattr(e, "reason", None), TimeoutError)
+
+
+def _post_sync(port: int, timeout: float = SYNC_NOW_TIMEOUT) -> Optional[dict]:
+    """
+    PET-1057 — ask the offline service to sync NOW (POST /api/sync).
+
+    The answer when it gave one, None when it could not be asked at all.
+    Running out of time is NOT «it could not be asked»: the sync carries on
+    without us, so that answers «running» and the card looks again in a
+    moment. Saying it failed would send a shop chasing a sync that is fine.
+
+    No Origin and no Sec-Fetch-Site are sent, which is how the service tells
+    its own callers from a web page.
+    """
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/api/sync", data=b"", method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:  # noqa: BLE001 — refused, timeout, 4xx, not JSON
+        if _timed_out(e):
+            log.info("offline sync now is still running after %.0fs; left to finish on its own", timeout)
+            return {"ran": "running", "failed": False}
+        log.warning("offline sync now failed: %s", e)
+        return None
+    return body if isinstance(body, dict) else None
+
+
 @dataclass
 class OfflineServiceState:
     """What the dashboard and the menu (PET-972) show."""
@@ -175,6 +210,7 @@ class OfflineService:
         port: int = DEFAULT_PORT,
         log_path: Optional[Path] = None,
         fetch_health: Callable[[int], Optional[dict]] = _fetch_health,
+        post_sync: Callable[[int], Optional[dict]] = _post_sync,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._load_config = load_config
@@ -184,6 +220,7 @@ class OfflineService:
         self._port = port
         self._log_path = log_path or (APP_DIR / "offline" / "service.log")
         self._fetch = fetch_health
+        self._post_sync = post_sync
         self._sleep = sleep
         self._proc: Optional[asyncio.subprocess.Process] = None
         # PET-972 — the config the running service was started with: a new
@@ -256,6 +293,21 @@ class OfflineService:
             return None
         self._remember(health)
         return health
+
+    async def sync_now(self) -> Optional[dict]:
+        """
+        PET-1057 — run the offline service's sync now, instead of waiting for
+        its own schedule. The answer it gave, or None when it could not be
+        asked. The state is refreshed afterwards so the card shows the new
+        «as of» and queue length without a second round trip.
+        """
+        if not self.state.running:
+            return None
+        ran = await asyncio.to_thread(self._post_sync, self._port)
+        if ran is None:
+            return None
+        await self.refresh()
+        return ran
 
     # ---- internals ---------------------------------------------------
 

@@ -45,6 +45,65 @@ async def status(request: Request) -> dict:
     return result
 
 
+@router.post("/sync")
+async def sync_now(request: Request) -> dict:
+    """
+    PET-1057 — «Синхронізувати» in Petshandler: send what the till did
+    offline now, instead of waiting for the service's own schedule.
+
+    Answers with what the sync did and the state after it, so the card can
+    show the new «as of» and how much is still queued.
+    """
+    svc = _service(request)
+    if svc is None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "offline_unavailable",
+                "message": "Ця версія Девайс менеджера не підтримує офлайн-режим. Оновіть менеджер.",
+            },
+        )
+    if not svc.state.running:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "offline_not_running",
+                "message": "Офлайн-сервіс не запущено на цьому комп'ютері.",
+            },
+        )
+    ran = await svc.sync_now()
+    if ran is None:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "offline_sync_failed",
+                "message": "Не вдалося синхронізувати. Спробуйте ще раз.",
+            },
+        )
+    st = svc.state
+    log.info(
+        "offline sync now: %s%s, %s still queued",
+        ran.get("ran"),
+        " (it did not go through)"
+        if ran.get("failed")
+        else " (the server does not accept this device)"
+        if ran.get("needsPairing")
+        else "",
+        st.extra.get("queued"),
+    )
+    return {
+        "ran": ran.get("ran"),
+        # PET-1057 — «it did nothing», «it did not go through» and «this
+        # device is not accepted» must not reach the shop as one answer.
+        "failed": bool(ran.get("failed")),
+        # It may have become so during this very sync, after the check that
+        # let the request in.
+        "needsPairing": bool(ran.get("needsPairing") or st.extra.get("needsPairing")),
+        "dataAsOf": st.extra.get("dataAsOf", ran.get("dataAsOf")),
+        "queued": st.extra.get("queued", ran.get("queued")),
+    }
+
+
 @router.post("/activate")
 async def activate(request: Request) -> dict:
     if _service(request) is None:
