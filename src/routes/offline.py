@@ -40,6 +40,9 @@ async def status(request: Request) -> dict:
             "version": st.version,
             "restarts": st.restarts,
             "lastError": st.last_error,
+            # PET-1055 — where the offline till is served, so neither the
+            # dashboard nor Petshandler has to know the number by heart.
+            "port": svc.port,
             **st.extra,
         }
     return result

@@ -38,8 +38,9 @@ PAYLOAD = {
 class FakeService:
     """The supervisor, reduced to what the routes and the busy guard use."""
 
-    def __init__(self, queued, running=True, sync_answer=None):
+    def __init__(self, queued, running=True, sync_answer=None, port=9898):
         self.queued = queued
+        self.port = port
         self.stopped = 0
         self.synced = 0
         self.sync_answer = sync_answer
@@ -183,6 +184,19 @@ def test_a_build_without_the_runtime_says_so(client_for):
     r = c.post("/offline/activate", json=PAYLOAD, headers=KEY)
     assert r.status_code == 409
     assert c.get("/offline/status", headers=KEY).json()["available"] is False
+
+
+def test_status_says_where_the_offline_till_is_served(client_for):
+    """PET-1055 — so the dashboard's link does not know the port by heart."""
+    c = client_for(FakeService(0, port=9899))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    assert c.get("/offline/status", headers=KEY).json()["service"]["port"] == 9899
+
+
+def test_the_real_service_says_the_port_it_was_given():
+    """The fake above proves the route; this proves there is anything to take."""
+    svc = offline_service.OfflineService(lambda: None, argv=["node", "main.js"], port=9123)
+    assert svc.port == 9123
 
 
 def test_status_shows_the_shop_and_the_queue_but_no_secret(client_for):

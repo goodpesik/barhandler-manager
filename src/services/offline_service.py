@@ -286,6 +286,11 @@ class OfflineService:
         self._stopped_on_purpose = True
         await self._stop_process()
 
+    @property
+    def port(self) -> int:
+        """Where the offline till is served on this machine (PET-1055)."""
+        return self._port
+
     async def refresh(self) -> Optional[dict]:
         """Ask /health now; the answer, when it is our service, or None."""
         health = await asyncio.to_thread(self._fetch, self._port)

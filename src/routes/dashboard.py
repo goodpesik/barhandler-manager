@@ -390,6 +390,9 @@ _HTML_TEMPLATE = r"""<!doctype html>
       <p id="offline-hint" class="modal-desc" data-i18n="offline_hint" style="margin-top:8px;">Увімкнення офлайн-режиму: Petshandler → Налаштування → Інтеграції → Пристрої → «Увімкнути офлайн-режим».</p>
       <div class="modal-actions">
         <button class="btn btn-default" data-i18n="btn_close" onclick="closeOfflineModal()">Закрити</button>
+        <!-- PET-1055 — the till itself is one click away: without this the
+             shop had to know http://127.0.0.1:9898 by heart. -->
+        <a id="offline-open" class="btn btn-default" target="_blank" rel="noopener" data-i18n="offline_open" href="#" style="display:none;">Відкрити офлайн-касу</a>
         <button id="offline-disable" class="btn btn-default" data-i18n="offline_disable" onclick="disableOffline()" style="display:none;">Вимкнути</button>
       </div>
     </div>
@@ -522,6 +525,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       offline_data_label: "Дані станом на",
       offline_queue_label: "Не синхронізовано операцій",
       offline_hint: "Увімкнення офлайн-режиму: Petshandler → Налаштування → Інтеграції → Пристрої → «Увімкнути офлайн-режим».",
+      offline_open: "Відкрити офлайн-касу",
       offline_disable: "Вимкнути",
       offline_off: "вимкнено",
       offline_on: "увімкнено, сервіс працює",
@@ -670,6 +674,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       offline_data_label: "Data as of",
       offline_queue_label: "Operations not synchronised",
       offline_hint: "To switch offline mode on: Petshandler → Settings → Integrations → Devices → «Enable offline mode».",
+      offline_open: "Open the offline till",
       offline_disable: "Switch off",
       offline_off: "off",
       offline_on: "on, the service is running",
@@ -1487,6 +1492,10 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
   async function openOfflineModal() {
     $("offline-modal").style.display = "flex";
+    /* PET-1055 — hidden before anything is asked. A link left over from the
+       time the window was open last would point at a till we have no word
+       about now, and the failure below never touches it. */
+    $("offline-open").style.display = "none";
     try {
       const st = await api("GET", "/offline/status", true);
       const svc = st.service || {};
@@ -1506,6 +1515,12 @@ _HTML_TEMPLATE = r"""<!doctype html>
       $("offline-hint").style.display = on ? "none" : "";
       $("offline-disable").style.display = on ? "" : "none";
       $("offline-disable").disabled = false;
+      /* PET-1055 — only while the service answers: a link to a port nothing
+         is listening on would open a browser error, which reads as «the
+         till is broken» rather than «it is not running». */
+      const open = $("offline-open");
+      open.href = "http://127.0.0.1:" + (svc.port || 9898) + "/";
+      open.style.display = on && svc.running ? "" : "none";
     } catch (e) {
       $("offline-status").innerHTML = "<span class='err-text'>" + escHtml(t("error_prefix", { err: e.message })) + "</span>";
     }
