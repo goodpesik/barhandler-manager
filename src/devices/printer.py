@@ -487,7 +487,7 @@ class PrinterDevice:
             with suppress(Exception):
                 reset()
 
-    def _fail_queued_jobs(self) -> None:
+    def _fail_queued_jobs(self, reason: str = "the printer is being reconfigured") -> None:
         """Розбудити всіх, хто чекає на джоби, які вже не виконаються.
 
         Знайдено ревʼю: скасований воркер лишав черзі невиконані елементи, а
@@ -502,8 +502,7 @@ class PrinterDevice:
             # PET-1087 — it will never print, and somebody is waiting for it:
             # that belongs in the journal as much as a failure does.
             work_journal.record_printer(
-                self.name, action, work_journal.STATUS_CANCELLED,
-                "the printer is being reconfigured",
+                self.name, action, work_journal.STATUS_CANCELLED, reason,
             )
             if not done.done():
                 done.set_exception(
@@ -1031,7 +1030,10 @@ class PrinterDevice:
                 # шлях лишився. З BH-164 ціна виросла: запит, що висить, тримає
                 # менеджер «зайнятим», тобто оновитись стало б неможливо аж до
                 # перезапуску — гірше за ваду, яку BH-164 і лікує.
-                self._fail_queued_jobs()
+                # Their own reason: these jobs did not print because the
+                # connection died, not because anybody reconfigured a printer
+                # (found by the second review round).
+                self._fail_queued_jobs("the printer's connection was lost")
                 return  # worker exits; registry.get_device() rebuilds on next print
             except asyncio.CancelledError:
                 # Знайдено ревʼю. Воркер скасовують, коли пристрій викидають

@@ -49,7 +49,7 @@ def create_app(config: dict) -> FastAPI:
     # the app leaves here. Both live beside the registries, for the same
     # reason: they belong to the machine, not to the browser that drives it.
     journal = WorkJournal(
-        path=Path(config["server"].get("journal_path", APP_DIR / "work-journal.json")),
+        path=Path(config["server"].get("journal_path", APP_DIR / "work-journal.jsonl")),
     )
     station_settings = StationSettings(
         path=Path(config["server"].get("station_settings_path", APP_DIR / "app-settings.json")),

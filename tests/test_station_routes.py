@@ -218,6 +218,30 @@ def test_a_save_that_could_not_be_written_changes_nothing(client: TestClient, au
     assert read["items"] == {"a": "1"}, "what is served must be what the station holds"
 
 
+def test_the_save_counter_survives_a_restart(client: TestClient, auth_headers: dict, config: dict) -> None:
+    """Second review round, reproduced: the counter started again from the
+    NUMBER OF SHOPS after a reload, while the stored orders kept growing — so
+    the next shop saved got the lowest order of all and was evicted one save
+    later, right after being told «saved»."""
+    from src.services.station_settings import MAX_SHOPS
+    from src.server import create_app
+
+    # Fill the file and rotate it a few times, so the stored orders run well
+    # above the number of shops.
+    for n in range(MAX_SHOPS * 3):
+        client.post(
+            "/station/settings", headers=auth_headers, json={"appid": f"shop-{n}", "items": {"a": "1"}},
+        )
+
+    with TestClient(create_app(config)) as fresh:
+        headers = {"X-Api-Key": DEFAULT_API_KEY}
+        fresh.post("/station/settings", headers=headers, json={"appid": "shop-new", "items": {"a": "2"}})
+        # One more save must not be the one that forgets the shop just saved.
+        fresh.post("/station/settings", headers=headers, json={"appid": "shop-other", "items": {"a": "3"}})
+        read = fresh.get("/station/settings?appid=shop-new", headers=headers)
+        assert read.status_code == 200, "the shop saved a moment ago is still there"
+
+
 def test_a_shop_that_is_not_a_string_is_refused(client: TestClient, auth_headers: dict) -> None:
     r = client.post("/station/settings", headers=auth_headers, json={"appid": ["a"], "items": {"a": "1"}})
     assert r.status_code == 400

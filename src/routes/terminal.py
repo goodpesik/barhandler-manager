@@ -129,13 +129,21 @@ def _journal_operation(
     very confusion this journal exists to end.
     """
     if result is not None:
+        # A `declined` from an adapter is not always the card saying no: ours
+        # fold a timeout and an unexpected answer into the same word (ssi:
+        # «everything else (decline / error / timeout) → declined»). So the
+        # journal asks whether the TERMINAL SPOKE — a response code or the
+        # protocol's own verbatim result means it did, and then the refusal is
+        # the card's. Without either, nobody refused anything and the row says
+        # `failed` (found by the second review round).
+        spoke = bool(result.response_code or result.raw_transaction_result)
         status = (
             work_journal.STATUS_OK
             if result.status == "ok"
             else work_journal.STATUS_CANCELLED
             if result.status == "cancelled"
             else work_journal.STATUS_DECLINED
-            if result.status == "declined"
+            if result.status == "declined" and spoke
             else work_journal.STATUS_FAILED
         )
         # The bank's code is what anybody sorting this out with the bank will
@@ -175,16 +183,21 @@ class _Operation:
         self.recorded = True
 
     def unfinished(self) -> None:
-        """Nothing answered and nothing was recorded — say exactly that. «The
-        request ended without an answer» is what a person needs to see: the
-        money may have moved, and the bank's own records settle it."""
+        """Nothing answered and nothing was recorded — say exactly that.
+
+        The status is `unknown`, not `failed`: the money may well have moved,
+        and «failed» would be a guess that is wrong half the time (second
+        review round). The bank's own records settle it, and the row tells the
+        shop where to look.
+        """
         if self.recorded:
             return
-        _journal_operation(
+        work_journal.record_terminal(
             self.terminal_id,
             self.action,
-            self.amount_kopecks,
-            error="the request ended without an answer from the terminal",
+            work_journal.STATUS_UNKNOWN,
+            amount_kopecks=self.amount_kopecks,
+            detail="the request ended without an answer from the terminal",
         )
 
 

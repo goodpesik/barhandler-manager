@@ -550,29 +550,6 @@ def test_a_refund_is_its_own_operation_in_the_journal(
     assert [(r["action"], r["amount"]) for r in rows] == [("refund", 500)]
 
 
-def test_a_card_that_said_no_is_declined_not_a_broken_terminal(
-    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
-) -> None:
-    """«The operator tried three times and the card refused» is exactly what
-    somebody comes to the journal for — and it must not read as a fault of the
-    terminal, or the shop goes looking for one (found by review)."""
-    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
-    declined = AcquirerResult(status="declined", error_code="E05", error_message="Відмова")
-    with patch(
-        "src.services.terminals.ssi.SSITerminalAdapter.charge",
-        new=AsyncMock(return_value=declined),
-    ):
-        client_with_terminal.post(
-            "/terminal/charge", headers=auth_headers, json={"amount_kopecks": 100},
-        )
-
-    rows = _journal_rows(client_with_terminal)
-    assert len(rows) == 1
-    assert rows[0]["status"] == "declined"
-    # The bank's own code stays beside the words: it is what the bank asks for.
-    assert rows[0]["detail"] == "Відмова · E05"
-
-
 def test_an_operator_who_stopped_the_payment_is_not_a_failure(
     client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
 ) -> None:
@@ -608,7 +585,9 @@ def test_a_request_that_ended_without_an_answer_is_still_a_row(
     rows = _journal_rows(client_with_terminal)
     assert len(rows) == 1
     assert rows[0]["amount"] == 7700
-    assert rows[0]["status"] == "failed"
+    # `unknown`, not `failed`: the money may well have moved, and «failed»
+    # would be a guess that is wrong half the time (second review round).
+    assert rows[0]["status"] == "unknown"
     assert "without an answer" in (rows[0]["detail"] or "")
 
 
@@ -645,3 +624,49 @@ def test_a_terminal_that_did_not_answer_is_in_the_journal_too(
     assert rows[0]["status"] == "failed"
     assert rows[0]["amount"] == 100
     assert "не відповідає" in (rows[0]["detail"] or "")
+
+
+def test_a_timeout_the_adapter_called_declined_is_not_blamed_on_the_card(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    """Second review round: our adapters fold a timeout and an unexpected
+    answer into `declined` («everything else → declined», says ssi). Telling a
+    shop the card refused when the terminal timed out is the same confusion
+    upside down — so the journal asks whether the terminal spoke at all."""
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    silent = AcquirerResult(status="declined", error_message="timeout waiting for the terminal")
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.charge",
+        new=AsyncMock(return_value=silent),
+    ):
+        client_with_terminal.post(
+            "/terminal/charge", headers=auth_headers, json={"amount_kopecks": 100},
+        )
+    assert _journal_rows(client_with_terminal)[0]["status"] == "failed"
+
+
+def test_a_card_refusal_the_terminal_spelled_out_stays_declined(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    refused = AcquirerResult(
+        status="declined",
+        error_code="E05",
+        error_message="Відмова",
+        raw_transaction_result="DECLINED",
+        response_code="05",
+    )
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.charge",
+        new=AsyncMock(return_value=refused),
+    ):
+        client_with_terminal.post(
+            "/terminal/charge", headers=auth_headers, json={"amount_kopecks": 100},
+        )
+    row = _journal_rows(client_with_terminal)[0]
+    # «The operator tried three times and the card refused» is exactly what
+    # somebody comes to the journal for — and it must not read as a fault of
+    # the terminal, or the shop goes looking for one.
+    assert row["status"] == "declined"
+    # The bank's own code stays beside the words: it is what the bank asks for.
+    assert row["detail"] == "Відмова · E05"

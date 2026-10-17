@@ -55,6 +55,10 @@ DEFAULT_PATH = Path("work-journal.jsonl")
 #: and the rows go to the server every hour, so this is days of slack.
 DEFAULT_LIMIT = 3000
 
+#: The highest number the shop's server will take (it refuses anything above
+#: this, so a row numbered past it could never be carried).
+MAX_SEQ = 10**15
+
 #: Which device the row is about.
 KIND_PRINTER = "printer"
 KIND_TERMINAL = "terminal"
@@ -69,6 +73,9 @@ STATUS_OK = "ok"
 STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
 STATUS_DECLINED = "declined"
+#: The request ended and nobody said how. The money may have moved — saying
+#: «failed» about that would be a guess, and a wrong one half the time.
+STATUS_UNKNOWN = "unknown"
 
 #: What a terminal was asked to do. The receipt side has no fixed list: the
 #: action of a print is the route that printed it (`receipt`, `label`, …).
@@ -108,41 +115,78 @@ class WorkJournal:
     def load(self) -> None:
         rows: list[dict] = []
         unreadable = 0
-        existed = self.path.exists()
-        if existed:
+        torn = False
+        if self.path.exists():
             try:
-                with self.path.open(encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            row = json.loads(line)
-                        except Exception:  # noqa: BLE001 — one bad line, not a crash
-                            unreadable += 1
-                            continue
-                        if isinstance(row, dict) and isinstance(row.get("seq"), int):
-                            rows.append(row)
-                        else:
-                            unreadable += 1
+                raw = self.path.read_text(encoding="utf-8", errors="replace")
             except OSError as exc:
                 logger.warning("work-journal could not be read: %s", exc)
+                raw = ""
+            # A crash mid-append leaves a last line with no newline. Appending
+            # after it would glue the next row onto the broken one and both
+            # would be unreadable — the row would be served from memory and
+            # then vanish, and its number could be handed out again (found by
+            # the second review round).
+            torn = bool(raw) and not raw.endswith("\n")
+            for line in raw.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:  # noqa: BLE001 — one bad line, not a crash
+                    unreadable += 1
+                    continue
+                if self._is_row(row):
+                    rows.append(row)
+                else:
+                    unreadable += 1
         rows.sort(key=lambda e: e["seq"])
         highest = rows[-1]["seq"] if rows else 0
+        if highest > MAX_SEQ:
+            # A damaged line can carry any number. One above the server's own
+            # ceiling would make every row from here on unacceptable to it.
+            logger.warning("work-journal: the number %s is not credible and is ignored", highest)
+            highest = 0
         with self._lock:
             self._entries = rows[-self.limit :]
             self._lines = len(rows)
-            # The floor applies when there is nothing to continue from: a fresh
-            # install, a deleted file, a file we could not read. Continuing from
-            # 0 there is what would hand the server numbers it already has.
-            self._seq = highest if highest else _seq_floor()
+            # NEVER BELOW THE FLOOR. A file restored from an old backup has a
+            # highest number the server has long passed, and continuing from
+            # it would make every row look like a duplicate and vanish in
+            # silence (found by the second review round). The floor grows with
+            # the clock, so it stands above any earlier life of this journal.
+            self._seq = max(highest, _seq_floor())
+        if torn:
+            try:
+                with self.path.open("a", encoding="utf-8") as f:
+                    f.write("\n")
+                logger.warning("work-journal: the last line was cut short; a new one starts after it")
+            except OSError as exc:
+                logger.warning("work-journal: the cut line could not be closed off: %s", exc)
         if unreadable:
             logger.warning("work-journal: %s line(s) could not be read and are skipped", unreadable)
         logger.info(
-            "work-journal: %s row(s), the numbering continues from %s%s",
+            "work-journal: %s row(s), the numbering continues from %s",
             len(rows),
             self._seq,
-            "" if highest else " (a floor taken from the clock: nothing to continue from)",
+        )
+
+    @staticmethod
+    def _is_row(row: object) -> bool:
+        """A row of this journal, and not something else that parses as JSON.
+
+        The file of an older version was one JSON object for the whole
+        journal; it parses, it has an int `seq`, and it would have been served
+        to the server as a row with no device and no action (found by the
+        second review round).
+        """
+        return (
+            isinstance(row, dict)
+            and isinstance(row.get("seq"), int)
+            and bool(row.get("deviceId"))
+            and bool(row.get("action"))
+            and bool(row.get("status"))
         )
 
     def _append_locked(self, entry: dict) -> None:
@@ -240,6 +284,18 @@ class WorkJournal:
         after = max(0, int(after_seq))
         take = max(1, min(int(limit), 2000))
         with self._lock:
+            # WHAT THE CALLER ALREADY HAS, WE DO NOT HAND OUT AGAIN. The cursor
+            # comes from the shop's server, which never lowers it: if our own
+            # numbering sits below it — a restored backup, a clock that was
+            # wrong when the floor was taken — every new row would be refused
+            # as a duplicate and vanish in silence. Lifting the sequence here
+            # is the one place that knows both numbers (second review round).
+            if after > self._seq and after <= MAX_SEQ:
+                logger.warning(
+                    "work-journal: the server is at %s and we are at %s — the numbering continues from the server's",
+                    after, self._seq,
+                )
+                self._seq = after
             rows = [dict(e) for e in self._entries if e["seq"] > after][:take]
             return {
                 "entries": rows,

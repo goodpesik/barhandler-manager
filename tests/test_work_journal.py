@@ -54,15 +54,17 @@ def test_rows_are_numbered_from_one_and_read_back_after_the_number(journal: Work
 def test_the_numbering_continues_after_a_restart(tmp_path: Path) -> None:
     path = tmp_path / "work-journal.jsonl"
     first = WorkJournal(path=path)
-    first.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
-    first.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
+    first.load()
+    one = first.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
+    two = first.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
+    assert one is not None and two is not None
 
     second = WorkJournal(path=path)
     second.load()
     row = second.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
 
-    assert row is not None and row["seq"] == 3
-    assert [e["seq"] for e in second.entries()] == [1, 2, 3]
+    assert row is not None and row["seq"] > two["seq"]
+    assert [e["seq"] for e in second.entries()] == [one["seq"], two["seq"], row["seq"]]
 
 
 def test_a_dropped_row_does_not_hand_its_number_to_a_new_one(tmp_path: Path) -> None:
@@ -71,15 +73,19 @@ def test_a_dropped_row_does_not_hand_its_number_to_a_new_one(tmp_path: Path) -> 
     knows and be dropped as a duplicate."""
     path = tmp_path / "work-journal.jsonl"
     first = WorkJournal(path=path, limit=2)
-    for _ in range(5):
+    first.load()
+    rows = [
         first.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
-    assert [e["seq"] for e in first.entries()] == [4, 5]
+        for _ in range(5)
+    ]
+    kept = [e["seq"] for e in first.entries()]
+    assert kept == [rows[3]["seq"], rows[4]["seq"]]
 
     second = WorkJournal(path=path, limit=2)
     second.load()
-    assert second.last_seq == 5
+    assert second.last_seq >= rows[4]["seq"]
     row = second.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
-    assert row is not None and row["seq"] == 6
+    assert row is not None and row["seq"] > rows[4]["seq"]
 
 
 def test_the_file_is_rewritten_once_it_outgrows_the_limit(tmp_path: Path) -> None:
@@ -136,17 +142,94 @@ def test_a_corrupt_journal_also_starts_above_the_old_numbers(tmp_path: Path) -> 
     assert row is not None and row["seq"] > 1_000_000_000
 
 
-def test_a_journal_that_can_be_read_continues_its_own_numbers(tmp_path: Path) -> None:
-    """The other half: a file that IS there must not jump to the clock, or the
-    server's cursor would skip the rows still waiting in it."""
+def test_a_file_restored_from_an_old_backup_does_not_collide_with_the_server(
+    tmp_path: Path,
+) -> None:
+    """The second review round: continuing from the file's own highest number
+    looks right until the file came from a backup. The server has long passed
+    those numbers, so every row until the station catches up would be ignored
+    as a duplicate — in silence. The floor never lets that happen.
+    """
     path = tmp_path / "work-journal.jsonl"
-    first = WorkJournal(path=path)
-    first.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
+    path.write_text(
+        json.dumps(
+            {
+                "seq": 7,
+                "at": "2026-01-01T00:00:00+00:00",
+                "deviceKind": "printer",
+                "deviceId": "p1",
+                "action": "receipt",
+                "status": "ok",
+            },
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    j = WorkJournal(path=path)
+    j.load()
+    row = j.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
+    assert row is not None and row["seq"] > 1_000_000_000
+    # And the row that WAS in the file is still readable from the beginning.
+    assert [e["seq"] for e in j.entries()] == [7, row["seq"]]
 
-    second = WorkJournal(path=path)
-    second.load()
-    row = second.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
-    assert row is not None and row["seq"] == 2
+
+def test_a_cut_short_last_line_does_not_swallow_the_next_row(tmp_path: Path) -> None:
+    """The second review round, reproduced: a crash mid-append leaves a line
+    with no newline. Appending after it glued the next row onto the broken one
+    — the row was served from memory and then vanished on the next start, and
+    its number could be handed out a second time.
+    """
+    path = tmp_path / "work-journal.jsonl"
+    whole = {
+        "seq": 5,
+        "at": "2026-10-17T08:00:00+00:00",
+        "deviceKind": "printer",
+        "deviceId": "p1",
+        "action": "receipt",
+        "status": "ok",
+    }
+    path.write_text(json.dumps(whole) + "\n" + '{"seq": 6, "at": "2026-10', encoding="utf-8")
+
+    j = WorkJournal(path=path)
+    j.load()
+    row = j.record(device_kind="printer", device_id="p1", action="label", status="ok")
+    assert row is not None
+
+    again = WorkJournal(path=path)
+    again.load()
+    assert row["seq"] in [e["seq"] for e in again.entries()], "the new row survived the restart"
+    assert again.last_seq >= row["seq"]
+
+
+def test_the_file_of_an_older_version_is_not_read_as_a_row(tmp_path: Path) -> None:
+    """Also the second round: the previous version kept the whole journal as
+    ONE json object. It parses, it has an int `seq` — and it would have been
+    carried to the server as a row with no device and no action.
+    """
+    path = tmp_path / "work-journal.jsonl"
+    path.write_text(json.dumps({"seq": 57, "entries": [{"seq": 1}]}) + "\n", encoding="utf-8")
+    j = WorkJournal(path=path)
+    j.load()
+    assert j.entries() == []
+    row = j.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
+    assert row is not None and row["seq"] > 1_000_000_000
+
+
+def test_the_servers_cursor_lifts_our_numbering(tmp_path: Path) -> None:
+    """The one place that knows both numbers. If the server is further along
+    than this journal — a restored file, a clock that was wrong when the floor
+    was taken — every new row would be refused as a duplicate. Asking for the
+    rows after the server's cursor lifts ours above it.
+    """
+    j = WorkJournal(path=tmp_path / "work-journal.jsonl")
+    j.load()
+    j.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
+    ahead = j.last_seq + 10_000
+
+    page = j.page(after_seq=ahead, limit=10)
+    assert page["entries"] == []
+    row = j.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
+    assert row is not None and row["seq"] == ahead + 1
 
 
 def test_a_row_that_could_not_be_written_is_not_served_and_its_number_is_burned(

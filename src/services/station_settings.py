@@ -77,8 +77,15 @@ class StationSettings:
             }
             # The order of the file is the order of the saves it remembers.
             for order, blob in enumerate(self._shops.values(), start=1):
-                blob.setdefault("order", order)
-            self._saves = len(self._shops)
+                stored = blob.get("order")
+                if not isinstance(stored, int):
+                    blob["order"] = order
+            # Continued from the HIGHEST order, not from the number of shops:
+            # after a reload the stored orders keep growing, and starting the
+            # counter again at ten made the next save the lowest of them —
+            # evicted one save later, right after answering «saved» (found by
+            # the second review round).
+            self._saves = max((blob.get("order") or 0) for blob in self._shops.values()) if self._shops else 0
         logger.info("app-settings: device settings of %s shop(s)", len(self._shops))
 
     def _save_locked(self) -> None:
