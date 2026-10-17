@@ -40,12 +40,17 @@ def tmp_terminal_registry(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def config(tmp_registry: Path, tmp_terminal_registry: Path) -> dict:
+def config(tmp_registry: Path, tmp_terminal_registry: Path, tmp_path: Path) -> dict:
     return {
         "server": {
             "port": 9999,
             "registry_path": str(tmp_registry),
             "terminal_registry_path": str(tmp_terminal_registry),
+            # PET-1087 — the work journal and the device settings the app keeps
+            # on the station. Per-test paths: the defaults are the install
+            # folder, and a test has no business writing there.
+            "journal_path": str(tmp_path / "work-journal.json"),
+            "station_settings_path": str(tmp_path / "app-settings.json"),
         },
     }
 

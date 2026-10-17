@@ -22,7 +22,7 @@ class _FailingDevice:
     def is_connected(self) -> bool:
         return True
 
-    async def enqueue(self, _job):
+    async def enqueue(self, _job, *, action: str = "print"):
         raise self.exc
 
 

@@ -333,7 +333,7 @@ async def probe_codepage(printer_id: str, request: Request) -> dict:
         esc.cut()
 
     try:
-        await device.enqueue(_job)
+        await device.enqueue(_job, action="codepage-probe")
     except PrinterUnavailable as exc:
         # BH-183 — keep the code, as /print/* does: a plain-string detail
         # left the test print showing a generic failure for paper, cover or
@@ -408,7 +408,7 @@ async def test_print(printer_id: str, request: Request) -> dict:
             esc._raw(blob)
 
         try:
-            await device.enqueue(_tspl_job)
+            await device.enqueue(_tspl_job, action="test-print")
         except PrinterUnavailable as exc:
             raise HTTPException(status_code=503, detail=_printer_detail(exc))
         except Exception as exc:
@@ -463,7 +463,7 @@ async def test_print(printer_id: str, request: Request) -> dict:
         esc.cut()
 
     try:
-        await device.enqueue(_job)
+        await device.enqueue(_job, action="test-print")
     except PrinterUnavailable as exc:
         # BH-183 — keep the code, as /print/* does: a plain-string detail
         # left the test print showing a generic failure for paper, cover or

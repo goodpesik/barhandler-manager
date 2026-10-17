@@ -159,6 +159,11 @@ UNGUARDED_ROUTERS: frozenset[str] = frozenset({
     # PET-972 — offline-mode activation, state and switch-off: settings, not
     # money or printing. The offline queue itself is part of busy_refusal.
     "offline",
+    # PET-1087 — who this station is, what its devices did, and the device
+    # settings kept here: reading state and saving settings. An update that
+    # interrupts a settings save loses a save, not money — and the app saves
+    # again on the next change.
+    "station",
 })
 
 

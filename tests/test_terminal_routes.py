@@ -500,3 +500,92 @@ def test_refund_without_registered_terminal_returns_no_terminal(
     )
     assert response.status_code == 503
     assert response.json()["detail"]["code"] == "no_terminal"
+
+
+# ---------------------------------------------------------------------------
+# PET-1087 — the work journal of the terminal
+# ---------------------------------------------------------------------------
+
+
+def _journal_rows(client: TestClient) -> list[dict]:
+    return client.app.state.work_journal.entries()
+
+
+def test_a_sale_leaves_a_journal_row_with_its_sum(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.charge",
+        new=AsyncMock(return_value=AcquirerResult(status="ok", rrn="1")),
+    ):
+        client_with_terminal.post(
+            "/terminal/charge", headers=auth_headers, json={"amount_kopecks": 24500},
+        )
+
+    rows = _journal_rows(client_with_terminal)
+    assert len(rows) == 1
+    assert rows[0]["deviceKind"] == "terminal"
+    assert rows[0]["deviceId"] == fake_terminal.id
+    assert rows[0]["action"] == "sale"
+    assert rows[0]["status"] == "ok"
+    assert rows[0]["amount"] == 24500
+
+
+def test_a_refund_is_its_own_operation_in_the_journal(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.refund",
+        new=AsyncMock(return_value=AcquirerResult(status="ok", rrn="1")),
+    ):
+        client_with_terminal.post(
+            "/terminal/refund",
+            headers=auth_headers,
+            json={"amount_kopecks": 500, "idempotency_key": "k-1"},
+        )
+
+    rows = _journal_rows(client_with_terminal)
+    assert [(r["action"], r["amount"]) for r in rows] == [("refund", 500)]
+
+
+def test_a_card_that_said_no_is_a_failed_row_not_a_missing_one(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    """«The operator tried three times and the card refused» is exactly what
+    somebody comes to the journal for."""
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    declined = AcquirerResult(status="declined", error_code="E05", error_message="Відмова")
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.charge",
+        new=AsyncMock(return_value=declined),
+    ):
+        client_with_terminal.post(
+            "/terminal/charge", headers=auth_headers, json={"amount_kopecks": 100},
+        )
+
+    rows = _journal_rows(client_with_terminal)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["detail"] == "Відмова"
+
+
+def test_a_terminal_that_did_not_answer_is_in_the_journal_too(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.charge",
+        new=AsyncMock(side_effect=TerminalUnavailable("термінал не відповідає")),
+    ):
+        response = client_with_terminal.post(
+            "/terminal/charge", headers=auth_headers, json={"amount_kopecks": 100},
+        )
+    assert response.status_code == 503
+
+    rows = _journal_rows(client_with_terminal)
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+    assert rows[0]["amount"] == 100
+    assert "не відповідає" in (rows[0]["detail"] or "")

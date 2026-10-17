@@ -28,6 +28,7 @@ from src.models.terminal import (
     TerminalKind,
     TerminalRegistrationRequest,
 )
+from src.services import work_journal
 from src.services.terminals.base import TerminalUnavailable
 
 
@@ -107,6 +108,41 @@ def _surface_terminal_error(exc: TerminalUnavailable) -> HTTPException:
 # ---------------------------------------------------------------------------
 # Discovery + registration
 # ---------------------------------------------------------------------------
+
+
+
+def _journal_operation(
+    terminal_id: str,
+    action: str,
+    amount_kopecks: int,
+    *,
+    result=None,
+    error: Optional[str] = None,
+) -> None:
+    """PET-1087 — one card operation, as the shop will read it: the sum, and
+    whether the money moved. Written after the terminal has answered, and the
+    journal keeps its own failures to itself — a row is not worth a payment.
+
+    A refusal by the terminal is NOT a failure of the device: `declined` means
+    the card said no. Both go in, by their own status, because «the operator
+    tried four times and the card refused» is exactly what somebody will come
+    looking for.
+    """
+    if result is not None:
+        status = (
+            work_journal.STATUS_OK
+            if result.status == "ok"
+            else work_journal.STATUS_CANCELLED
+            if result.status == "cancelled"
+            else work_journal.STATUS_FAILED
+        )
+        detail = result.error_message or result.error_code or (None if result.status == "ok" else result.status)
+    else:
+        status = work_journal.STATUS_FAILED
+        detail = error
+    work_journal.record_terminal(
+        terminal_id, action, status, amount_kopecks=amount_kopecks, detail=detail,
+    )
 
 
 @router.post("/discover")
@@ -320,11 +356,17 @@ async def charge(
         result = await adapter.charge(payload)
     except TerminalUnavailable as exc:
         log.warning("[charge] terminal=%s TerminalUnavailable code=%s msg=%s", used_id, getattr(exc, "code", None), exc)
+        _journal_operation(
+            used_id, work_journal.ACTION_SALE, payload.amount_kopecks, error=str(exc) or getattr(exc, "code", None),
+        )
         raise _surface_terminal_error(exc)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 — surface root cause instead of bare 500
         log.exception("[charge] terminal=%s unhandled error: %s", used_id, exc)
+        _journal_operation(
+            used_id, work_journal.ACTION_SALE, payload.amount_kopecks, error=f"{type(exc).__name__}: {exc}",
+        )
         raise HTTPException(
             status_code=500,
             detail={
@@ -333,6 +375,7 @@ async def charge(
             },
         )
     log.info("[charge] terminal=%s result=%s", used_id, result.model_dump_json())
+    _journal_operation(used_id, work_journal.ACTION_SALE, payload.amount_kopecks, result=result)
     return {"terminal_id": used_id, "result": result.model_dump()}
 
 
@@ -367,11 +410,17 @@ async def refund(
             "[refund] terminal=%s TerminalUnavailable code=%s msg=%s",
             used_id, getattr(exc, "code", None), exc,
         )
+        _journal_operation(
+            used_id, work_journal.ACTION_REFUND, payload.amount_kopecks, error=str(exc) or getattr(exc, "code", None),
+        )
         raise _surface_terminal_error(exc)
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001 — surface root cause instead of bare 500
         log.exception("[refund] terminal=%s unhandled error: %s", used_id, exc)
+        _journal_operation(
+            used_id, work_journal.ACTION_REFUND, payload.amount_kopecks, error=f"{type(exc).__name__}: {exc}",
+        )
         raise HTTPException(
             status_code=500,
             detail={
@@ -380,6 +429,7 @@ async def refund(
             },
         )
     log.info("[refund] terminal=%s result=%s", used_id, result.model_dump_json())
+    _journal_operation(used_id, work_journal.ACTION_REFUND, payload.amount_kopecks, result=result)
     return {"terminal_id": used_id, "result": result.model_dump()}
 
 

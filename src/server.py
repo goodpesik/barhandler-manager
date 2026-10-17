@@ -19,9 +19,13 @@ from src.constants import DEFAULT_API_KEY
 from src.devices.registry import PrinterRegistry
 from src.devices.terminal_registry import TerminalRegistry
 from src.routes import (
-    dashboard, devices, drawer, fiscal_it, health, offline, print_routes, system, terminal, version,
+    dashboard, devices, drawer, fiscal_it, health, offline, print_routes, station, system, terminal,
+    version,
 )
 from src.services.busy import BusyTracker, guard_critical
+from src.services.station_settings import StationSettings
+from src.services import work_journal as work_journal_service
+from src.services.work_journal import WorkJournal
 from src.services.update_check import UpdateChecker
 from src.version import installed_version
 
@@ -41,6 +45,15 @@ def create_app(config: dict) -> FastAPI:
         config["server"].get("terminal_registry_path", "terminals.json"),
     )
     terminal_registry = TerminalRegistry(path=terminal_registry_path)
+    # PET-1087 — what the devices of this station did, and the device settings
+    # the app leaves here. Both live beside the registries, for the same
+    # reason: they belong to the machine, not to the browser that drives it.
+    journal = WorkJournal(
+        path=Path(config["server"].get("journal_path", APP_DIR / "work-journal.json")),
+    )
+    station_settings = StationSettings(
+        path=Path(config["server"].get("station_settings_path", APP_DIR / "app-settings.json")),
+    )
 
     async def _printer_connect_watcher() -> None:
         """Connect-ONLY watcher — the safe inverse of the old heartbeat. Every
@@ -78,6 +91,13 @@ def create_app(config: dict) -> FastAPI:
         app.state.busy = BusyTracker()
         registry.load()
         terminal_registry.load()
+        app.state.work_journal = journal
+        app.state.station_settings = station_settings
+        journal.load()
+        station_settings.load()
+        # The device layer records through the module singleton, so it does not
+        # have to be handed the journal down every call path.
+        work_journal_service.set_active(journal)
         connect_watcher = asyncio.create_task(
             _printer_connect_watcher(), name="printer-connect",
         )
@@ -167,6 +187,7 @@ def create_app(config: dict) -> FastAPI:
         await update_checker.stop()
         update_task.cancel()
         connect_watcher.cancel()
+        work_journal_service.set_active(None)
         await registry.disconnect_all()
 
     app = FastAPI(title="Handler Device Manager", version="0.5.0", lifespan=lifespan)
@@ -391,5 +412,8 @@ def create_app(config: dict) -> FastAPI:
     app.include_router(system.router, prefix="/system", dependencies=[Depends(verify_key)])
     # PET-972 — Petshandler offline mode: activation, state, switching off.
     app.include_router(offline.router, prefix="/offline", dependencies=[Depends(verify_key)])
+    # PET-1087 — this station: its identifier, its work journal, the device
+    # settings the app keeps here.
+    app.include_router(station.router, prefix="/station", dependencies=[Depends(verify_key)])
 
     return app

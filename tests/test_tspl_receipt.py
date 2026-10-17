@@ -496,7 +496,7 @@ def test_test_print_speaks_the_devices_language_whatever_the_role(
         def is_connected(self):
             return True
 
-        async def enqueue(self, job):
+        async def enqueue(self, job, *, action: str = "print"):
             class _Esc:
                 def _raw(self, data):
                     sent.append(data)

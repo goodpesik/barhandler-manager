@@ -22,6 +22,7 @@ from escpos.printer import Network, Usb
 from src.services.bitmap_render import dots_for, image_to_gs_v_0, render_paragraph
 from src.services.tspl_render import image_to_tspl_bitmap
 from src.services.encoding import encode_ua_cp866
+from src.services import work_journal
 
 logger = logging.getLogger(__name__)
 
@@ -497,19 +498,47 @@ class PrinterDevice:
         queued = self._queue.qsize() if worker is not None and not worker.done() else 0
         return queued + (1 if self._job_in_flight else 0)
 
-    async def enqueue(self, job: Callable[[object], Awaitable[None]]):
+    async def enqueue(
+        self,
+        job: Callable[[object], Awaitable[None]],
+        *,
+        action: str = "print",
+    ):
         """Submit a job and wait until it has been executed by the worker.
 
         `job` is `async def fn(printer): ...` — it receives the live
         python-escpos printer instance and is free to issue any commands.
         Raises PrinterUnavailable if the device isn't connected.
+
+        PET-1087 — the work journal is written HERE and nowhere else: every
+        print of every route passes through this one queue, so a route added
+        later is in the journal without anybody remembering to add it. The row
+        is written after the job has ended, and `record_printer` keeps its own
+        failures to itself — a journal is not worth a lost receipt.
         """
         if not self.is_connected():
+            work_journal.record_printer(
+                self.name, action, work_journal.STATUS_FAILED, "printer is not connected",
+            )
             raise PrinterUnavailable(f"{self.name} printer is not connected")
         loop = asyncio.get_running_loop()
         done: asyncio.Future = loop.create_future()
         await self._queue.put((job, done))
-        return await done
+        try:
+            result = await done
+        except asyncio.CancelledError:
+            # Nobody is at fault and nothing was printed — telling the shop
+            # its printer failed would send it looking for a fault that is not
+            # there.
+            work_journal.record_printer(self.name, action, work_journal.STATUS_CANCELLED)
+            raise
+        except Exception as exc:
+            work_journal.record_printer(
+                self.name, action, work_journal.STATUS_FAILED, str(exc) or type(exc).__name__,
+            )
+            raise
+        work_journal.record_printer(self.name, action, work_journal.STATUS_OK)
+        return result
 
     async def open_drawer(self) -> None:
         """Pulse the cash-drawer connector. Silent no-op when disabled."""
@@ -520,7 +549,7 @@ class PrinterDevice:
         async def _job(printer):
             printer.cashdraw(pin)
 
-        await self.enqueue(_job)
+        await self.enqueue(_job, action="drawer")
 
     # ----- off-loop I/O (BH-168) ---------------------------------------
 

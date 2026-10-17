@@ -75,7 +75,7 @@ async def print_receipt(
         _maybe_open_drawer(esc, reg, payload.open_drawer)
 
     try:
-        await device.enqueue(_job)
+        await device.enqueue(_job, action="receipt")
     except PrinterUnavailable as exc:
         # Surface the structured code so the frontend can switch on it
         # ("out_of_paper" → "Закінчився папір", "cover_open" → "Закрийте кришку").
@@ -100,7 +100,7 @@ async def print_fiscal(
         _maybe_open_drawer(esc, reg, payload.open_drawer)
 
     try:
-        await device.enqueue(_job)
+        await device.enqueue(_job, action="fiscal")
     except PrinterUnavailable as exc:
         # Surface the structured code so the frontend can switch on it
         # ("out_of_paper" → "Закінчився папір", "cover_open" → "Закрийте кришку").
@@ -133,7 +133,7 @@ async def print_text(
         _maybe_open_drawer(esc, reg, payload.open_drawer)
 
     try:
-        await device.enqueue(_job)
+        await device.enqueue(_job, action="text")
     except PrinterUnavailable as exc:
         # Surface the structured code so the frontend can switch on it
         # ("out_of_paper" → "Закінчився папір", "cover_open" → "Закрийте кришку").
@@ -218,7 +218,7 @@ async def print_lines(
         _maybe_open_drawer(esc, reg, payload.open_drawer)
 
     try:
-        await device.enqueue(_job)
+        await device.enqueue(_job, action="lines")
     except PrinterUnavailable as exc:
         # Surface the structured code so the frontend can switch on it
         # ("out_of_paper" → "Закінчився папір", "cover_open" → "Закрийте кришку").
@@ -305,7 +305,7 @@ async def print_label(
         esc._raw(blob)
 
     try:
-        await device.enqueue(_job)
+        await device.enqueue(_job, action="label")
     except PrinterUnavailable as exc:
         raise HTTPException(
             status_code=503,
@@ -401,7 +401,7 @@ async def print_kitchen(
         esc.cut()
 
     try:
-        await device.enqueue(_job)
+        await device.enqueue(_job, action="kitchen")
     except PrinterUnavailable as exc:
         # Surface the structured code so the frontend can switch on it
         # ("out_of_paper" → "Закінчився папір", "cover_open" → "Закрийте кришку").

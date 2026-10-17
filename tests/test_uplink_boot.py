@@ -29,6 +29,8 @@ def _config(enabled_at: str, tmp_path) -> dict:
             "port": 9999,
             "registry_path": str(tmp_path / "printers.json"),
             "terminal_registry_path": str(tmp_path / "terminals.json"),
+            "journal_path": str(tmp_path / "work-journal.json"),
+            "station_settings_path": str(tmp_path / "app-settings.json"),
         },
         "uplink": {
             "enabled": True,
