@@ -208,6 +208,39 @@ async def save_local_settings(request: Request) -> dict:
         raise HTTPException(status_code=409, detail={"code": "offline_not_active", "message": str(e)})
 
 
+@router.post("/fiscal-key")
+async def save_fiscal_key(request: Request) -> dict:
+    """PET-1088 — the shop uploads the key container of an offline register.
+
+    The offline service signs with a file on this machine, so the person picks
+    it in the browser instead of typing a path. It is kept in the manager's own
+    folder (it outlives the offline data, which goes when offline mode is
+    switched off), and the answer carries the path the register settings keep.
+    """
+    try:
+        payload = await request.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "Некоректний запит."})
+    try:
+        return await asyncio.to_thread(
+            offline_state.save_fiscal_key,
+            str(payload.get("appid") or ""),
+            str(payload.get("fileName") or ""),
+            str(payload.get("contentBase64") or ""),
+        )
+    except offline_state.ActivationError as e:
+        log.warning("offline fiscal key refused: %s", e)
+        raise HTTPException(status_code=400, detail={"code": "fiscal_key_refused", "message": str(e)})
+    except OSError as e:
+        log.error("offline fiscal key could not be kept: %s", e)
+        raise HTTPException(
+            status_code=500,
+            detail={"code": "fiscal_key_failed", "message": "Не вдалося зберегти файл ключа."},
+        )
+
+
 @router.get("/local-settings")
 async def load_local_settings() -> dict:
     """PET-973 — the offline build takes them when it starts."""

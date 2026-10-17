@@ -705,3 +705,92 @@ def test_sync_now_needs_the_managers_key(client_for):
     c = client_for(svc)
     assert c.post("/offline/sync").status_code in (401, 403)
     assert svc.synced == 0
+
+
+# PET-1088 — the key container of an offline register is uploaded, not typed.
+
+
+def _activate(client):
+    assert client.post("/offline/activate", json=PAYLOAD, headers=KEY).status_code == 200
+
+
+def test_an_uploaded_key_is_kept_private_and_its_path_comes_back(client_for, home):
+    c = client_for(FakeService(queued=0))
+    _activate(c)
+    r = c.post(
+        "/offline/fiscal-key",
+        json={"appid": PAYLOAD["appid"], "fileName": "Key-6.dat", "contentBase64": "a2V5LWJ5dGVz"},
+        headers=KEY,
+    )
+    assert r.status_code == 200, r.text
+    path = Path(r.json()["path"])
+    assert path.read_bytes() == b"key-bytes"
+    # Only this user may read a container that signs fiscal documents.
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    # It lives in the manager's own folder, which outlives the offline data.
+    assert path.parent == offline_state.fiscal_keys_folder(PAYLOAD["appid"])
+
+
+def test_a_name_cannot_put_the_key_outside_its_folder(client_for, home):
+    c = client_for(FakeService(queued=0))
+    _activate(c)
+    r = c.post(
+        "/offline/fiscal-key",
+        json={
+            "appid": PAYLOAD["appid"],
+            "fileName": "../../../../tmp/Key-6.dat",
+            "contentBase64": "a2V5LWJ5dGVz",
+        },
+        headers=KEY,
+    )
+    assert r.status_code == 200, r.text
+    path = Path(r.json()["path"])
+    assert path.parent == offline_state.fiscal_keys_folder(PAYLOAD["appid"])
+    assert path.name == "Key-6.dat"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"fileName": "Key-6.dat", "contentBase64": ""},
+        {"fileName": "Key-6.dat", "contentBase64": "not base64 at all!!"},
+        # Characters that are not base64 at all, in a string that would decode
+        # once they were quietly dropped: a container is taken as it was sent
+        # or not at all.
+        {"fileName": "Key-6.dat", "contentBase64": "a2V5!!LWJ5dGVz"},
+        {"fileName": "", "contentBase64": "a2V5LWJ5dGVz"},
+        {"fileName": "...", "contentBase64": "a2V5LWJ5dGVz"},
+    ],
+)
+def test_what_is_not_a_key_file_is_refused(client_for, home, body):
+    c = client_for(FakeService(queued=0))
+    _activate(c)
+    r = c.post("/offline/fiscal-key", json={"appid": PAYLOAD["appid"], **body}, headers=KEY)
+    assert r.status_code == 400, r.text
+
+
+def test_a_key_for_another_shop_is_refused(client_for, home):
+    c = client_for(FakeService(queued=0))
+    _activate(c)
+    r = c.post(
+        "/offline/fiscal-key",
+        json={"appid": "another-shop", "fileName": "Key-6.dat", "contentBase64": "a2V5LWJ5dGVz"},
+        headers=KEY,
+    )
+    assert r.status_code == 400, r.text
+    assert not offline_state.fiscal_keys_folder("another-shop").exists()
+
+
+def test_a_key_bigger_than_a_container_is_refused(client_for, home):
+    import base64
+
+    c = client_for(FakeService(queued=0))
+    _activate(c)
+    too_big = base64.b64encode(b"x" * (offline_state.FISCAL_KEY_MAX_BYTES + 1)).decode()
+    r = c.post(
+        "/offline/fiscal-key",
+        json={"appid": PAYLOAD["appid"], "fileName": "Key-6.dat", "contentBase64": too_big},
+        headers=KEY,
+    )
+    assert r.status_code == 400, r.text
+

@@ -324,6 +324,65 @@ def save_local_settings(appid: str, items: object) -> dict:
     return {"id": body["id"], "savedAt": body["savedAt"], "count": len(items)}
 
 
+#: A key container is a few kilobytes; anything beyond this is not one.
+FISCAL_KEY_MAX_BYTES = 1024 * 1024
+#: What a file dropped into the fiscal-keys folder may be called.
+_KEY_FILE_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def fiscal_keys_folder(appid: str) -> Path:
+    return shop_folder(appid) / "fiscal-keys"
+
+
+def _safe_key_name(file_name: str) -> str:
+    """The name the file is kept under: its own, with nothing of a path in it.
+
+    The browser sends whatever the person picked, and a name is not a path:
+    `..`, a slash or a backslash would put the container anywhere on the disk.
+    Everything outside the allowed set becomes an underscore, and a name left
+    with nothing is refused instead of invented.
+    """
+    bare = str(file_name or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", bare).lstrip(".")[:64]
+    if not cleaned or not _KEY_FILE_NAME.fullmatch(cleaned):
+        raise ActivationError("Некоректна назва файла ключа.")
+    return cleaned
+
+
+def save_fiscal_key(appid: str, file_name: str, content_base64: str) -> dict:
+    """PET-1088 — keep an uploaded key container (or its certificate) on this machine.
+
+    The offline service signs with a file that lives on the shop's own
+    computer, so the person uploads it here instead of typing a path they have
+    to find in a file manager. The manager is the one that keeps it: its folder
+    outlives the service's data, which goes when offline mode is switched off.
+
+    The file is written like every other private file of ours — through a
+    temporary file and a rename, readable by this user only — and the answer is
+    the path the offline register settings then carry.
+    """
+    active = active_appid()
+    if not active:
+        raise ActivationError("Офлайн-режим на цьому компʼютері не увімкнено.")
+    if appid != active:
+        raise ActivationError("Офлайн-режим на цьому компʼютері увімкнено для іншого закладу.")
+    name = _safe_key_name(file_name)
+    try:
+        data = base64.b64decode(str(content_base64 or ""), validate=True)
+    except (ValueError, TypeError):
+        raise ActivationError("Файл не вдалося прочитати.")
+    if not data:
+        raise ActivationError("Файл порожній.")
+    if len(data) > FISCAL_KEY_MAX_BYTES:
+        raise ActivationError("Файл завеликий для ключа.")
+    path = fiscal_keys_folder(appid) / name
+    offline_secrets._write_private(path, data)
+    # The name is in the log and the content never is: a key container is the
+    # right to sign fiscal documents.
+    log.info("offline: fiscal key file %s kept for shop %s (%d bytes)", name, appid, len(data))
+    return {"path": str(path), "name": name, "bytes": len(data)}
+
+
 def load_local_settings() -> Optional[dict]:
     """The active shop's snapshot: {savedAt, items}, or None."""
     appid = active_appid()
