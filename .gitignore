@@ -25,7 +25,7 @@ printers.json
 terminals.json
 # PET-1087 — the station's own data: its work journal and the device
 # settings the app keeps here.
-work-journal.json
+work-journal.jsonl
 app-settings.json
 
 # CLI runtime — PID of the detached server (written by `python cli.py start`)

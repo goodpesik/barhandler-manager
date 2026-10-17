@@ -640,7 +640,7 @@ async def test_a_dead_worker_does_not_block_updates_forever() -> None:
     # Воркер, який уже завершився, плюс джоб, що лишився в черзі.
     dev._worker_task = asyncio.create_task(asyncio.sleep(0))
     await dev._worker_task
-    await dev._queue.put((lambda _esc: None, asyncio.get_running_loop().create_future()))
+    await dev._queue.put((lambda _esc: None, asyncio.get_running_loop().create_future(), "receipt"))
 
     assert dev._queue.qsize() == 1, "передумова тесту не склалась"
     assert dev.pending_jobs() == 0, (
@@ -694,7 +694,7 @@ async def test_a_socket_error_wakes_the_jobs_still_queued_behind_it() -> None:
     async def _never_runs(_esc):
         raise AssertionError("цей джоб не мав виконатись")
 
-    await dev._queue.put((_never_runs, behind))
+    await dev._queue.put((_never_runs, behind, "receipt"))
     assert dev._queue.qsize() == 1, "передумова тесту не склалась"
 
     may_fail.set()

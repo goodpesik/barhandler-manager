@@ -35,7 +35,9 @@ DEFAULT_PATH = Path("app-settings.json")
 #: printer list, so these bounds are wide; they are here to stop a bug (or a
 #: caller that decided to park a photo here) from growing the file forever.
 MAX_KEYS = 200
+MAX_KEY_LEN = 200
 MAX_VALUE_LEN = 64 * 1024
+MAX_APPID_LEN = 100
 #: A machine can serve two shops (a kiosk shared by a shop and its branch).
 MAX_SHOPS = 10
 
@@ -49,6 +51,11 @@ class StationSettings:
         self.path = Path(path)
         self._shops: dict[str, dict] = {}
         self._lock = threading.Lock()
+        #: Which save came after which. Review found the first version
+        #: evicting by `savedAt`, and a station clock that steps back then
+        #: makes the blob just saved the oldest one — evicted inside the very
+        #: call that reports success. A counter cannot step back.
+        self._saves = 0
 
     def load(self) -> None:
         if not self.path.exists():
@@ -68,6 +75,10 @@ class StationSettings:
                 for appid, blob in shops.items()
                 if isinstance(appid, str) and isinstance(blob, dict) and isinstance(blob.get("items"), dict)
             }
+            # The order of the file is the order of the saves it remembers.
+            for order, blob in enumerate(self._shops.values(), start=1):
+                blob.setdefault("order", order)
+            self._saves = len(self._shops)
         logger.info("app-settings: device settings of %s shop(s)", len(self._shops))
 
     def _save_locked(self) -> None:
@@ -78,9 +89,13 @@ class StationSettings:
     def save(self, appid: str, items: object) -> dict:
         """Keep this shop's settings. Answers the blob's id and time, so the
         app can tell its own copy from a newer one saved elsewhere."""
+        if appid is not None and not isinstance(appid, str):
+            raise SettingsRefused("Некоректний заклад.")
         appid = (appid or "").strip()
         if not appid:
             raise SettingsRefused("Не вказано заклад.")
+        if len(appid) > MAX_APPID_LEN:
+            raise SettingsRefused("Некоректний заклад.")
         if not isinstance(items, dict) or not items:
             raise SettingsRefused("Немає налаштувань для збереження.")
         if len(items) > MAX_KEYS:
@@ -89,27 +104,43 @@ class StationSettings:
         for key, value in items.items():
             if not isinstance(key, str) or not isinstance(value, str):
                 raise SettingsRefused("Налаштування мусять бути рядками.")
+            if len(key) > MAX_KEY_LEN:
+                raise SettingsRefused("Назва налаштування завелика.")
             if len(value) > MAX_VALUE_LEN:
                 raise SettingsRefused(f"Налаштування «{key}» завелике.")
             clean[key] = value
-        blob = {
-            # The id, not the time, is what the app compares: a station's clock
-            # can jump back, and then a newer blob would look older than the
-            # copy already applied (the same reason as in offline settings).
-            "id": uuid.uuid4().hex,
-            "savedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "items": clean,
-        }
         with self._lock:
-            self._shops[appid] = blob
-            if len(self._shops) > MAX_SHOPS:
-                # The oldest save goes, by its own time — a shop that still
-                # uses this machine saves on every change.
-                oldest = sorted(self._shops.items(), key=lambda kv: kv[1].get("savedAt") or "")
-                for appid_out, _ in oldest[: len(self._shops) - MAX_SHOPS]:
-                    self._shops.pop(appid_out, None)
+            self._saves += 1
+            blob = {
+                # The id, not the time, is what the app compares: a station's
+                # clock can jump back, and then a newer blob would look older
+                # than the copy already applied (as in offline settings).
+                "id": uuid.uuid4().hex,
+                "savedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "order": self._saves,
+                "items": clean,
+            }
+            # Built apart and committed only after the file is written: an
+            # unwritable disk must not leave the memory (and therefore GET)
+            # ahead of what the station actually holds.
+            next_shops = dict(self._shops)
+            next_shops[appid] = blob
+            if len(next_shops) > MAX_SHOPS:
+                # The shop saved least recently goes — never the one being
+                # saved right now.
+                oldest = sorted(
+                    (kv for kv in next_shops.items() if kv[0] != appid),
+                    key=lambda kv: kv[1].get("order") or 0,
+                )
+                for appid_out, _ in oldest[: len(next_shops) - MAX_SHOPS]:
+                    next_shops.pop(appid_out, None)
                     logger.info("app-settings: the settings of shop %s are forgotten (the file is full)", appid_out)
-            self._save_locked()
+            kept, self._shops = self._shops, next_shops
+            try:
+                self._save_locked()
+            except Exception:
+                self._shops = kept
+                raise
         logger.info("app-settings: %s settings saved for shop %s", len(clean), appid)
         return {"id": blob["id"], "savedAt": blob["savedAt"], "count": len(clean)}
 

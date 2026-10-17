@@ -120,7 +120,10 @@ class PrinterDevice:
         self.name = name
         self._config = config or {}
         self._printer = None
-        self._queue: "asyncio.Queue[tuple[Callable[[object], Awaitable[None]], asyncio.Future]]" = (
+        # PET-1087 — the action travels WITH the job: the worker is the only
+        # place that knows whether the paper came out, and it has to name what
+        # was printed in the journal row.
+        self._queue: "asyncio.Queue[tuple[Callable[[object], Awaitable[None]], asyncio.Future, str]]" = (
             asyncio.Queue()
         )
         self._worker_task: Optional[asyncio.Task] = None
@@ -377,6 +380,32 @@ class PrinterDevice:
     def _job_finished(self, _flush: asyncio.Future) -> None:
         self._job_in_flight = False
 
+    def _record_when_flushed(self, flush: asyncio.Future, action: str) -> None:
+        """PET-1087 — the row is written when the write itself ends.
+
+        A write running in the device thread cannot be cancelled; it finishes
+        on its own. So the journal waits for it rather than guessing.
+        """
+
+        def _row(done_flush: asyncio.Future) -> None:
+            # Called as soon as the write ends — and on the next pass of the
+            # loop when it has ended already.
+            if done_flush.cancelled():
+                work_journal.record_printer(
+                    self.name, action, work_journal.STATUS_CANCELLED,
+                )
+                return
+            exc = done_flush.exception()
+            if exc is not None:
+                work_journal.record_printer(
+                    self.name, action, work_journal.STATUS_FAILED,
+                    str(exc) or type(exc).__name__,
+                )
+                return
+            work_journal.record_printer(self.name, action, work_journal.STATUS_OK)
+
+        flush.add_done_callback(_row)
+
     def _close_late_handle(
         self, build: asyncio.Future, executor: Optional[ThreadPoolExecutor],
     ) -> None:
@@ -467,9 +496,15 @@ class PrinterDevice:
         """
         while True:
             try:
-                _job, done = self._queue.get_nowait()
+                _job, done, action = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
+            # PET-1087 — it will never print, and somebody is waiting for it:
+            # that belongs in the journal as much as a failure does.
+            work_journal.record_printer(
+                self.name, action, work_journal.STATUS_CANCELLED,
+                "the printer is being reconfigured",
+            )
             if not done.done():
                 done.set_exception(
                     PrinterUnavailable(
@@ -510,11 +545,14 @@ class PrinterDevice:
         python-escpos printer instance and is free to issue any commands.
         Raises PrinterUnavailable if the device isn't connected.
 
-        PET-1087 — the work journal is written HERE and nowhere else: every
-        print of every route passes through this one queue, so a route added
-        later is in the journal without anybody remembering to add it. The row
-        is written after the job has ended, and `record_printer` keeps its own
-        failures to itself — a journal is not worth a lost receipt.
+        PET-1087 — the journal row is written by the WORKER, not here. The
+        first version recorded the outcome around this `await`, and review
+        found it says the wrong thing in the commonest interruption: a client
+        that disconnects cancels THIS await, while the write to the printer is
+        shielded and finishes — the paper comes out and the row said
+        «cancelled». The worker sees the write itself, so that is where the
+        truth is. What stays here is the one case the worker never sees: a
+        printer that is not connected at all, so the job never reaches it.
         """
         if not self.is_connected():
             work_journal.record_printer(
@@ -523,22 +561,8 @@ class PrinterDevice:
             raise PrinterUnavailable(f"{self.name} printer is not connected")
         loop = asyncio.get_running_loop()
         done: asyncio.Future = loop.create_future()
-        await self._queue.put((job, done))
-        try:
-            result = await done
-        except asyncio.CancelledError:
-            # Nobody is at fault and nothing was printed — telling the shop
-            # its printer failed would send it looking for a fault that is not
-            # there.
-            work_journal.record_printer(self.name, action, work_journal.STATUS_CANCELLED)
-            raise
-        except Exception as exc:
-            work_journal.record_printer(
-                self.name, action, work_journal.STATUS_FAILED, str(exc) or type(exc).__name__,
-            )
-            raise
-        work_journal.record_printer(self.name, action, work_journal.STATUS_OK)
-        return result
+        await self._queue.put((job, done, action))
+        return await done
 
     async def open_drawer(self) -> None:
         """Pulse the cash-drawer connector. Silent no-op when disabled."""
@@ -874,7 +898,7 @@ class PrinterDevice:
 
     async def _worker(self) -> None:
         while True:
-            job, done = await self._queue.get()
+            job, done, action = await self._queue.get()
             spooler = self._is_spooler()
             flush: Optional[asyncio.Future] = None
             self._job_in_flight = True
@@ -980,6 +1004,9 @@ class PrinterDevice:
                 # таймаути й `GET /busy`, яке питають інсталятори.
                 flush = self._io(self._flush_blocking, printer, chunks, spooler)
                 await asyncio.shield(flush)
+                # PET-1087 — the paper is out: the row says so, whether or not
+                # anybody is still waiting for the answer.
+                work_journal.record_printer(self.name, action, work_journal.STATUS_OK)
                 if not done.done():
                     done.set_result(None)
             except OSError as exc:
@@ -987,6 +1014,9 @@ class PrinterDevice:
                 # Clear the handle so health() reports "unavailable" and
                 # the next print attempt triggers a fresh connect().
                 logger.warning("[%s] socket error — marking disconnected: %s", self.name, exc)
+                work_journal.record_printer(
+                    self.name, action, work_journal.STATUS_FAILED, str(exc) or "socket error",
+                )
                 # BH-168 — `close()` теж робота з залізом: у потоці пристрою,
                 # а не в циклі подій (доти саме тут він кликався з циклу).
                 dead, self._printer = self._printer, None
@@ -1011,6 +1041,19 @@ class PrinterDevice:
                 # летів мовчки, і `done` не отримував НІЧОГО: HTTP-запит, що
                 # чекав на цей друк, висів до таймауту клієнта без жодної
                 # помилки. Розбудити того, хто чекає, і лише тоді падати далі.
+                # PET-1087 — the same reasoning as for the answer below: a
+                # write already in the device thread cannot be cancelled and
+                # will finish, so the row waits for it instead of claiming
+                # that nothing was printed.
+                if flush is not None:
+                    # Done and sound means the paper is already out, even
+                    # though the cancellation arrived before the row below.
+                    self._record_when_flushed(flush, action)
+                else:
+                    work_journal.record_printer(
+                        self.name, action, work_journal.STATUS_CANCELLED,
+                        "the printer is being reconfigured",
+                    )
                 if not done.done():
                     if flush is not None and not flush.done():
                         # BH-168, знайдено ревʼю: запис у потоці пристрою
@@ -1028,6 +1071,10 @@ class PrinterDevice:
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.exception("[%s] print job failed", self.name)
+                work_journal.record_printer(
+                    self.name, action, work_journal.STATUS_FAILED,
+                    str(exc) or type(exc).__name__,
+                )
                 if not done.done():
                     done.set_exception(exc)
             finally:

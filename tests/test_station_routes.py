@@ -18,7 +18,7 @@ def test_the_station_says_who_it_is(client: TestClient, auth_headers: dict) -> N
     body = client.get("/station", headers=auth_headers).json()
     assert body["installId"], "the station must have a stable identifier"
     assert "label" in body and "platform" in body and "version" in body
-    assert body["journalLastSeq"] == 0
+    assert body["journalEntries"] == 0
 
 
 def test_the_station_is_behind_the_key(client: TestClient) -> None:
@@ -31,7 +31,9 @@ def test_the_station_is_behind_the_key(client: TestClient) -> None:
 
 def test_the_journal_is_empty_on_a_fresh_station(client: TestClient, auth_headers: dict) -> None:
     body = client.get("/station/journal", headers=auth_headers).json()
-    assert body == {"entries": [], "lastSeq": 0}
+    assert body["entries"] == []
+    # Nothing to ask from next time, so the cursor stays where the caller is.
+    assert body["pageLastSeq"] == 0
 
 
 def test_the_journal_answers_the_rows_after_a_number(client: TestClient, auth_headers: dict) -> None:
@@ -40,24 +42,34 @@ def test_the_journal_answers_the_rows_after_a_number(client: TestClient, auth_he
     journal.record(device_kind="terminal", device_id="t1", action="sale", status="ok", amount_kopecks=5000)
 
     whole = client.get("/station/journal", headers=auth_headers).json()
-    assert [e["seq"] for e in whole["entries"]] == [1, 2]
-    assert whole["lastSeq"] == 2
+    seqs = [e["seq"] for e in whole["entries"]]
+    assert len(seqs) == 2 and seqs[0] < seqs[1]
+    assert whole["pageLastSeq"] == seqs[-1] == whole["lastSeq"]
 
-    rest = client.get("/station/journal?after=1", headers=auth_headers).json()
+    rest = client.get(f"/station/journal?after={seqs[0]}", headers=auth_headers).json()
     assert [e["action"] for e in rest["entries"]] == ["sale"]
     assert rest["entries"][0]["amount"] == 5000
+    assert rest["pageLastSeq"] == seqs[1]
 
 
-def test_the_journal_takes_at_most_the_asked_for_rows(client: TestClient, auth_headers: dict) -> None:
+def test_a_page_hands_back_its_own_cursor_and_the_stations_highest(
+    client: TestClient, auth_headers: dict,
+) -> None:
+    """Found by review: an app that took the station's highest number as its
+    cursor would skip every row between the page and that number."""
     journal = client.app.state.work_journal
-    for _ in range(5):
+    rows = [
         journal.record(device_kind="printer", device_id="p1", action="receipt", status="ok")
+        for _ in range(5)
+    ]
+    seqs = [r["seq"] for r in rows]
 
     body = client.get("/station/journal?after=0&limit=2", headers=auth_headers).json()
-    assert [e["seq"] for e in body["entries"]] == [1, 2]
-    # The last number is the station's, not the page's: the app asks again from
-    # the last row it took, and a page's number would stop it short.
-    assert body["lastSeq"] == 5
+    assert [e["seq"] for e in body["entries"]] == seqs[:2]
+    # The cursor for the next call is the page's own last row…
+    assert body["pageLastSeq"] == seqs[1]
+    # …while the station's highest says how much is still queued.
+    assert body["lastSeq"] == seqs[-1]
 
 
 @pytest.mark.parametrize("query", ["?after=-1", "?limit=0", "?limit=5000"])
@@ -146,3 +158,73 @@ def test_the_settings_survive_a_restart_of_the_manager(client: TestClient, auth_
         read = fresh.get(f"/station/settings?appid={SHOP}", headers={"X-Api-Key": DEFAULT_API_KEY})
         assert read.status_code == 200
         assert read.json()["items"] == {"a": "1"}
+
+
+def test_the_shop_being_saved_is_never_the_one_evicted(client: TestClient, auth_headers: dict) -> None:
+    """Found by review: the first version evicted by the saved-at time, and a
+    station clock that steps back makes the blob just saved the oldest one —
+    thrown away inside the very call that answered «saved»."""
+    from src.services.station_settings import MAX_SHOPS
+
+    for n in range(MAX_SHOPS):
+        client.post(
+            "/station/settings", headers=auth_headers, json={"appid": f"shop-{n}", "items": {"a": "1"}},
+        )
+    # The clock steps back a year for the next save.
+    import src.services.station_settings as settings_module
+    from datetime import datetime, timedelta, timezone
+
+    real = settings_module.datetime
+
+    class _Stepped:
+        @staticmethod
+        def now(tz=None):
+            return real.now(tz or timezone.utc) - timedelta(days=365)
+
+    settings_module.datetime = _Stepped
+    try:
+        saved = client.post(
+            "/station/settings", headers=auth_headers, json={"appid": "shop-new", "items": {"a": "2"}},
+        )
+    finally:
+        settings_module.datetime = real
+    assert saved.status_code == 200
+
+    read = client.get("/station/settings?appid=shop-new", headers=auth_headers)
+    assert read.status_code == 200, "the shop that just saved must still be there"
+    assert read.json()["items"] == {"a": "2"}
+    # And the room was made by forgetting the shop that saved first.
+    assert client.get("/station/settings?appid=shop-0", headers=auth_headers).status_code == 404
+
+
+def test_a_save_that_could_not_be_written_changes_nothing(client: TestClient, auth_headers: dict) -> None:
+    """Also from the review: the first version put the new blob into memory
+    before writing the file, so a failed write answered 500 while GET already
+    served the new settings and the evicted shop was already gone."""
+    client.post("/station/settings", headers=auth_headers, json={"appid": SHOP, "items": {"a": "1"}})
+    store = client.app.state.station_settings
+
+    def _boom() -> None:
+        raise OSError("read-only disk")
+
+    store._save_locked = _boom  # noqa: SLF001
+    failed = client.post(
+        "/station/settings", headers=auth_headers, json={"appid": SHOP, "items": {"a": "2"}},
+    )
+    del store._save_locked  # noqa: SLF001
+    assert failed.status_code == 500
+
+    read = client.get(f"/station/settings?appid={SHOP}", headers=auth_headers).json()
+    assert read["items"] == {"a": "1"}, "what is served must be what the station holds"
+
+
+def test_a_shop_that_is_not_a_string_is_refused(client: TestClient, auth_headers: dict) -> None:
+    r = client.post("/station/settings", headers=auth_headers, json={"appid": ["a"], "items": {"a": "1"}})
+    assert r.status_code == 400
+
+
+def test_an_oversized_key_is_refused(client: TestClient, auth_headers: dict) -> None:
+    r = client.post(
+        "/station/settings", headers=auth_headers, json={"appid": SHOP, "items": {"k" * 300: "1"}},
+    )
+    assert r.status_code == 400

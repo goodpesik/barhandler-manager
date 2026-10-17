@@ -550,11 +550,12 @@ def test_a_refund_is_its_own_operation_in_the_journal(
     assert [(r["action"], r["amount"]) for r in rows] == [("refund", 500)]
 
 
-def test_a_card_that_said_no_is_a_failed_row_not_a_missing_one(
+def test_a_card_that_said_no_is_declined_not_a_broken_terminal(
     client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
 ) -> None:
     """«The operator tried three times and the card refused» is exactly what
-    somebody comes to the journal for."""
+    somebody comes to the journal for — and it must not read as a fault of the
+    terminal, or the shop goes looking for one (found by review)."""
     _register_default(client_with_terminal, auth_headers, fake_terminal.id)
     declined = AcquirerResult(status="declined", error_code="E05", error_message="Відмова")
     with patch(
@@ -567,8 +568,63 @@ def test_a_card_that_said_no_is_a_failed_row_not_a_missing_one(
 
     rows = _journal_rows(client_with_terminal)
     assert len(rows) == 1
+    assert rows[0]["status"] == "declined"
+    # The bank's own code stays beside the words: it is what the bank asks for.
+    assert rows[0]["detail"] == "Відмова · E05"
+
+
+def test_an_operator_who_stopped_the_payment_is_not_a_failure(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.charge",
+        new=AsyncMock(return_value=AcquirerResult(status="cancelled")),
+    ):
+        client_with_terminal.post(
+            "/terminal/charge", headers=auth_headers, json={"amount_kopecks": 100},
+        )
+    assert _journal_rows(client_with_terminal)[0]["status"] == "cancelled"
+
+
+def test_a_request_that_ended_without_an_answer_is_still_a_row(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    """Found by review: an HTTPException raised inside an adapter is re-raised
+    untouched, and a cancelled request is a BaseException — both left a card
+    operation that may well have gone through with no row at all."""
+    from fastapi import HTTPException
+
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.charge",
+        new=AsyncMock(side_effect=HTTPException(status_code=409, detail="busy")),
+    ):
+        response = client_with_terminal.post(
+            "/terminal/charge", headers=auth_headers, json={"amount_kopecks": 7700},
+        )
+    assert response.status_code == 409
+
+    rows = _journal_rows(client_with_terminal)
+    assert len(rows) == 1
+    assert rows[0]["amount"] == 7700
     assert rows[0]["status"] == "failed"
-    assert rows[0]["detail"] == "Відмова"
+    assert "without an answer" in (rows[0]["detail"] or "")
+
+
+def test_one_answered_operation_leaves_exactly_one_row(
+    client_with_terminal: TestClient, auth_headers: dict, fake_terminal,
+) -> None:
+    """The `finally` must not add a second row to an operation that answered."""
+    _register_default(client_with_terminal, auth_headers, fake_terminal.id)
+    with patch(
+        "src.services.terminals.ssi.SSITerminalAdapter.charge",
+        new=AsyncMock(return_value=AcquirerResult(status="ok")),
+    ):
+        client_with_terminal.post(
+            "/terminal/charge", headers=auth_headers, json={"amount_kopecks": 100},
+        )
+    assert len(_journal_rows(client_with_terminal)) == 1
 
 
 def test_a_terminal_that_did_not_answer_is_in_the_journal_too(

@@ -73,15 +73,20 @@ async def journal(
     limit: int = Query(default=500, ge=1, le=2000),
 ) -> dict:
     """What the printers and the terminal of this station did, from row
-    `after` on. The caller keeps the last number it took and asks again."""
+    `after` on.
+
+    `pageLastSeq` is THE CURSOR for the next call: the last row of this page.
+    `lastSeq` is the station's highest number, which says how much is still
+    queued — taking IT as the cursor would skip everything between the page
+    and it (found by review), so both are named and both are read at once.
+    """
     j = _journal(request)
     if j is None:
         # A build without a journal: an empty answer, not an error — the app
         # must not keep a troubled face over a manager that simply does not
         # keep one yet.
-        return {"entries": [], "lastSeq": 0}
-    entries = j.entries(after_seq=after, limit=limit)
-    return {"entries": entries, "lastSeq": j.last_seq}
+        return {"entries": [], "pageLastSeq": after, "lastSeq": 0}
+    return j.page(after_seq=after, limit=limit)
 
 
 @router.post("/settings")
@@ -103,7 +108,9 @@ async def save_settings(request: Request) -> dict:
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "Некоректний запит."})
     try:
-        return await _to_thread(s.save, str(payload.get("appid") or ""), payload.get("items"))
+        # The raw value, not `str(...)`: a list would otherwise arrive as its
+        # own repr and pass for a shop (found by review).
+        return await _to_thread(s.save, payload.get("appid"), payload.get("items"))
     except station_settings_service.SettingsRefused as exc:
         log.warning("station settings refused: %s", exc)
         raise HTTPException(status_code=400, detail={"code": "settings_refused", "message": str(exc)})
