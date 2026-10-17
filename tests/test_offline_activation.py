@@ -727,8 +727,77 @@ def test_an_uploaded_key_is_kept_private_and_its_path_comes_back(client_for, hom
     assert path.read_bytes() == b"key-bytes"
     # Only this user may read a container that signs fiscal documents.
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    # It lives in the manager's own folder, which outlives the offline data.
     assert path.parent == offline_state.fiscal_keys_folder(PAYLOAD["appid"])
+
+
+def test_the_key_outlives_offline_mode_being_switched_off(client_for, home):
+    """A shop that switches offline mode off and on again keeps its keys.
+
+    Everything beside the local copy goes with it, and a key container that
+    went too would leave the registers naming a file that is not there —
+    found out in the first shop without internet.
+    """
+    c = client_for(FakeService(queued=0))
+    _activate(c)
+    r = c.post(
+        "/offline/fiscal-key",
+        json={"appid": PAYLOAD["appid"], "fileName": "Key-6.dat", "contentBase64": "a2V5LWJ5dGVz"},
+        headers=KEY,
+    )
+    path = Path(r.json()["path"])
+    assert c.post("/offline/deactivate", headers=KEY).status_code == 200
+    assert path.read_bytes() == b"key-bytes"
+
+
+def test_two_different_keys_under_one_name_do_not_replace_each_other(client_for, home):
+    """Every shop's container is called the same: the content names the file."""
+    c = client_for(FakeService(queued=0))
+    _activate(c)
+    first = c.post(
+        "/offline/fiscal-key",
+        json={"appid": PAYLOAD["appid"], "fileName": "Key-6.dat", "contentBase64": "a2V5LW9uZQ=="},
+        headers=KEY,
+    ).json()["path"]
+    second = c.post(
+        "/offline/fiscal-key",
+        json={"appid": PAYLOAD["appid"], "fileName": "Key-6.dat", "contentBase64": "a2V5LXR3bw=="},
+        headers=KEY,
+    ).json()["path"]
+    assert first != second
+    assert Path(first).read_bytes() == b"key-one"
+    assert Path(second).read_bytes() == b"key-two"
+    # Two names that are not ASCII flatten to the same string: the content
+    # still keeps them apart.
+    cyrillic_one = c.post(
+        "/offline/fiscal-key",
+        json={"appid": PAYLOAD["appid"], "fileName": "Ключ.dat", "contentBase64": "a2V5LXRocmVl"},
+        headers=KEY,
+    ).json()["path"]
+    assert cyrillic_one not in (first, second)
+
+    # The same container again lands on itself and costs nothing.
+    again = c.post(
+        "/offline/fiscal-key",
+        json={"appid": PAYLOAD["appid"], "fileName": "Key-6.dat", "contentBase64": "a2V5LW9uZQ=="},
+        headers=KEY,
+    ).json()["path"]
+    assert again == first
+
+
+def test_a_long_name_keeps_the_extension_it_came_with(client_for, home):
+    c = client_for(FakeService(queued=0))
+    _activate(c)
+    r = c.post(
+        "/offline/fiscal-key",
+        json={
+            "appid": PAYLOAD["appid"],
+            "fileName": "K" * 120 + ".dat",
+            "contentBase64": "a2V5LWJ5dGVz",
+        },
+        headers=KEY,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["name"].endswith(".dat")
 
 
 def test_a_name_cannot_put_the_key_outside_its_folder(client_for, home):
@@ -746,7 +815,9 @@ def test_a_name_cannot_put_the_key_outside_its_folder(client_for, home):
     assert r.status_code == 200, r.text
     path = Path(r.json()["path"])
     assert path.parent == offline_state.fiscal_keys_folder(PAYLOAD["appid"])
-    assert path.name == "Key-6.dat"
+    # Nothing of the path it came with is left; the content names it.
+    assert path.name.endswith("-Key-6.dat")
+    assert ".." not in path.name
 
 
 @pytest.mark.parametrize(

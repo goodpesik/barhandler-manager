@@ -20,6 +20,7 @@ A developer can still point BHM_OFFLINE_CONFIG_FILE at a full JSON config.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -331,7 +332,17 @@ _KEY_FILE_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
 
 def fiscal_keys_folder(appid: str) -> Path:
-    return shop_folder(appid) / "fiscal-keys"
+    """Where the key containers of a shop's offline registers are kept.
+
+    OUTSIDE the shop's own folder, and that is the whole point: switching
+    offline mode off removes the local copy and everything beside it
+    (`remove_data`), while a key container has to outlive it — a shop that
+    switches offline mode off and on again would otherwise be left with
+    registers whose settings name a file that is no longer there, and nothing
+    to sign a receipt with in the first shop without internet (found by the
+    second review round).
+    """
+    return offline_root() / "fiscal-keys" / appid
 
 
 def _safe_key_name(file_name: str) -> str:
@@ -341,9 +352,15 @@ def _safe_key_name(file_name: str) -> str:
     `..`, a slash or a backslash would put the container anywhere on the disk.
     Everything outside the allowed set becomes an underscore, and a name left
     with nothing is refused instead of invented.
+
+    The extension is kept when the name has to be cut: a name of seventy
+    characters would otherwise lose its `.dat` and stop looking like what it is.
     """
     bare = str(file_name or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
-    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", bare).lstrip(".")[:64]
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", bare).lstrip(".")
+    if len(cleaned) > 48:
+        stem, dot, ext = cleaned.rpartition(".")
+        cleaned = (stem[: 48 - len(ext) - 1] + dot + ext) if dot and len(ext) <= 8 else cleaned[:48]
     if not cleaned or not _KEY_FILE_NAME.fullmatch(cleaned):
         raise ActivationError("Некоректна назва файла ключа.")
     return cleaned
@@ -367,14 +384,30 @@ def save_fiscal_key(appid: str, file_name: str, content_base64: str) -> dict:
     if appid != active:
         raise ActivationError("Офлайн-режим на цьому компʼютері увімкнено для іншого закладу.")
     name = _safe_key_name(file_name)
+    raw = str(content_base64 or "")
+    # Four base64 characters carry three bytes: a body too big to be a
+    # container is refused before it is decoded into memory.
+    if len(raw) > (FISCAL_KEY_MAX_BYTES // 3 + 1) * 4 + 4:
+        raise ActivationError("Файл завеликий для ключа.")
     try:
-        data = base64.b64decode(str(content_base64 or ""), validate=True)
+        data = base64.b64decode(raw, validate=True)
     except (ValueError, TypeError):
         raise ActivationError("Файл не вдалося прочитати.")
     if not data:
         raise ActivationError("Файл порожній.")
     if len(data) > FISCAL_KEY_MAX_BYTES:
         raise ActivationError("Файл завеликий для ключа.")
+    """THE CONTENT NAMES THE FILE, NOT THE NAME THE BROWSER SENT.
+
+    Every shop's container is called `Key-6.dat`, so two registers of one shop
+    upload two different keys under one name — and the second silently replaced
+    the first, leaving register A signing with register B's key (found by the
+    second review round). The digest of the content goes in front of the name:
+    two different containers cannot meet, and the same one uploaded twice lands
+    on itself, which costs nothing.
+    """
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    name = f"{digest}-{name}"
     path = fiscal_keys_folder(appid) / name
     offline_secrets._write_private(path, data)
     # The name is in the log and the content never is: a key container is the
