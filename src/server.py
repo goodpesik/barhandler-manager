@@ -19,9 +19,14 @@ from src.constants import DEFAULT_API_KEY
 from src.devices.registry import PrinterRegistry
 from src.devices.terminal_registry import TerminalRegistry
 from src.routes import (
-    dashboard, devices, drawer, fiscal_it, health, print_routes, system, terminal, version,
+    dashboard, devices, drawer, fiscal_it, health, offline, print_routes, station, system, terminal,
+    version,
 )
 from src.services.busy import BusyTracker, guard_critical
+from src.services.station_settings import StationSettings
+from src.services.offline_offer import OfflineOffer
+from src.services import work_journal as work_journal_service
+from src.services.work_journal import WorkJournal
 from src.services.update_check import UpdateChecker
 from src.version import installed_version
 
@@ -41,6 +46,20 @@ def create_app(config: dict) -> FastAPI:
         config["server"].get("terminal_registry_path", "terminals.json"),
     )
     terminal_registry = TerminalRegistry(path=terminal_registry_path)
+    # PET-1087 — what the devices of this station did, and the device settings
+    # the app leaves here. Both live beside the registries, for the same
+    # reason: they belong to the machine, not to the browser that drives it.
+    journal = WorkJournal(
+        path=Path(config["server"].get("journal_path", APP_DIR / "work-journal.jsonl")),
+    )
+    station_settings = StationSettings(
+        path=Path(config["server"].get("station_settings_path", APP_DIR / "app-settings.json")),
+    )
+    # Whether the client app offers offline mode (it is off on Petshandler's
+    # production for now); the dashboard shows the mode only when it does.
+    offline_offer = OfflineOffer(
+        path=Path(config["server"].get("offline_offer_path", APP_DIR / "offline-offer.json")),
+    )
 
     async def _printer_connect_watcher() -> None:
         """Connect-ONLY watcher — the safe inverse of the old heartbeat. Every
@@ -78,8 +97,28 @@ def create_app(config: dict) -> FastAPI:
         app.state.busy = BusyTracker()
         registry.load()
         terminal_registry.load()
+        app.state.work_journal = journal
+        app.state.station_settings = station_settings
+        app.state.offline_offer = offline_offer
+        journal.load()
+        station_settings.load()
+        offline_offer.load()
+        # The device layer records through the module singleton, so it does not
+        # have to be handed the journal down every call path.
+        work_journal_service.set_active(journal)
         connect_watcher = asyncio.create_task(
             _printer_connect_watcher(), name="printer-connect",
+        )
+
+        # BH-182 — the frozen build runs from the system temp folder, which
+        # the OS cleans of files untouched for days; keep ours fresh.
+        from src.services.extract_keeper import extraction_dir, keep_extraction_alive
+
+        extract_root = extraction_dir()
+        extract_keeper = (
+            asyncio.create_task(keep_extraction_alive(extract_root), name="extract-keeper")
+            if extract_root
+            else None
         )
 
         update_checker = UpdateChecker(current_version=current_version)
@@ -126,14 +165,37 @@ def create_app(config: dict) -> FastAPI:
 
         uplink_watch = asyncio.create_task(watch(app.state, config))
 
+        # PET-971 — the Petshandler offline service. Only a build that ships
+        # its runtime runs it; everywhere else there is nothing to start.
+        from src.services.offline_service import OfflineService, node_path
+        from src.services.offline_state import current_config
+
+        offline = None
+        offline_task = None
+        if node_path().exists():
+            offline = OfflineService(current_config)
+            app.state.offline_service = offline
+            offline_task = asyncio.create_task(offline.run_forever(), name="offline-service")
+
         yield
+        if offline is not None:
+            await offline.stop()
+        if offline_task is not None:
+            offline_task.cancel()
+            # Its outcome is read here, at shutdown, not lost to the GC.
+            for outcome in await asyncio.gather(offline_task, return_exceptions=True):
+                if isinstance(outcome, Exception):
+                    logger.warning("offline service task ended with %r", outcome)
         uplink_watch.cancel()
+        if extract_keeper is not None:
+            extract_keeper.cancel()
 
         if uplink is not None:
             await uplink.stop()
         await update_checker.stop()
         update_task.cancel()
         connect_watcher.cancel()
+        work_journal_service.set_active(None)
         await registry.disconnect_all()
 
     app = FastAPI(title="Handler Device Manager", version="0.5.23", lifespan=lifespan)
@@ -169,6 +231,10 @@ def create_app(config: dict) -> FastAPI:
     cors_origin_regex = config["server"].get("cors_origin_regex") or (
         r"^("
         r"https?://localhost(:\d+)?"
+        # PET-996 — the offline till is served from 127.0.0.1:9898 (it
+        # listens on IPv4 loopback only), and it prints through this
+        # manager; without this its preflight got 400 and nothing printed.
+        r"|https?://127\.0\.0\.1(:\d+)?"
         r"|capacitor://localhost"
         r"|https://[a-zA-Z0-9-]+\.(web\.app|firebaseapp\.com)"
         r"|https://([a-zA-Z0-9-]+\.)*barhandler\.com"
@@ -262,6 +328,15 @@ def create_app(config: dict) -> FastAPI:
         origin = request.headers.get("origin", "")
         if origin and not _LOCALHOST_ORIGIN_RE.match(origin):
             app.state.last_tenant_origin = origin
+        # Whether the app offers offline mode: decides the dashboard's button.
+        # Only from a caller holding the manager's key, as the device routes
+        # require: `/health` itself needs none, and the pages of other products
+        # or a stray caller must not switch the button on or off.
+        if request.headers.get("x-api-key") == api_key:
+            try:
+                offline_offer.note(request.headers)
+            except Exception:
+                pass
         # Preferred identity — explicit tenant headers from the PWA.
         tenant_id = (request.headers.get("x-tenant-id") or "").strip()
         if tenant_id:
@@ -352,5 +427,10 @@ def create_app(config: dict) -> FastAPI:
     app.include_router(drawer.router, prefix="/drawer", dependencies=[Depends(verify_key), Depends(guard_critical("/drawer"))])
     app.include_router(terminal.router, prefix="/terminal", dependencies=[Depends(verify_key), Depends(guard_critical("/terminal"))])
     app.include_router(system.router, prefix="/system", dependencies=[Depends(verify_key)])
+    # PET-972 — Petshandler offline mode: activation, state, switching off.
+    app.include_router(offline.router, prefix="/offline", dependencies=[Depends(verify_key)])
+    # PET-1087 — this station: its identifier, its work journal, the device
+    # settings the app keeps here.
+    app.include_router(station.router, prefix="/station", dependencies=[Depends(verify_key)])
 
     return app

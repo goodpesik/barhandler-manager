@@ -23,6 +23,11 @@ Thumbs.db
 # Runtime registry — per-machine printer/terminal assignments
 printers.json
 terminals.json
+# PET-1087 — the station's own data: its work journal and the device
+# settings the app keeps here.
+work-journal.jsonl
+app-settings.json
+offline-offer.json
 
 # CLI runtime — PID of the detached server (written by `python cli.py start`)
 bhm.pid
@@ -35,3 +40,7 @@ install_id.txt
 # 28-мегабайтним бінарником — саме те, чого в репо бути не має.
 dist/
 build/
+
+# PET-971 — the offline runtime is packed at build time; a dev copy lives here.
+/offline/
+/offline-runtime/

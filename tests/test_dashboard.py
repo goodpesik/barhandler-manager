@@ -112,3 +112,21 @@ def test_the_dashboard_shows_a_refusal_text_not_a_status_code() -> None:
     body = js.split("async function api(", 1)[1].split("\n  }", 1)[0]
     assert "detail.message" in body, "текст відмови не читається з detail.message"
     assert "res.status" in body, "фолбек на код відповіді має лишитись"
+
+
+def test_the_offline_modal_links_to_the_till_only_while_it_runs() -> None:
+    """PET-1055 — без цього заклад мусив би знати http://127.0.0.1:9898
+    напамʼять. А посилання на порт, де ніхто не слухає, відкрило б помилку
+    браузера, і це читається як «каса зламалась», а не «сервіс не працює»."""
+    src = _dashboard_js()
+    assert 'id="offline-open"' in src
+    assert 'open.href = "http://127.0.0.1:" + (svc.port || 9898) + "/";' in src
+    assert 'open.style.display = on && svc.running ? "" : "none";' in src
+    # A new tab, and one that cannot reach back into the dashboard.
+    assert 'id="offline-open" class="btn btn-default" target="_blank" rel="noopener"' in src
+    # And hidden before the state is asked for: a link left from the last
+    # time the window was open would point at a till we know nothing about,
+    # and the failure branch never touches it.
+    opened = src.split("async function openOfflineModal()", 1)[1]
+    before_try = opened.split("try {", 1)[0]
+    assert '$("offline-open").style.display = "none";' in before_try

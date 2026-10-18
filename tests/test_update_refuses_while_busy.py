@@ -156,6 +156,14 @@ GUARDED_ROUTERS: list[tuple[str, str]] = [
 # Роутери, яким охорона не потрібна: службові й читання стану.
 UNGUARDED_ROUTERS: frozenset[str] = frozenset({
     "health", "version", "dashboard", "devices", "system",
+    # PET-972 — offline-mode activation, state and switch-off: settings, not
+    # money or printing. The offline queue itself is part of busy_refusal.
+    "offline",
+    # PET-1087 — who this station is, what its devices did, and the device
+    # settings kept here: reading state and saving settings. An update that
+    # interrupts a settings save loses a save, not money — and the app saves
+    # again on the next change.
+    "station",
 })
 
 
@@ -632,7 +640,7 @@ async def test_a_dead_worker_does_not_block_updates_forever() -> None:
     # Воркер, який уже завершився, плюс джоб, що лишився в черзі.
     dev._worker_task = asyncio.create_task(asyncio.sleep(0))
     await dev._worker_task
-    await dev._queue.put((lambda _esc: None, asyncio.get_running_loop().create_future()))
+    await dev._queue.put((lambda _esc: None, asyncio.get_running_loop().create_future(), "receipt"))
 
     assert dev._queue.qsize() == 1, "передумова тесту не склалась"
     assert dev.pending_jobs() == 0, (
@@ -667,8 +675,14 @@ async def test_a_socket_error_wakes_the_jobs_still_queued_behind_it() -> None:
     async def _socket_dies(_esc):
         first_started.set()
         await may_fail.wait()
+
+    # BH-182 — the connection dies where it really can: while the bytes are
+    # written out. The job itself only builds them in memory (BH-168), and an
+    # OSError there is a render failure, not a lost printer.
+    def _write_fails(*_a, **_k):
         raise OSError("зʼєднання зникло")
 
+    dev._flush_blocking = _write_fails
     dev._worker_task = asyncio.create_task(dev._worker())
     doomed = asyncio.create_task(dev.enqueue(_socket_dies))
     await asyncio.wait_for(first_started.wait(), timeout=2)
@@ -680,7 +694,7 @@ async def test_a_socket_error_wakes_the_jobs_still_queued_behind_it() -> None:
     async def _never_runs(_esc):
         raise AssertionError("цей джоб не мав виконатись")
 
-    await dev._queue.put((_never_runs, behind))
+    await dev._queue.put((_never_runs, behind, "receipt"))
     assert dev._queue.qsize() == 1, "передумова тесту не склалась"
 
     may_fail.set()

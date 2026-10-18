@@ -22,6 +22,7 @@ from escpos.printer import Network, Usb
 from src.services.bitmap_render import dots_for, image_to_gs_v_0, render_paragraph
 from src.services.tspl_render import image_to_tspl_bitmap
 from src.services.encoding import encode_ua_cp866
+from src.services import work_journal
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +94,25 @@ def _settle_from(source: asyncio.Future, target: asyncio.Future) -> None:
     source.add_done_callback(_copy)
 
 
+class PrintRenderError(PrinterUnavailable):
+    """BH-182 — building the job's bytes failed; the printer was not touched.
+
+    Rendering runs before any socket write, but a font Pillow cannot open
+    raises OSError too — and the worker's OSError branch took it for a lost
+    connection: «socket error — marking disconnected», printer shown offline,
+    while the real cause (missing fonts) stayed out of the log.
+
+    Code «render_failed», so every route that already turns PrinterUnavailable
+    into a structured 503 hands it to the frontend too (found by review: the
+    /print routes caught only PrinterUnavailable, and a plain error would have
+    been a bare 500). The worker does not drop the connection for it: only its
+    OSError branch does that.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message, code="render_failed")
+
+
 class PrinterDevice:
     """A single ESC/POS printer (USB or network) with a FIFO job queue."""
 
@@ -100,7 +120,10 @@ class PrinterDevice:
         self.name = name
         self._config = config or {}
         self._printer = None
-        self._queue: "asyncio.Queue[tuple[Callable[[object], Awaitable[None]], asyncio.Future]]" = (
+        # PET-1087 — the action travels WITH the job: the worker is the only
+        # place that knows whether the paper came out, and it has to name what
+        # was printed in the journal row.
+        self._queue: "asyncio.Queue[tuple[Callable[[object], Awaitable[None]], asyncio.Future, str]]" = (
             asyncio.Queue()
         )
         self._worker_task: Optional[asyncio.Task] = None
@@ -357,6 +380,32 @@ class PrinterDevice:
     def _job_finished(self, _flush: asyncio.Future) -> None:
         self._job_in_flight = False
 
+    def _record_when_flushed(self, flush: asyncio.Future, action: str) -> None:
+        """PET-1087 — the row is written when the write itself ends.
+
+        A write running in the device thread cannot be cancelled; it finishes
+        on its own. So the journal waits for it rather than guessing.
+        """
+
+        def _row(done_flush: asyncio.Future) -> None:
+            # Called as soon as the write ends — and on the next pass of the
+            # loop when it has ended already.
+            if done_flush.cancelled():
+                work_journal.record_printer(
+                    self.name, action, work_journal.STATUS_CANCELLED,
+                )
+                return
+            exc = done_flush.exception()
+            if exc is not None:
+                work_journal.record_printer(
+                    self.name, action, work_journal.STATUS_FAILED,
+                    str(exc) or type(exc).__name__,
+                )
+                return
+            work_journal.record_printer(self.name, action, work_journal.STATUS_OK)
+
+        flush.add_done_callback(_row)
+
     def _close_late_handle(
         self, build: asyncio.Future, executor: Optional[ThreadPoolExecutor],
     ) -> None:
@@ -438,7 +487,7 @@ class PrinterDevice:
             with suppress(Exception):
                 reset()
 
-    def _fail_queued_jobs(self) -> None:
+    def _fail_queued_jobs(self, reason: str = "the printer is being reconfigured") -> None:
         """Розбудити всіх, хто чекає на джоби, які вже не виконаються.
 
         Знайдено ревʼю: скасований воркер лишав черзі невиконані елементи, а
@@ -447,9 +496,14 @@ class PrinterDevice:
         """
         while True:
             try:
-                _job, done = self._queue.get_nowait()
+                _job, done, action = self._queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
+            # PET-1087 — it will never print, and somebody is waiting for it:
+            # that belongs in the journal as much as a failure does.
+            work_journal.record_printer(
+                self.name, action, work_journal.STATUS_CANCELLED, reason,
+            )
             if not done.done():
                 done.set_exception(
                     PrinterUnavailable(
@@ -478,18 +532,35 @@ class PrinterDevice:
         queued = self._queue.qsize() if worker is not None and not worker.done() else 0
         return queued + (1 if self._job_in_flight else 0)
 
-    async def enqueue(self, job: Callable[[object], Awaitable[None]]):
+    async def enqueue(
+        self,
+        job: Callable[[object], Awaitable[None]],
+        *,
+        action: str = "print",
+    ):
         """Submit a job and wait until it has been executed by the worker.
 
         `job` is `async def fn(printer): ...` — it receives the live
         python-escpos printer instance and is free to issue any commands.
         Raises PrinterUnavailable if the device isn't connected.
+
+        PET-1087 — the journal row is written by the WORKER, not here. The
+        first version recorded the outcome around this `await`, and review
+        found it says the wrong thing in the commonest interruption: a client
+        that disconnects cancels THIS await, while the write to the printer is
+        shielded and finishes — the paper comes out and the row said
+        «cancelled». The worker sees the write itself, so that is where the
+        truth is. What stays here is the one case the worker never sees: a
+        printer that is not connected at all, so the job never reaches it.
         """
         if not self.is_connected():
+            work_journal.record_printer(
+                self.name, action, work_journal.STATUS_FAILED, "printer is not connected",
+            )
             raise PrinterUnavailable(f"{self.name} printer is not connected")
         loop = asyncio.get_running_loop()
         done: asyncio.Future = loop.create_future()
-        await self._queue.put((job, done))
+        await self._queue.put((job, done, action))
         return await done
 
     async def open_drawer(self) -> None:
@@ -501,7 +572,7 @@ class PrinterDevice:
         async def _job(printer):
             printer.cashdraw(pin)
 
-        await self.enqueue(_job)
+        await self.enqueue(_job, action="drawer")
 
     # ----- off-loop I/O (BH-168) ---------------------------------------
 
@@ -826,7 +897,7 @@ class PrinterDevice:
 
     async def _worker(self) -> None:
         while True:
-            job, done = await self._queue.get()
+            job, done, action = await self._queue.get()
             spooler = self._is_spooler()
             flush: Optional[asyncio.Future] = None
             self._job_in_flight = True
@@ -916,6 +987,14 @@ class PrinterDevice:
                         # до зливу — інакше він поїде окремим джобом або не
                         # поїде взагалі.
                         self._finalize_tspl()
+                    except OSError as exc:
+                        # BH-182 — nothing has been written to the printer yet:
+                        # this is a render failure, not a lost connection. That
+                        # holds only while every byte of a job goes through the
+                        # patched `_raw` (see `_buffered`): a job that queried
+                        # the device here (is_online, paper_status) would have a
+                        # real connection loss filed as a render failure.
+                        raise PrintRenderError(f"render failed: {exc}") from exc
                     finally:
                         self._reset_render_state()
 
@@ -924,6 +1003,9 @@ class PrinterDevice:
                 # таймаути й `GET /busy`, яке питають інсталятори.
                 flush = self._io(self._flush_blocking, printer, chunks, spooler)
                 await asyncio.shield(flush)
+                # PET-1087 — the paper is out: the row says so, whether or not
+                # anybody is still waiting for the answer.
+                work_journal.record_printer(self.name, action, work_journal.STATUS_OK)
                 if not done.done():
                     done.set_result(None)
             except OSError as exc:
@@ -931,6 +1013,9 @@ class PrinterDevice:
                 # Clear the handle so health() reports "unavailable" and
                 # the next print attempt triggers a fresh connect().
                 logger.warning("[%s] socket error — marking disconnected: %s", self.name, exc)
+                work_journal.record_printer(
+                    self.name, action, work_journal.STATUS_FAILED, str(exc) or "socket error",
+                )
                 # BH-168 — `close()` теж робота з залізом: у потоці пристрою,
                 # а не в циклі подій (доти саме тут він кликався з циклу).
                 dead, self._printer = self._printer, None
@@ -945,7 +1030,10 @@ class PrinterDevice:
                 # шлях лишився. З BH-164 ціна виросла: запит, що висить, тримає
                 # менеджер «зайнятим», тобто оновитись стало б неможливо аж до
                 # перезапуску — гірше за ваду, яку BH-164 і лікує.
-                self._fail_queued_jobs()
+                # Their own reason: these jobs did not print because the
+                # connection died, not because anybody reconfigured a printer
+                # (found by the second review round).
+                self._fail_queued_jobs("the printer's connection was lost")
                 return  # worker exits; registry.get_device() rebuilds on next print
             except asyncio.CancelledError:
                 # Знайдено ревʼю. Воркер скасовують, коли пристрій викидають
@@ -955,6 +1043,19 @@ class PrinterDevice:
                 # летів мовчки, і `done` не отримував НІЧОГО: HTTP-запит, що
                 # чекав на цей друк, висів до таймауту клієнта без жодної
                 # помилки. Розбудити того, хто чекає, і лише тоді падати далі.
+                # PET-1087 — the same reasoning as for the answer below: a
+                # write already in the device thread cannot be cancelled and
+                # will finish, so the row waits for it instead of claiming
+                # that nothing was printed.
+                if flush is not None:
+                    # Done and sound means the paper is already out, even
+                    # though the cancellation arrived before the row below.
+                    self._record_when_flushed(flush, action)
+                else:
+                    work_journal.record_printer(
+                        self.name, action, work_journal.STATUS_CANCELLED,
+                        "the printer is being reconfigured",
+                    )
                 if not done.done():
                     if flush is not None and not flush.done():
                         # BH-168, знайдено ревʼю: запис у потоці пристрою
@@ -972,6 +1073,10 @@ class PrinterDevice:
                 raise
             except Exception as exc:  # noqa: BLE001
                 logger.exception("[%s] print job failed", self.name)
+                work_journal.record_printer(
+                    self.name, action, work_journal.STATUS_FAILED,
+                    str(exc) or type(exc).__name__,
+                )
                 if not done.done():
                     done.set_exception(exc)
             finally:

@@ -1,0 +1,428 @@
+"""PET-972 — which shop is activated for offline mode on this machine.
+
+Activation comes from Petshandler itself: only a signed-in admin can get a
+device token from the server, so the online app takes one and hands it to the
+manager (POST /offline/activate). The manager then:
+
+* makes a fresh data key for the shop's local copy;
+* keeps the token and the key in a private file (offline_secrets);
+* writes the rest of the config — no secrets — to
+  APP_DIR/offline/<appid>/config.json, readable by this user only, through a
+  temporary file and a rename;
+* remembers which shop is active (APP_DIR/offline/active.json).
+
+The supervisor (offline_service) reads `current_config()` every time it
+starts the service, and restarts it when the config changes.
+
+A developer can still point BHM_OFFLINE_CONFIG_FILE at a full JSON config.
+"""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+import logging
+import os
+import re
+import secrets as pysecrets
+import shutil
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+from src.config import APP_DIR
+from src.services import offline_secrets
+from src.services.offline_service import DEFAULT_PRODUCT, PRODUCTS, runtime_dir
+
+log = logging.getLogger(__name__)
+
+#: A shop's appid and a device id: used in paths.
+# fullmatch everywhere: `$` also matches before a trailing newline.
+_SAFE_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+#: The server the token was issued by: https, /api, and a host on the
+#: product's own list (PRODUCTS[…].api_hosts).
+_API_BASE = re.compile(r"https://([A-Za-z0-9.-]+)/api/?")
+
+
+def offline_root() -> Path:
+    return APP_DIR / "offline"
+
+
+def shop_folder(appid: str) -> Path:
+    return offline_root() / appid
+
+
+class ActivationError(ValueError):
+    """What was sent cannot activate offline mode; the text is for a person."""
+
+
+def _write_json(path: Path, value: dict) -> None:
+    offline_secrets._write_private(path, json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8"))
+
+
+def active_appid() -> Optional[str]:
+    try:
+        raw = json.loads((offline_root() / "active.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    appid = raw.get("appid") if isinstance(raw, dict) else None
+    return appid if isinstance(appid, str) and _SAFE_ID.fullmatch(appid) else None
+
+
+def activate(payload: dict) -> dict:
+    """Store what the online app sent; returns the public part for the answer."""
+    # Which product's till this is (only Petshandler so far, see PRODUCTS).
+    product = str(payload.get("product") or DEFAULT_PRODUCT)
+    if product not in PRODUCTS:
+        raise ActivationError("Офлайн-режим для цього продукту не підтримується.")
+    appid = str(payload.get("appid") or "")
+    device_id = str(payload.get("deviceId") or "")
+    token = str(payload.get("deviceToken") or "")
+    api_base = str(payload.get("apiBase") or "")
+    if not _SAFE_ID.fullmatch(appid):
+        raise ActivationError("Некоректний ідентифікатор закладу.")
+    if not _SAFE_ID.fullmatch(device_id):
+        raise ActivationError("Некоректний ідентифікатор пристрою.")
+    if not token.startswith("pho_"):
+        raise ActivationError("Некоректний токен пристрою.")
+    api = _API_BASE.fullmatch(api_base)
+    if not api or api.group(1).lower() not in PRODUCTS[product].api_hosts:
+        raise ActivationError("Некоректна адреса сервера.")
+
+    folder = shop_folder(appid)
+    previous = active_appid()
+    if previous and previous != appid:
+        # One till, one shop: another shop's data may still hold operations
+        # that have not reached its server. Refusing is safer than guessing.
+        raise ActivationError(
+            "Офлайн-режим уже увімкнено для іншого закладу. Спершу вимкніть його там.",
+        )
+    # Read even when active.json was lost: the shop's own secrets file decides
+    # whether its data key still exists. A file that cannot be read now raises
+    # (SecretsUnreadable): the activation fails and nothing is moved aside.
+    old = offline_secrets.load(appid, folder)
+    # A re-activation (a new token) keeps the data key: the local copy was
+    # encrypted with it, and a new key would make it unreadable.
+    data_key = (old or {}).get("dataKey")
+    if not data_key:
+        data_key = base64.b64encode(pysecrets.token_bytes(32)).decode("ascii")
+        # A copy left from before (a switch-off that could not remove it all)
+        # was encrypted with a key that is gone: moved aside, never opened
+        # with the new one.
+        # Such folders are kept (not deleted: the lock that stopped the
+        # removal may still hold) and go with the shop's next full removal.
+        stale = folder / "data"
+        aside = folder / f"data.unreadable-{datetime.now(timezone.utc):%Y%m%dT%H%M%S%f}"
+        try:
+            stale.rename(aside)
+            log.warning("offline: shop %s had a local copy without its key, moved to %s", appid, aside.name)
+        except FileNotFoundError:
+            pass  # nothing left over — or a request sent twice already moved it
+    offline_secrets.save(appid, {"deviceToken": token, "dataKey": data_key}, folder)
+    config = {
+        "product": product,
+        "appid": appid,
+        "apiBase": api_base.rstrip("/"),
+        "deviceId": device_id,
+        "shopName": str(payload.get("shopName") or "")[:200],
+        "tokenExpiresAt": payload.get("expiresAt"),
+        "activatedAt": datetime.now(timezone.utc).isoformat(),
+    }
+    _write_json(folder / "config.json", config)
+    _write_json(offline_root() / "active.json", {"appid": appid})
+    log.info(
+        "offline mode activated for shop %s, device %s (%s)",
+        appid, device_id, "new token" if previous == appid else "first activation",
+    )
+    return {k: config[k] for k in ("product", "appid", "deviceId", "shopName", "tokenExpiresAt", "activatedAt")}
+
+
+def queued_on_disk(appid: str, timeout: float = 5, quiet: bool = False) -> Optional[int]:
+    """Operations still waiting for the server, read from the local copy itself.
+
+    For when the service is not running and cannot be asked — without its
+    secrets it never starts, and switching off must not depend on it. The
+    queue's status column is plain text (only the payload is sealed), so no
+    key is needed. None when the copy is there but cannot be read.
+
+    `quiet` leaves out the routine lines for callers that poll (the update
+    guard asks every few seconds); a copy that cannot be read is always logged.
+    """
+    path = shop_folder(appid) / "data" / "offline.sqlite"
+    try:
+        if not path.exists():
+            if not quiet:
+                log.info("offline: shop %s has no local copy, nothing queued", appid)
+            return 0
+        con = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=timeout)
+        try:
+            (n,) = con.execute("SELECT count(*) FROM outbox WHERE status = 'queued'").fetchone()
+        finally:
+            con.close()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            if not quiet:
+                log.info("offline: shop %s local copy has no queue yet", appid)
+            return 0
+        log.warning("offline: queue of shop %s unreadable on disk: %s", appid, e)
+        return None
+    except (sqlite3.DatabaseError, OSError, ValueError) as e:
+        log.warning("offline: queue of shop %s unreadable on disk: %s", appid, e)
+        return None
+    if not quiet or n:
+        log.info("offline: shop %s queue read from disk: %s waiting", appid, n)
+    return int(n)
+
+
+def check_can_deactivate(queued: Optional[int]) -> None:
+    """Refuse while operations made offline have not reached the server."""
+    if queued:
+        raise ActivationError(
+            f"Офлайн-операцій, що ще не надійшли на сервер: {queued}. "
+            "Вимкнення можливе після синхронізації.",
+        )
+    if queued is None:
+        raise ActivationError(
+            "Не вдалося перевірити чергу офлайн-операцій. Спробуйте ще раз.",
+        )
+
+
+def forget() -> Optional[str]:
+    """Switch offline mode off: the secrets and the active mark go. Returns the shop."""
+    appid = active_appid()
+    if not appid:
+        return None
+    offline_secrets.delete(appid, shop_folder(appid))
+    try:
+        (offline_root() / "active.json").unlink()
+    except FileNotFoundError:
+        pass
+    log.info("offline mode switched off for shop %s", appid)
+    return appid
+
+
+def remove_data(appid: str) -> None:
+    """The shop's local copy, once the service that held it has stopped."""
+    folder = shop_folder(appid)
+    shutil.rmtree(folder, ignore_errors=True)
+    if folder.exists():
+        log.error("offline data of shop %s could not be removed completely: %s", appid, folder)
+    else:
+        log.info("offline data of shop %s removed", appid)
+
+
+def current_config() -> Optional[dict]:
+    """The full config the service is started with, or None when not activated."""
+    path = os.environ.get("BHM_OFFLINE_CONFIG_FILE")
+    if path:
+        try:
+            cfg = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            log.warning("offline config %s unreadable: %s", path, e)
+            return None
+        return cfg if isinstance(cfg, dict) else None
+
+    appid = active_appid()
+    if not appid:
+        return None
+    folder = shop_folder(appid)
+    try:
+        stored = json.loads((folder / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        log.warning("offline config for shop %s unreadable: %s", appid, e)
+        return None
+    # A config without what the service needs is not activated — returned as
+    # None, not raised: an exception here would end the supervisor.
+    if not isinstance(stored, dict) or not stored.get("apiBase") or not stored.get("deviceId"):
+        log.warning("offline config for shop %s is incomplete: activate again from Petshandler", appid)
+        return None
+    # SecretsUnreadable goes up: «cannot read it now» is not «not activated»,
+    # and the supervisor keeps a running service on it.
+    kept = offline_secrets.load(appid, folder)
+    if not kept or not kept.get("deviceToken") or not kept.get("dataKey"):
+        log.warning("offline secrets for shop %s are missing: activate again from Petshandler", appid)
+        return None
+    return {
+        "appid": appid,
+        "apiBase": stored["apiBase"],
+        "deviceId": stored["deviceId"],
+        "deviceToken": kept["deviceToken"],
+        "dataKey": kept["dataKey"],
+        "dataDir": str(folder / "data"),
+        "staticDir": str(runtime_dir(stored.get("product") or DEFAULT_PRODUCT) / "app"),
+    }
+
+
+def public_status() -> dict:
+    """What the manager shows about activation; never the secrets."""
+    appid = active_appid()
+    if not appid:
+        return {"activated": False}
+    try:
+        stored = json.loads((shop_folder(appid) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        stored = {}
+    return {
+        "activated": True,
+        "product": stored.get("product") or DEFAULT_PRODUCT,
+        "appid": appid,
+        "shopName": stored.get("shopName") or "",
+        "deviceId": stored.get("deviceId"),
+        "tokenExpiresAt": stored.get("tokenExpiresAt"),
+        "activatedAt": stored.get("activatedAt"),
+    }
+
+
+# ---- PET-973: the online app's device settings, for the offline build ----
+
+#: A snapshot is a handful of short preferences; anything bigger is not one.
+LOCAL_SETTINGS_MAX_BYTES = 64 * 1024
+_SETTING_KEY = re.compile(r"[A-Za-z0-9_.:-]{1,100}")
+#: The manager's own address may only be this computer: the offline build
+#: sends every print and status call there (the app checks it again).
+_LOCAL_URL = re.compile(r"https?://(localhost|127\.0\.0\.1)(:\d{1,5})?/?")
+_VALUE_CHECKS = {"phm.manager.url": _LOCAL_URL}
+
+
+def save_local_settings(appid: str, items: object) -> dict:
+    """Keep what the online app sent for the offline build of the same shop.
+
+    Which keys go is decided by the app (an allow-list there: device and
+    printer settings, language, list views — never the session, the tenant or
+    temporary state). Here only the shape is checked.
+    """
+    active = active_appid()
+    if not active:
+        raise ActivationError("Офлайн-режим на цьому компʼютері не увімкнено.")
+    if appid != active:
+        raise ActivationError("Офлайн-режим на цьому компʼютері увімкнено для іншого закладу.")
+    if not isinstance(items, dict) or not all(
+        isinstance(k, str) and _SETTING_KEY.fullmatch(k) and isinstance(v, str) for k, v in items.items()
+    ):
+        raise ActivationError("Некоректні налаштування.")
+    for key, check in _VALUE_CHECKS.items():
+        if key in items and not check.fullmatch(items[key]):
+            raise ActivationError("Некоректні налаштування.")
+    # A new id when the settings changed: the offline build applies a snapshot
+    # it has not applied yet, not «a later time» (the till's clock can jump
+    # back). The same settings again keep their id, so an online reload does
+    # not undo what was changed offline.
+    previous = load_local_settings()
+    same = previous is not None and previous.get("items") == items and isinstance(previous.get("id"), str)
+    body = {
+        "id": previous["id"] if same else uuid.uuid4().hex,
+        "savedAt": datetime.now(timezone.utc).isoformat(),
+        "items": items,
+    }
+    raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    if len(raw) > LOCAL_SETTINGS_MAX_BYTES:
+        raise ActivationError("Налаштування завеликі.")
+    offline_secrets._write_private(shop_folder(appid) / "local-settings.json", raw)
+    log.info("offline: %d browser settings kept for shop %s", len(items), appid)
+    return {"id": body["id"], "savedAt": body["savedAt"], "count": len(items)}
+
+
+#: A key container is a few kilobytes; anything beyond this is not one.
+FISCAL_KEY_MAX_BYTES = 1024 * 1024
+#: What a file dropped into the fiscal-keys folder may be called.
+_KEY_FILE_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+def fiscal_keys_folder(appid: str) -> Path:
+    """Where the key containers of a shop's offline registers are kept.
+
+    OUTSIDE the shop's own folder, and that is the whole point: switching
+    offline mode off removes the local copy and everything beside it
+    (`remove_data`), while a key container has to outlive it — a shop that
+    switches offline mode off and on again would otherwise be left with
+    registers whose settings name a file that is no longer there, and nothing
+    to sign a receipt with in the first shop without internet (found by the
+    second review round).
+    """
+    return offline_root() / "fiscal-keys" / appid
+
+
+def _safe_key_name(file_name: str) -> str:
+    """The name the file is kept under: its own, with nothing of a path in it.
+
+    The browser sends whatever the person picked, and a name is not a path:
+    `..`, a slash or a backslash would put the container anywhere on the disk.
+    Everything outside the allowed set becomes an underscore, and a name left
+    with nothing is refused instead of invented.
+
+    The extension is kept when the name has to be cut: a name of seventy
+    characters would otherwise lose its `.dat` and stop looking like what it is.
+    """
+    bare = str(file_name or "").replace("\\", "/").rsplit("/", 1)[-1].strip()
+    cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", bare).lstrip(".")
+    if len(cleaned) > 48:
+        stem, dot, ext = cleaned.rpartition(".")
+        cleaned = (stem[: 48 - len(ext) - 1] + dot + ext) if dot and len(ext) <= 8 else cleaned[:48]
+    if not cleaned or not _KEY_FILE_NAME.fullmatch(cleaned):
+        raise ActivationError("Некоректна назва файла ключа.")
+    return cleaned
+
+
+def save_fiscal_key(appid: str, file_name: str, content_base64: str) -> dict:
+    """PET-1088 — keep an uploaded key container (or its certificate) on this machine.
+
+    The offline service signs with a file that lives on the shop's own
+    computer, so the person uploads it here instead of typing a path they have
+    to find in a file manager. The manager is the one that keeps it: its folder
+    outlives the service's data, which goes when offline mode is switched off.
+
+    The file is written like every other private file of ours — through a
+    temporary file and a rename, readable by this user only — and the answer is
+    the path the offline register settings then carry.
+    """
+    active = active_appid()
+    if not active:
+        raise ActivationError("Офлайн-режим на цьому компʼютері не увімкнено.")
+    if appid != active:
+        raise ActivationError("Офлайн-режим на цьому компʼютері увімкнено для іншого закладу.")
+    name = _safe_key_name(file_name)
+    raw = str(content_base64 or "")
+    # Four base64 characters carry three bytes: a body too big to be a
+    # container is refused before it is decoded into memory.
+    if len(raw) > (FISCAL_KEY_MAX_BYTES // 3 + 1) * 4 + 4:
+        raise ActivationError("Файл завеликий для ключа.")
+    try:
+        data = base64.b64decode(raw, validate=True)
+    except (ValueError, TypeError):
+        raise ActivationError("Файл не вдалося прочитати.")
+    if not data:
+        raise ActivationError("Файл порожній.")
+    if len(data) > FISCAL_KEY_MAX_BYTES:
+        raise ActivationError("Файл завеликий для ключа.")
+    """THE CONTENT NAMES THE FILE, NOT THE NAME THE BROWSER SENT.
+
+    Every shop's container is called `Key-6.dat`, so two registers of one shop
+    upload two different keys under one name — and the second silently replaced
+    the first, leaving register A signing with register B's key (found by the
+    second review round). The digest of the content goes in front of the name:
+    two different containers cannot meet, and the same one uploaded twice lands
+    on itself, which costs nothing.
+    """
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    name = f"{digest}-{name}"
+    path = fiscal_keys_folder(appid) / name
+    offline_secrets._write_private(path, data)
+    # The name is in the log and the content never is: a key container is the
+    # right to sign fiscal documents.
+    log.info("offline: fiscal key file %s kept for shop %s (%d bytes)", name, appid, len(data))
+    return {"path": str(path), "name": name, "bytes": len(data)}
+
+
+def load_local_settings() -> Optional[dict]:
+    """The active shop's snapshot: {savedAt, items}, or None."""
+    appid = active_appid()
+    if not appid:
+        return None
+    try:
+        body = json.loads((shop_folder(appid) / "local-settings.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return body if isinstance(body, dict) and isinstance(body.get("items"), dict) else None

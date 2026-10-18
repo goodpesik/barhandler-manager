@@ -28,6 +28,7 @@ from src.models.terminal import (
     TerminalKind,
     TerminalRegistrationRequest,
 )
+from src.services import work_journal
 from src.services.terminals.base import TerminalUnavailable
 
 
@@ -107,6 +108,97 @@ def _surface_terminal_error(exc: TerminalUnavailable) -> HTTPException:
 # ---------------------------------------------------------------------------
 # Discovery + registration
 # ---------------------------------------------------------------------------
+
+
+
+def _journal_operation(
+    terminal_id: str,
+    action: str,
+    amount_kopecks: int,
+    *,
+    result=None,
+    error: Optional[str] = None,
+) -> None:
+    """PET-1087 — one card operation, as the shop will read it: the sum, and
+    whether the money moved. Written after the terminal has answered, and the
+    journal keeps its own failures to itself — a row is not worth a payment.
+
+    A refusal by the card has its own status, `declined`: it is not a broken
+    device, and a shop reading «failed» would go looking for one. Review found
+    the first version filing every non-ok answer as a failure, which is the
+    very confusion this journal exists to end.
+    """
+    if result is not None:
+        # A `declined` from an adapter is not always the card saying no: ours
+        # fold a timeout and an unexpected answer into the same word (ssi:
+        # «everything else (decline / error / timeout) → declined»). So the
+        # journal asks whether the TERMINAL SPOKE — a response code or the
+        # protocol's own verbatim result means it did, and then the refusal is
+        # the card's. Without either, nobody refused anything and the row says
+        # `failed` (found by the second review round).
+        spoke = bool(result.response_code or result.raw_transaction_result)
+        status = (
+            work_journal.STATUS_OK
+            if result.status == "ok"
+            else work_journal.STATUS_CANCELLED
+            if result.status == "cancelled"
+            else work_journal.STATUS_DECLINED
+            if result.status == "declined" and spoke
+            else work_journal.STATUS_FAILED
+        )
+        # The bank's code is what anybody sorting this out with the bank will
+        # be asked for, so it stays beside the words.
+        parts = [p for p in (result.error_message, result.error_code) if p]
+        detail = " · ".join(parts) or (None if result.status == "ok" else result.status)
+    else:
+        status = work_journal.STATUS_FAILED
+        detail = error
+    work_journal.record_terminal(
+        terminal_id, action, status, amount_kopecks=amount_kopecks, detail=detail,
+    )
+
+
+class _Operation:
+    """PET-1087 — one row per attempt, whatever happens to the request.
+
+    Review found the holes: `CancelledError` is a BaseException (the cashier's
+    browser closes mid-payment) and an `HTTPException` raised inside an adapter
+    is re-raised untouched — both left a card operation that may well have
+    gone through with no row at all. So the row is written in a `finally`, and
+    this little object remembers whether one was written already.
+    """
+
+    def __init__(self, terminal_id: str, action: str, amount_kopecks: int) -> None:
+        self.terminal_id = terminal_id
+        self.action = action
+        self.amount_kopecks = amount_kopecks
+        self.recorded = False
+
+    def done(self, result) -> None:
+        _journal_operation(self.terminal_id, self.action, self.amount_kopecks, result=result)
+        self.recorded = True
+
+    def failed(self, error: Optional[str]) -> None:
+        _journal_operation(self.terminal_id, self.action, self.amount_kopecks, error=error)
+        self.recorded = True
+
+    def unfinished(self) -> None:
+        """Nothing answered and nothing was recorded — say exactly that.
+
+        The status is `unknown`, not `failed`: the money may well have moved,
+        and «failed» would be a guess that is wrong half the time (second
+        review round). The bank's own records settle it, and the row tells the
+        shop where to look.
+        """
+        if self.recorded:
+            return
+        work_journal.record_terminal(
+            self.terminal_id,
+            self.action,
+            work_journal.STATUS_UNKNOWN,
+            amount_kopecks=self.amount_kopecks,
+            detail="the request ended without an answer from the terminal",
+        )
 
 
 @router.post("/discover")
@@ -316,24 +408,38 @@ async def charge(
         used_id,
         payload.model_dump_json(),
     )
+    operation = _Operation(used_id, work_journal.ACTION_SALE, payload.amount_kopecks)
     try:
-        result = await adapter.charge(payload)
-    except TerminalUnavailable as exc:
-        log.warning("[charge] terminal=%s TerminalUnavailable code=%s msg=%s", used_id, getattr(exc, "code", None), exc)
-        raise _surface_terminal_error(exc)
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001 — surface root cause instead of bare 500
-        log.exception("[charge] terminal=%s unhandled error: %s", used_id, exc)
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "code": "internal_error",
-                "message": f"{type(exc).__name__}: {exc}",
-            },
-        )
-    log.info("[charge] terminal=%s result=%s", used_id, result.model_dump_json())
-    return {"terminal_id": used_id, "result": result.model_dump()}
+        try:
+            result = await adapter.charge(payload)
+        except TerminalUnavailable as exc:
+            log.warning(
+                "[charge] terminal=%s TerminalUnavailable code=%s msg=%s",
+                used_id, getattr(exc, "code", None), exc,
+            )
+            operation.failed(str(exc) or getattr(exc, "code", None))
+            raise _surface_terminal_error(exc)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001 — surface root cause instead of bare 500
+            log.exception("[charge] terminal=%s unhandled error: %s", used_id, exc)
+            operation.failed(f"{type(exc).__name__}: {exc}")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "internal_error",
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            )
+        log.info("[charge] terminal=%s result=%s", used_id, result.model_dump_json())
+        operation.done(result)
+        return {"terminal_id": used_id, "result": result.model_dump()}
+    finally:
+        # Nothing answered and nothing was recorded: a cancelled request (the
+        # cashier's browser closed mid-payment) or an HTTPException raised
+        # inside the adapter. The money may have moved, so the attempt is in
+        # the journal either way.
+        operation.unfinished()
 
 
 @router.post("/refund")
@@ -360,27 +466,38 @@ async def refund(
     log.info(
         "[refund] terminal=%s payload=%s", used_id, payload.model_dump_json(),
     )
+    operation = _Operation(used_id, work_journal.ACTION_REFUND, payload.amount_kopecks)
     try:
-        result = await adapter.refund(payload)
-    except TerminalUnavailable as exc:
-        log.warning(
-            "[refund] terminal=%s TerminalUnavailable code=%s msg=%s",
-            used_id, getattr(exc, "code", None), exc,
-        )
-        raise _surface_terminal_error(exc)
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001 — surface root cause instead of bare 500
-        log.exception("[refund] terminal=%s unhandled error: %s", used_id, exc)
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "code": "internal_error",
-                "message": f"{type(exc).__name__}: {exc}",
-            },
-        )
-    log.info("[refund] terminal=%s result=%s", used_id, result.model_dump_json())
-    return {"terminal_id": used_id, "result": result.model_dump()}
+        try:
+            result = await adapter.refund(payload)
+        except TerminalUnavailable as exc:
+            log.warning(
+                "[refund] terminal=%s TerminalUnavailable code=%s msg=%s",
+                used_id, getattr(exc, "code", None), exc,
+            )
+            operation.failed(str(exc) or getattr(exc, "code", None))
+            raise _surface_terminal_error(exc)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001 — surface root cause instead of bare 500
+            log.exception("[refund] terminal=%s unhandled error: %s", used_id, exc)
+            operation.failed(f"{type(exc).__name__}: {exc}")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "internal_error",
+                    "message": f"{type(exc).__name__}: {exc}",
+                },
+            )
+        log.info("[refund] terminal=%s result=%s", used_id, result.model_dump_json())
+        operation.done(result)
+        return {"terminal_id": used_id, "result": result.model_dump()}
+    finally:
+        # Nothing answered and nothing was recorded: a cancelled request (the
+        # cashier's browser closed mid-payment) or an HTTPException raised
+        # inside the adapter. The money may have moved, so the attempt is in
+        # the journal either way.
+        operation.unfinished()
 
 
 @router.post("/{terminal_id}/cancel")

@@ -151,6 +151,8 @@ try {
     foreach ($p in $procs) {
         Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
     }
+    # PET-971 — the offline service the manager runs (Node, its own name).
+    Stop-Process -Name "device-handler-offline" -Force -ErrorAction SilentlyContinue
 } catch {}
 # Wait for port 9999 to actually free (health stops answering) before we
 # start the new one — up to ~15s for uvicorn's graceful shutdown.

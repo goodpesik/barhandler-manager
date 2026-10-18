@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 
+from src.devices.printer import PrinterUnavailable
 from src.devices.registry import UnknownPrinter
 from src.models.printer import (
     PrintProtocol,
@@ -163,6 +164,11 @@ def _discovery_warnings() -> list[dict]:
             })
     return warnings
 
+
+
+def _printer_detail(exc: PrinterUnavailable) -> dict:
+    """The same 503 body as /print/*, so the frontend reads one shape."""
+    return {"code": getattr(exc, "code", "unavailable"), "message": str(exc)}
 
 @router.post("/discover")
 async def discover(request: Request) -> dict:
@@ -327,7 +333,12 @@ async def probe_codepage(printer_id: str, request: Request) -> dict:
         esc.cut()
 
     try:
-        await device.enqueue(_job)
+        await device.enqueue(_job, action="codepage-probe")
+    except PrinterUnavailable as exc:
+        # BH-183 — keep the code, as /print/* does: a plain-string detail
+        # left the test print showing a generic failure for paper, cover or
+        # render problems.
+        raise HTTPException(status_code=503, detail=_printer_detail(exc))
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     return {"status": "printed", "tables_tried": [{"codec": c, "table": t} for c, t in _CYR_TABLES]}
@@ -397,7 +408,9 @@ async def test_print(printer_id: str, request: Request) -> dict:
             esc._raw(blob)
 
         try:
-            await device.enqueue(_tspl_job)
+            await device.enqueue(_tspl_job, action="test-print")
+        except PrinterUnavailable as exc:
+            raise HTTPException(status_code=503, detail=_printer_detail(exc))
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc))
         return {
@@ -450,7 +463,12 @@ async def test_print(printer_id: str, request: Request) -> dict:
         esc.cut()
 
     try:
-        await device.enqueue(_job)
+        await device.enqueue(_job, action="test-print")
+    except PrinterUnavailable as exc:
+        # BH-183 — keep the code, as /print/* does: a plain-string detail
+        # left the test print showing a generic failure for paper, cover or
+        # render problems.
+        raise HTTPException(status_code=503, detail=_printer_detail(exc))
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc))
     return {

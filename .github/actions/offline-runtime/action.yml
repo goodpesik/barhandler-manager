@@ -1,0 +1,69 @@
+# PET-971 — builds the Petshandler offline runtime for an installer:
+# the offline service (goodpesik/petshandler-offline), the offline build of
+# the app (goodpesik/petshandler-app) and the official Node binary, laid out
+# by scripts/build_offline_runtime.sh into <out>.
+#
+# Needs two secrets from the calling job:
+#   OFFLINE_REPO_TOKEN   read access to both private repos
+#   PETSHANDLER_APP_ENV  the app's .env, base64 (the build needs its VITE_* values)
+# The jobs call this only when OFFLINE_REPO_TOKEN is set, so a release without
+# them builds exactly as before, with no offline mode.
+name: offline-runtime
+description: Build the Petshandler offline runtime for the installers
+inputs:
+  platform:
+    description: win-x64 | darwin-arm64 | darwin-x64
+    required: true
+  out:
+    description: where to lay it out (e.g. offline-runtime/petshandler)
+    required: true
+  token:
+    description: read access to the two private repos
+    required: true
+  app-env:
+    description: the app's .env, base64
+    required: true
+  app-ref:
+    description: which ref of petshandler-app to build the offline app from
+    required: false
+    default: production
+  service-ref:
+    description: which ref of petshandler-offline to build
+    required: false
+    default: main
+runs:
+  using: composite
+  steps:
+    - uses: actions/checkout@v4
+      with:
+        repository: goodpesik/petshandler-offline
+        ref: ${{ inputs.service-ref }}
+        token: ${{ inputs.token }}
+        path: .offline-src/service
+    - uses: actions/checkout@v4
+      with:
+        repository: goodpesik/petshandler-app
+        ref: ${{ inputs.app-ref }}
+        token: ${{ inputs.token }}
+        path: .offline-src/app
+    - uses: actions/setup-node@v4
+      with:
+        node-version: "22"
+    - name: Build the offline service and the offline app
+      shell: bash
+      env:
+        APP_ENV: ${{ inputs.app-env }}
+      run: |
+        set -euo pipefail
+        (cd .offline-src/service && npm ci && npm run build)
+        printf '%s' "$APP_ENV" | base64 --decode > .offline-src/app/.env
+        (cd .offline-src/app && npm ci && npm run build:offline)
+        rm -f .offline-src/app/.env
+    - name: Lay out the runtime
+      shell: bash
+      env:
+        # The Node the service is developed and tested with (node:sqlite).
+        NODE_VERSION: v22.22.3
+      run: |
+        bash scripts/build_offline_runtime.sh "${{ inputs.platform }}" "${{ inputs.out }}" \
+          .offline-src/service .offline-src/app/dist-offline
