@@ -198,7 +198,7 @@ def create_app(config: dict) -> FastAPI:
         work_journal_service.set_active(None)
         await registry.disconnect_all()
 
-    app = FastAPI(title="Handler Device Manager", version="0.5.0", lifespan=lifespan)
+    app = FastAPI(title="Handler Device Manager", version="0.5.23", lifespan=lifespan)
 
     # CORS — the browser drives this service directly from the
     # BarHandler/FitStudio web apps (and from any future local web UI).
