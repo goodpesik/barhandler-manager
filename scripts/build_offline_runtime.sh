@@ -43,10 +43,14 @@ curl -fsSL "$BASE/$NODE_VERSION/SHASUMS256.txt" -o "$WORK/SHASUMS256.txt"
 curl -fsSL "$BASE/$NODE_VERSION/$ARCHIVE" -o "$WORK/$ARCHIVE"
 EXPECTED="$(awk -v f="$ARCHIVE" '$2 == f { print $1 }' "$WORK/SHASUMS256.txt")"
 [ -n "$EXPECTED" ] || { echo "::error::$ARCHIVE is not in SHASUMS256.txt"; exit 1; }
+# From stdin, not by name: on the Windows runner the path is D:\a\_temp/...,
+# and GNU sha256sum escapes a name with backslashes by putting a "\" before
+# the hash, so the line never matched SHASUMS256.txt (the 1.0.0 Windows build
+# failed on exactly that).
 if command -v sha256sum >/dev/null 2>&1; then
-  ACTUAL="$(sha256sum "$WORK/$ARCHIVE" | awk '{print $1}')"
+  ACTUAL="$(sha256sum < "$WORK/$ARCHIVE" | awk '{print $1}')"
 else
-  ACTUAL="$(shasum -a 256 "$WORK/$ARCHIVE" | awk '{print $1}')"
+  ACTUAL="$(shasum -a 256 < "$WORK/$ARCHIVE" | awk '{print $1}')"
 fi
 [ "$EXPECTED" = "$ACTUAL" ] || { echo "::error::checksum mismatch for $ARCHIVE"; exit 1; }
 
