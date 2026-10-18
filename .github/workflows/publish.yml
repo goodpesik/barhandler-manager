@@ -104,8 +104,17 @@ jobs:
           chmod +x dist/install.sh dist/install-android.sh
 
       - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          PREV_TAG=$(git tag --sort=-creatordate | head -n1)
+          # From the last PUBLISHED release, not the newest tag: a release whose
+          # build failed stays a draft with its tag pushed, and counting from
+          # that tag would leave its commits out of every public note.
+          PREV_TAG=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          if [ -z "$PREV_TAG" ]; then
+            echo "::warning::no published release found through gh — the notes start from the newest tag"
+            PREV_TAG=$(git tag --sort=-creatordate | head -n1)
+          fi
           if [ -z "$PREV_TAG" ]; then
             RANGE=HEAD
           else
@@ -156,7 +165,12 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
           body_path: dist/notes.md
-          draft: false
+          # A DRAFT until every installer is attached (`publish-release`
+          # below). Installed managers ask /releases/latest for an update and
+          # the install scripts download from it; a published release whose
+          # Windows or macOS build was still running (or had failed) offered
+          # them a version with no installer behind it.
+          draft: true
           prerelease: false
           files: |
             dist/barhandler-manager-${{ steps.version.outputs.version }}.tar.gz
@@ -227,15 +241,18 @@ jobs:
           Copy-Item dist\bhm.exe dist\device-handler.exe
           Copy-Item dist\barhandler-setup.exe dist\device-handler-setup.exe
 
+      # `gh release upload`, like the macOS jobs: the release is still a draft
+      # here, and it is found by its tag only through the API that sees drafts.
       - name: Attach exe + installer to the release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ needs.release.outputs.tag }}
-          files: |
-            dist/device-handler.exe
-            dist/device-handler-setup.exe
-            dist/bhm.exe
-            dist/barhandler-setup.exe
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ needs.release.outputs.tag }}" \
+            dist/device-handler.exe \
+            dist/device-handler-setup.exe \
+            dist/bhm.exe \
+            dist/barhandler-setup.exe --clobber --repo "${{ github.repository }}"
 
   # Build the macOS .app on mac runners, wrap it in a .pkg installer and attach
   # it to the same release. TWO artifacts, not one: PyInstaller freezes for the
@@ -336,3 +353,18 @@ jobs:
         run: |
           gh release upload "${{ needs.release.outputs.tag }}" \
             "dist/device-handler-${{ matrix.arch }}.pkg" --clobber
+
+  # The release goes public only now, with every installer on it. Until then it
+  # is a draft: /releases/latest (the in-app update check, the install
+  # scripts) keeps pointing at the previous version. A failed build leaves the
+  # draft as it is — nothing half-built is ever offered.
+  publish-release:
+    needs: [release, build-windows-exe, build-macos-app]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${{ needs.release.outputs.tag }}" \
+            --repo "${{ github.repository }}" --draft=false --latest
