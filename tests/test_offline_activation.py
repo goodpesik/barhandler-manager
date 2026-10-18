@@ -865,3 +865,69 @@ def test_a_key_bigger_than_a_container_is_refused(client_for, home):
     )
     assert r.status_code == 400, r.text
 
+
+# ---- whether the client app offers offline mode at all ----------------------
+#
+# Offline mode is off on Petshandler's production for now, and the dashboard
+# must not show it there. The app says with every request whether it offers the
+# mode; the manager keeps the last word.
+
+
+def test_offline_is_not_offered_until_the_app_says_so(client_for):
+    c = client_for(FakeService(0))
+    assert c.get("/offline/status", headers=KEY).json()["offered"] is False
+
+
+def test_the_app_saying_it_offers_offline_is_remembered(client_for):
+    c = client_for(FakeService(0))
+    c.get("/health", headers={**KEY, "X-Offline-Offered": "1"})
+    assert c.get("/offline/status", headers=KEY).json()["offered"] is True
+    # A request without the header (another product, an older app) changes nothing.
+    c.get("/health", headers=KEY)
+    assert c.get("/offline/status", headers=KEY).json()["offered"] is True
+    # The app stopped offering it.
+    c.get("/health", headers={**KEY, "X-Offline-Offered": "0"})
+    assert c.get("/offline/status", headers=KEY).json()["offered"] is False
+
+
+def test_a_caller_without_the_key_is_not_listened_to(client_for):
+    c = client_for(FakeService(0))
+    c.get("/health", headers={"X-Offline-Offered": "1"})
+    c.get("/health", headers={"X-Api-Key": "wrong", "X-Offline-Offered": "1"})
+    assert c.get("/offline/status", headers=KEY).json()["offered"] is False
+
+
+def _no_discovery():
+    return (
+        patch("src.devices.scan.discover_usb", return_value=[]),
+        patch("src.devices.scan.discover_network", return_value=[]),
+        patch("src.devices.scan.discover_bluetooth", return_value=[]),
+    )
+
+
+def test_the_last_word_survives_a_restart(config, monkeypatch, home):
+    a, b, c3 = _no_discovery()
+    with a, b, c3:
+        with _client(config, monkeypatch, FakeService(0)) as c:
+            c.get("/health", headers={**KEY, "X-Offline-Offered": "1"})
+        with _client(config, monkeypatch, FakeService(0)) as c:
+            assert c.get("/offline/status", headers=KEY).json()["offered"] is True
+
+
+def test_a_broken_offer_file_keeps_offline_hidden(config, monkeypatch, home):
+    Path(config["server"]["offline_offer_path"]).write_text("{not json", encoding="utf-8")
+    a, b, c3 = _no_discovery()
+    with a, b, c3:
+        with _client(config, monkeypatch, FakeService(0)) as c:
+            assert c.get("/offline/status", headers=KEY).json()["offered"] is False
+
+
+def test_only_one_or_zero_is_a_word():
+    from src.services.offline_offer import parse_header
+    assert parse_header("1") is True
+    assert parse_header("true") is True
+    assert parse_header("0") is False
+    assert parse_header("") is None
+    assert parse_header("yes") is None
+    assert parse_header(None) is None
+

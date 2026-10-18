@@ -25,12 +25,21 @@ def _service(request: Request) -> Optional[OfflineService]:
     return getattr(request.app.state, "offline_service", None)
 
 
+def _offered(request: Request) -> bool:
+    offer = getattr(request.app.state, "offline_offer", None)
+    return bool(offer is not None and offer.offered())
+
+
 @router.get("/status")
 async def status(request: Request) -> dict:
     svc = _service(request)
     result: dict = {
         # A build without the Node runtime cannot run offline mode at all.
         "available": svc is not None,
+        # Whether the client app offers offline mode at all (off on
+        # Petshandler's production for now). The dashboard shows the mode
+        # only when it does, or when it is already on here.
+        "offered": _offered(request),
         **offline_state.public_status(),
     }
     if svc is not None:

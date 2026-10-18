@@ -27,6 +27,7 @@ terminals.json
 # settings the app keeps here.
 work-journal.jsonl
 app-settings.json
+offline-offer.json
 
 # CLI runtime — PID of the detached server (written by `python cli.py start`)
 bhm.pid

@@ -1486,7 +1486,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
   async function refreshOfflineButton() {
     try {
       const st = await api("GET", "/offline/status", true);
-      if (st && st.available) $("btn-offline").style.display = "";
+      /* Only when the client app offers offline mode (it is off on
+         Petshandler's production for now), or when it is already on here and
+         has to stay reachable to be looked at or switched off. */
+      $("btn-offline").style.display =
+        st && st.available && (st.offered || st.activated) ? "" : "none";
     } catch (_) {}
   }
 

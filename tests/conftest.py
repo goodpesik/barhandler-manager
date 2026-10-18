@@ -51,6 +51,8 @@ def config(tmp_registry: Path, tmp_terminal_registry: Path, tmp_path: Path) -> d
             # folder, and a test has no business writing there.
             "journal_path": str(tmp_path / "work-journal.json"),
             "station_settings_path": str(tmp_path / "app-settings.json"),
+            # Whether the client app offers offline mode — per test too.
+            "offline_offer_path": str(tmp_path / "offline-offer.json"),
         },
     }
 

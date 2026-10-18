@@ -24,6 +24,7 @@ from src.routes import (
 )
 from src.services.busy import BusyTracker, guard_critical
 from src.services.station_settings import StationSettings
+from src.services.offline_offer import OfflineOffer
 from src.services import work_journal as work_journal_service
 from src.services.work_journal import WorkJournal
 from src.services.update_check import UpdateChecker
@@ -53,6 +54,11 @@ def create_app(config: dict) -> FastAPI:
     )
     station_settings = StationSettings(
         path=Path(config["server"].get("station_settings_path", APP_DIR / "app-settings.json")),
+    )
+    # Whether the client app offers offline mode (it is off on Petshandler's
+    # production for now); the dashboard shows the mode only when it does.
+    offline_offer = OfflineOffer(
+        path=Path(config["server"].get("offline_offer_path", APP_DIR / "offline-offer.json")),
     )
 
     async def _printer_connect_watcher() -> None:
@@ -93,8 +99,10 @@ def create_app(config: dict) -> FastAPI:
         terminal_registry.load()
         app.state.work_journal = journal
         app.state.station_settings = station_settings
+        app.state.offline_offer = offline_offer
         journal.load()
         station_settings.load()
+        offline_offer.load()
         # The device layer records through the module singleton, so it does not
         # have to be handed the journal down every call path.
         work_journal_service.set_active(journal)
@@ -320,6 +328,15 @@ def create_app(config: dict) -> FastAPI:
         origin = request.headers.get("origin", "")
         if origin and not _LOCALHOST_ORIGIN_RE.match(origin):
             app.state.last_tenant_origin = origin
+        # Whether the app offers offline mode: decides the dashboard's button.
+        # Only from a caller holding the manager's key, as the device routes
+        # require: `/health` itself needs none, and the pages of other products
+        # or a stray caller must not switch the button on or off.
+        if request.headers.get("x-api-key") == api_key:
+            try:
+                offline_offer.note(request.headers)
+            except Exception:
+                pass
         # Preferred identity — explicit tenant headers from the PWA.
         tenant_id = (request.headers.get("x-tenant-id") or "").strip()
         if tenant_id:
