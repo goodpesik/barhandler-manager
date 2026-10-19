@@ -51,6 +51,11 @@ def _inputs(tmp: Path) -> tuple[Path, Path]:
     service = tmp / "service"
     (service / "dist").mkdir(parents=True)
     (service / "dist" / "main.js").write_text("console.log('service')")
+    # What the service's build lays beside main.js and loads from there.
+    (service / "dist" / "vendor" / "dstu").mkdir(parents=True)
+    (service / "dist" / "vendor" / "dstu" / "bundle.cjs").write_text("module.exports = {}")
+    (service / "dist" / "certs").mkdir()
+    (service / "dist" / "certs" / "tax.cer").write_bytes(b"\x30\x82")
     (service / "package.json").write_text('{\n  "name": "petshandler-offline",\n  "version": "0.3.1"\n}\n')
     app = tmp / "app"
     (app / "assets").mkdir(parents=True)
@@ -78,6 +83,9 @@ def test_lays_out_node_the_service_and_the_app(tmp_path, platform, binary):
     out = tmp_path / "out"
     assert (out / binary).is_file()
     assert (out / "service" / "main.js").read_text() == "console.log('service')"
+    # Without these the service starts and then cannot sign or look up a register.
+    assert (out / "service" / "vendor" / "dstu" / "bundle.cjs").read_text() == "module.exports = {}"
+    assert (out / "service" / "certs" / "tax.cer").read_bytes() == b"\x30\x82"
     # The manager checks /health for exactly this.
     assert (out / "service" / "version.txt").read_text().strip() == "0.3.1"
     assert (out / "app" / "index.html").is_file() and (out / "app" / "assets" / "a.js").is_file()
