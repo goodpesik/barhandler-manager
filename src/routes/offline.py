@@ -12,7 +12,9 @@ import asyncio
 import logging
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Request
+import re
+
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from src.services import offline_secrets, offline_state
 from src.services.offline_service import OfflineService
@@ -171,8 +173,20 @@ async def deactivate(request: Request) -> dict:
         # depend on the service it would switch off.
         queued = await asyncio.to_thread(offline_state.queued_on_disk, appid)
         log.info("offline switch-off: the service did not answer, queue on disk: %s", queued)
+    pending = health.get("fiscalPending") if health else None
+    if isinstance(pending, int) and not isinstance(pending, bool):
+        fiscal_pending = pending
+        fiscal_sessions = len(health.get("fiscalSessions") or [])
+    else:
+        # Not asked, or a service that does not say (an older build): the
+        # counts the service keeps in the clear. A copy that cannot be read
+        # (or judged) is refused, never taken for «nothing owed».
+        on_disk = await asyncio.to_thread(offline_state.fiscal_owed_on_disk, appid)
+        fiscal_pending, fiscal_sessions = on_disk if on_disk is not None else (None, 0)
     try:
-        offline_state.check_can_deactivate(queued if isinstance(queued, int) else None)
+        offline_state.check_can_deactivate(
+            queued if isinstance(queued, int) else None, fiscal_pending, fiscal_sessions,
+        )
     except offline_state.ActivationError as e:
         log.warning("offline deactivation refused: %s", e)
         raise HTTPException(status_code=409, detail={"code": "offline_queue_not_empty", "message": str(e)})
@@ -257,3 +271,39 @@ async def load_local_settings() -> dict:
     if body is None:
         raise HTTPException(status_code=404, detail={"code": "no_local_settings", "message": "Немає збережених налаштувань."})
     return body
+
+
+#: The register routes of the offline service, below /api/offline-fiscal.
+_FISCAL_PATH = re.compile(r"(/[A-Za-z0-9_-]+)*")
+
+
+@router.api_route("/fiscal{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def fiscal(path: str, request: Request) -> Response:
+    """The offline registers of this computer, set up from the online app.
+
+    The registers belong to the offline service here (their key is on this
+    disk), and the service lets no other web page in. The online app reaches
+    them through this route, with the manager's key, so a shop sets its
+    register up while it still has internet, before it ever has to go offline.
+    The bodies are passed through and never logged: they carry the key's
+    password.
+    """
+    svc = _service(request)
+    if svc is None:
+        raise HTTPException(status_code=503, detail={"code": "offline_unavailable", "message": "Ця збірка не підтримує офлайн-режим."})
+    if not offline_state.active_appid():
+        raise HTTPException(status_code=409, detail={"code": "offline_not_active", "message": "Офлайн-режим на цьому комп'ютері не увімкнено."})
+    if not _FISCAL_PATH.fullmatch(path):
+        log.warning("offline fiscal: refused path %r", path)
+        raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "Некоректний запит."})
+    body = await request.body() if request.method in ("POST", "PUT") else None
+    try:
+        status, answer = await svc.fiscal(request.method, path, body)
+    except Exception as e:  # noqa: BLE001 — refused, timeout: the service is not there
+        log.warning("offline fiscal %s %s: the service did not answer: %s", request.method, path, e)
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "offline_service_down", "message": "Офлайн-сервіс не відповідає. Спробуйте за хвилину."},
+        )
+    log.info("offline fiscal %s %s: %s", request.method, path or "/", status)
+    return Response(content=answer, status_code=status, media_type="application/json")
