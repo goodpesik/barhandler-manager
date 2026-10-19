@@ -16,6 +16,7 @@ from pathlib import Path
 
 import pytest
 
+from src.services import offline_service
 from src.services.offline_service import OfflineService, SERVICE_NAME
 
 FAKE = textwrap.dedent(
@@ -792,3 +793,42 @@ async def _instant_timeout(aw, timeout):
     if asyncio.iscoroutine(aw):
         aw.close()
     raise asyncio.TimeoutError
+
+
+def test_a_register_call_reaches_the_service_and_brings_its_refusal_back():
+    """The online app's call is passed on as it came, and a 4xx is an answer, not a failure."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_PUT(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            seen.append((self.command, self.path, self.rfile.read(n), self.headers.get("Origin")))
+            self.send_response(422)
+            self.end_headers()
+            self.wfile.write(b'{"code": "KEY_REFUSED"}')
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        status, body = offline_service._call_fiscal(srv.server_port, "PUT", "/registers/r-1", b'{"name": "x"}', timeout=5)
+    finally:
+        srv.shutdown()
+    assert (status, body) == (422, b'{"code": "KEY_REFUSED"}')
+    assert seen == [("PUT", "/api/offline-fiscal/registers/r-1", b'{"name": "x"}', None)]
+
+
+@pytest.mark.parametrize("said, shown", [(True, True), (False, False), (None, False), ("yes", False)])
+def test_status_says_whether_the_tills_own_shift_is_open(said, shown):
+    """PET-1122 — Petshandler reminds the shop to close it; only a literal true counts."""
+    health = {"name": SERVICE_NAME, "version": "1.2.3", "queued": 0}
+    if said is not None:
+        health["shiftOpen"] = said
+    svc = OfflineService(lambda: None, argv=["node"], expected_version="1.2.3", fetch_health=lambda port: health)
+    assert asyncio.run(svc.refresh()) is not None
+    assert svc.state.extra["shiftOpen"] is shown
