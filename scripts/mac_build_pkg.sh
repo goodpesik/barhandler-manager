@@ -127,7 +127,22 @@ if [ -n "$installer_identity" ] && [ -n "${MAC_NOTARY_APPLE_ID:-}" ] \
     --team-id "$MAC_NOTARY_TEAM_ID" \
     --wait --timeout 20m
   echo "==> Приклеюю тікет (staple)"
-  xcrun stapler staple "$PKG"
+  # The ticket is fetched from Apple's CloudKit, and a single dropped
+  # connection there (error 68) used to fail the whole release after the
+  # package was already accepted. Retry a few times before giving up.
+  stapled=""
+  for attempt in 1 2 3 4 5; do
+    if xcrun stapler staple "$PKG"; then
+      stapled=1
+      break
+    fi
+    echo "==> staple attempt $attempt/5 failed"
+    [ "$attempt" -lt 5 ] && sleep 15
+  done
+  if [ -z "$stapled" ]; then
+    echo "==> staple failed after 5 attempts" >&2
+    exit 68
+  fi
   echo "==> Перевірка очима Gatekeeper"
   spctl -a -t install -v "$PKG"
 else

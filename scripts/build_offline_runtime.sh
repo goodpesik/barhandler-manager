@@ -39,8 +39,8 @@ WORK="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/offline-runtime-XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 echo "==> Node $NODE_VERSION for $PLATFORM"
-curl -fsSL "$BASE/$NODE_VERSION/SHASUMS256.txt" -o "$WORK/SHASUMS256.txt"
-curl -fsSL "$BASE/$NODE_VERSION/$ARCHIVE" -o "$WORK/$ARCHIVE"
+curl -fsSL --retry 3 --retry-all-errors "$BASE/$NODE_VERSION/SHASUMS256.txt" -o "$WORK/SHASUMS256.txt"
+curl -fsSL --retry 3 --retry-all-errors "$BASE/$NODE_VERSION/$ARCHIVE" -o "$WORK/$ARCHIVE"
 EXPECTED="$(awk -v f="$ARCHIVE" '$2 == f { print $1 }' "$WORK/SHASUMS256.txt")"
 [ -n "$EXPECTED" ] || { echo "::error::$ARCHIVE is not in SHASUMS256.txt"; exit 1; }
 # From stdin, not by name: on the Windows runner the path is D:\a\_temp/...,
