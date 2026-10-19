@@ -28,6 +28,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -185,6 +186,33 @@ def _post_sync(port: int, timeout: float = SYNC_NOW_TIMEOUT) -> Optional[dict]:
     return body if isinstance(body, dict) else None
 
 
+#: Asking the tax service (a grant, a registration form) goes over the
+#: internet from the offline service, and the cabinet can be slow.
+FISCAL_CALL_TIMEOUT = 60.0
+
+
+def _call_fiscal(port: int, method: str, path: str, body: Optional[bytes], timeout: float = FISCAL_CALL_TIMEOUT) -> tuple[int, bytes]:
+    """
+    One call to the offline service's register routes (/api/offline-fiscal…)
+    on the online app's behalf: the service lets only its own page and callers
+    without an Origin in, and the online page is neither.
+
+    The status and the body as the service answered them, 4xx included; a
+    service that cannot be reached raises.
+    """
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/offline-fiscal{path}",
+        data=body,
+        method=method,
+        headers={"Content-Type": "application/json"} if body is not None else {},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
 @dataclass
 class OfflineServiceState:
     """What the dashboard and the menu (PET-972) show."""
@@ -211,6 +239,7 @@ class OfflineService:
         log_path: Optional[Path] = None,
         fetch_health: Callable[[int], Optional[dict]] = _fetch_health,
         post_sync: Callable[[int], Optional[dict]] = _post_sync,
+        call_fiscal: Callable[[int, str, str, Optional[bytes]], tuple[int, bytes]] = _call_fiscal,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._load_config = load_config
@@ -221,6 +250,7 @@ class OfflineService:
         self._log_path = log_path or (APP_DIR / "offline" / "service.log")
         self._fetch = fetch_health
         self._post_sync = post_sync
+        self._call_fiscal = call_fiscal
         self._sleep = sleep
         self._proc: Optional[asyncio.subprocess.Process] = None
         # PET-972 — the config the running service was started with: a new
@@ -298,6 +328,10 @@ class OfflineService:
             return None
         self._remember(health)
         return health
+
+    async def fiscal(self, method: str, path: str, body: Optional[bytes]) -> tuple[int, bytes]:
+        """The online app's call to the register routes, passed through as is."""
+        return await asyncio.to_thread(self._call_fiscal, self._port, method, path, body)
 
     async def sync_now(self) -> Optional[dict]:
         """

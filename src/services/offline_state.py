@@ -177,8 +177,60 @@ def queued_on_disk(appid: str, timeout: float = 5, quiet: bool = False) -> Optio
     return int(n)
 
 
-def check_can_deactivate(queued: Optional[int]) -> None:
-    """Refuse while operations made offline have not reached the server."""
+def fiscal_owed_on_disk(appid: str) -> Optional[tuple[int, int]]:
+    """What the local copy still owes the tax service: (unsent documents, sessions).
+
+    For when the service cannot be asked. Whether a document was sent is
+    inside its sealed row, so the service keeps the count of unsent ones in
+    the clear (meta `fiscalPending`, PET-1120); an open session is a meta row
+    of its own, whose key says so without the payload. A copy from a service
+    older than that count, with any fiscal document in it, cannot be judged:
+    None, like a copy that cannot be read.
+    """
+    path = shop_folder(appid) / "data" / "offline.sqlite"
+    try:
+        if not path.exists():
+            return 0, 0
+        con = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5)
+        try:
+            row = con.execute("SELECT value FROM meta WHERE key = 'fiscalPending'").fetchone()
+            (sessions,) = con.execute(
+                "SELECT count(*) FROM meta WHERE key LIKE 'fiscalOfflineSession:%'"
+            ).fetchone()
+            if row is not None:
+                pending = int(row[0])
+            else:
+                (docs,) = con.execute("SELECT count(*) FROM entity WHERE kind = 'fiscalDocument'").fetchone()
+                if docs:
+                    log.warning("offline: shop %s has %s fiscal documents and no count of unsent ones", appid, docs)
+                    return None
+                pending = 0
+        finally:
+            con.close()
+    except sqlite3.OperationalError as e:
+        if "no such table" in str(e):
+            return 0, 0
+        log.warning("offline: fiscal state of shop %s unreadable on disk: %s", appid, e)
+        return None
+    except (sqlite3.DatabaseError, OSError, ValueError) as e:
+        log.warning("offline: fiscal state of shop %s unreadable on disk: %s", appid, e)
+        return None
+    log.info("offline: shop %s fiscal state read from disk: %s unsent, %s sessions", appid, pending, sessions)
+    return pending, int(sessions)
+
+
+def check_can_deactivate(
+    queued: Optional[int],
+    fiscal_pending: Optional[int] = 0,
+    fiscal_sessions: int = 0,
+) -> None:
+    """Refuse while anything made offline has not reached the server or the tax service.
+
+    Switching off removes the local copy. A fiscal document signed offline and
+    not yet handed to the tax service would be lost with it, and its fiscal
+    number never arrives, which is what gets a registrar blocked; an open
+    offline session has to be brought back online the same way.
+    """
     if queued:
         raise ActivationError(
             f"Офлайн-операцій, що ще не надійшли на сервер: {queued}. "
@@ -187,6 +239,22 @@ def check_can_deactivate(queued: Optional[int]) -> None:
     if queued is None:
         raise ActivationError(
             "Не вдалося перевірити чергу офлайн-операцій. Спробуйте ще раз.",
+        )
+    if fiscal_sessions:
+        raise ActivationError(
+            "Офлайн-каса ще працює в офлайн-сесії. "
+            "Вимкнення можливе після повернення каси в онлайн.",
+        )
+    if fiscal_pending:
+        raise ActivationError(
+            f"Фіскальних документів, ще не переданих до ДПС: {fiscal_pending}. "
+            "Вимкнення можливе після їх передачі.",
+        )
+    if fiscal_pending is None:
+        raise ActivationError(
+            "Не вдалося перевірити фіскальні документи офлайн-каси: "
+            "офлайн-сервіс не відповідає. Перезапустіть Девайс менеджер "
+            "і спробуйте ще раз, коли офлайн-сервіс запуститься.",
         )
 
 

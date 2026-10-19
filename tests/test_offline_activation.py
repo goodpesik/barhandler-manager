@@ -38,8 +38,11 @@ PAYLOAD = {
 class FakeService:
     """The supervisor, reduced to what the routes and the busy guard use."""
 
-    def __init__(self, queued, running=True, sync_answer=None, port=9898):
+    def __init__(self, queued, running=True, sync_answer=None, port=9898, health=None):
         self.queued = queued
+        self.health = health or {}
+        self.fiscal_calls = []
+        self.fiscal_answer = (200, b'{"registers": []}')
         self.port = port
         self.stopped = 0
         self.synced = 0
@@ -59,7 +62,13 @@ class FakeService:
         self.stopped += 1
 
     async def refresh(self):
-        return None if self.queued is None else {"queued": self.queued}
+        return None if self.queued is None else {"queued": self.queued, **self.health}
+
+    async def fiscal(self, method, path, body):
+        self.fiscal_calls.append((method, path, body))
+        if isinstance(self.fiscal_answer, Exception):
+            raise self.fiscal_answer
+        return self.fiscal_answer
 
     async def sync_now(self):
         """PET-1057 — what the service answered, or None when it could not."""
@@ -930,4 +939,118 @@ def test_only_one_or_zero_is_a_word():
     assert parse_header("") is None
     assert parse_header("yes") is None
     assert parse_header(None) is None
+
+
+@pytest.mark.parametrize(
+    "health",
+    [{"fiscalPending": 2, "fiscalSessions": []}, {"fiscalPending": 0, "fiscalSessions": ["s-1"]}],
+)
+def test_switching_off_waits_for_the_tax_service(client_for, home, health):
+    """A document signed offline and not yet sent would go with the local copy."""
+    svc = FakeService(0, health=health)
+    c = client_for(svc)
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    r = c.post("/offline/deactivate", headers=KEY)
+    assert r.status_code == 409
+    assert offline_state.active_appid() == "bark-01"
+    assert svc.stopped == 0
+
+
+def test_switching_off_goes_once_the_tax_service_has_everything(client_for, home):
+    svc = FakeService(0, health={"fiscalPending": 0, "fiscalSessions": []})
+    c = client_for(svc)
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    assert c.post("/offline/deactivate", headers=KEY).status_code == 200
+    assert offline_state.active_appid() is None
+
+
+def _fiscal_copy(home, docs, pending=None, sessions=0):
+    """The offline service's copy as it lays out fiscal state (counts in the clear)."""
+    import sqlite3
+
+    data = home / "offline" / "bark-01" / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(data / "offline.sqlite")
+    con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    con.execute("CREATE TABLE entity (kind TEXT NOT NULL, id TEXT NOT NULL, at TEXT, data BLOB NOT NULL, PRIMARY KEY (kind, id))")
+    con.execute("INSERT INTO entity VALUES ('product', 'p1', NULL, x'00')")
+    con.execute("INSERT INTO meta VALUES ('fiscalOfflineSessionX', 'not a session')")
+    for i in range(docs):
+        con.execute("INSERT INTO entity VALUES ('fiscalDocument', ?, NULL, x'00')", (f"d{i}",))
+    if pending is not None:
+        con.execute("INSERT INTO meta VALUES ('fiscalPending', ?)", (str(pending),))
+    for i in range(sessions):
+        con.execute("INSERT INTO meta VALUES (?, 'sealed')", (f"fiscalOfflineSession:r{i}",))
+    con.commit()
+    con.close()
+
+
+@pytest.mark.parametrize(
+    "docs, pending, sessions, code",
+    [
+        (3, 2, 0, 409),  # two of three still owed
+        (3, 0, 0, 200),  # all sent: not stuck because documents were ever signed
+        (0, 0, 1, 409),  # a session still open
+        (1, None, 0, 409),  # an older service with documents: cannot be judged
+        (0, None, 0, 200),  # an older service that never signed anything
+    ],
+)
+def test_a_silent_service_is_judged_by_the_counts_on_disk(client_for, home, docs, pending, sessions, code):
+    svc = FakeService(None)
+    c = client_for(svc)
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    _fiscal_copy(home, docs, pending, sessions)
+    assert c.post("/offline/deactivate", headers=KEY).status_code == code
+
+
+def test_a_silent_service_and_a_copy_that_cannot_be_read_are_not_switched_off(client_for, home, monkeypatch):
+    """Not readable is not «nothing owed»: the copy may hold unsent documents."""
+    svc = FakeService(None)
+    c = client_for(svc)
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    monkeypatch.setattr(offline_state, "queued_on_disk", lambda *a, **k: 0)
+    data = home / "offline" / "bark-01" / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    (data / "offline.sqlite").write_bytes(b"this is not a database" * 100)
+    assert c.post("/offline/deactivate", headers=KEY).status_code == 409
+    assert offline_state.active_appid() == "bark-01"
+
+
+def test_the_online_app_reaches_the_registers_through_the_manager(client_for):
+    svc = FakeService(0)
+    c = client_for(svc)
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    svc.fiscal_answer = (400, b'{"code": "KEY_REFUSED"}')
+    r = c.put("/offline/fiscal/registers/r-1", json={"name": "Каса 1"}, headers=KEY)
+    assert r.status_code == 400 and r.json() == {"code": "KEY_REFUSED"}
+    method, path, body = svc.fiscal_calls[-1]
+    assert (method, path, json.loads(body)) == ("PUT", "/registers/r-1", {"name": "Каса 1"})
+    assert c.get("/offline/fiscal", headers=KEY).status_code == 400
+    assert svc.fiscal_calls[-1] == ("GET", "", None)
+
+
+def test_the_registers_are_closed_without_the_key_activation_or_a_plain_path(client_for):
+    svc = FakeService(0)
+    c = client_for(svc)
+    assert c.get("/offline/fiscal").status_code in (401, 403)
+    assert c.get("/offline/fiscal", headers=KEY).status_code == 409
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    assert c.get("/offline/fiscal/registers/..%2F..%2Fsync", headers=KEY).status_code == 400
+    assert svc.fiscal_calls == []
+    # A line break in the path is never passed on to the service.
+    c.get("/offline/fiscal/registers/r-1%0A", headers=KEY)
+    assert all("\n" not in path for _, path, _ in svc.fiscal_calls)
+    svc.fiscal_answer = OSError("refused")
+    assert c.get("/offline/fiscal", headers=KEY).status_code == 503
+
+
+@pytest.mark.parametrize("health", [{}, {"fiscalPending": None}, {"fiscalPending": True}])
+def test_a_service_that_does_not_say_what_it_owes_is_judged_by_the_disk(client_for, home, health):
+    """An older service answers /health without the count: unknown is not «nothing owed»."""
+    svc = FakeService(0, health=health)
+    c = client_for(svc)
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    _fiscal_copy(home, docs=2, pending=None)
+    assert c.post("/offline/deactivate", headers=KEY).status_code == 409
+    assert offline_state.active_appid() == "bark-01"
 
