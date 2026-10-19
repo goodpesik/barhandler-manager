@@ -1365,25 +1365,26 @@ _HTML_TEMPLATE = r"""<!doctype html>
     // (version changed) from a silent no-op (came back on the same
     // version — failed download, port conflict, never restarted).
     let beforeVer = null;
-    let downloadUrl = null;
     try {
       const v = await api("GET", "/version", false);
       beforeVer = v.version || null;
-      downloadUrl = v.update_download_url || null;
     } catch (_) {}
-    // BH-176 — на вінді оновлення качає БРАУЗЕР. Ми пробували завантажувати й
-    // запускати інсталятор самі, і цей шлях ламався щоразу по-новому; той
-    // самий файл, завантажений людиною й запущений руками, ставиться без
-    // пригод. Тож просто віддаємо адресу браузеру.
-    if (downloadUrl) {
-      window.location.href = downloadUrl;
-      showToast(t("update_downloading"), "ok", 12000);
-      btn.disabled = false;
-      btn.textContent = t("btn_update");
-      return;
-    }
     try {
+      // PET-1117 — ALWAYS ask the manager first: it is there that an update
+      // is refused while a card payment is in flight (BH-164). The page used to
+      // take the Windows installer's address from /version and skip this call,
+      // and the address never came (it was served at /system/version), so on
+      // Windows the button downloaded nothing and waited for a wizard.
       const res = await api("POST", "/system/update", true);
+      // BH-176 — on Windows the BROWSER downloads the installer and the person
+      // runs it: the manager starts nothing there and answers with the address.
+      if (res.download_url) {
+        window.location.href = res.download_url;
+        showToast(t("update_downloading"), "ok", 12000);
+        btn.disabled = false;
+        btn.textContent = t("btn_update");
+        return;
+      }
       showToast(res.message || t("update_started"), "ok", 10000);
       // `interactive` = менеджер лише ВІДКРИВ інсталятор (мак-застосунок,
       // вінда-збірка). Доти й кнопка, і дедлайн брехали: «Перезапуск…» і

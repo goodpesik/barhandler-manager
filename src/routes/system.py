@@ -3,9 +3,6 @@
 POST /system/update  — spawns update.sh as a detached process and returns
                        immediately. The manager will restart itself within
                        a few seconds as the installer replaces the code.
-GET  /system/version — returns the running version so the dashboard JS
-                       can compare it with the latest GitHub release without
-                       needing a dedicated GitHub API proxy.
 GET  /system/uplink  — current uplink config + live connection status.
 POST /system/uplink  — write a new uplink block into config.yaml and
                        SIGTERM self so the service manager respawns with
@@ -77,16 +74,22 @@ WIN_INSTALLER_URL = (
 )
 
 
-@router.get("/version")
-async def get_version() -> dict:
-    version = installed_version("unknown")
-    # BH-150 — дашборд має знати, чи це встановлений мак-застосунок: кнопку
-    # видалення показуємо ЛИШЕ там, де вона справді щось знімає. У скриптовій
-    # інсталяції та на вінді за це відповідають їхні власні інсталятори.
+def install_facts() -> dict:
+    """PET-1117 — what the dashboard needs to know about THIS installation.
+
+    BH-150: whether it is the installed mac app — the uninstall button is shown
+    only where it really removes something. BH-176: where the Windows installer
+    is downloaded from — empty where the manager updates itself (mac, the
+    script install).
+
+    These used to be answered by a `GET /version` of this router, which is
+    mounted under `/system` and so lived at `/system/version`, where nobody
+    asked: the dashboard asks the public `GET /version` (routes/version.py),
+    so on Windows it never got the address and the uninstall button never
+    appeared anywhere. The public route now carries these fields itself.
+    """
     return {
-        "version": version,
         "mac_app_install": IS_MAC_APP_INSTALL,
-        # Порожньо — оновлення робимо самі (мак, скриптова інсталяція).
         "update_download_url": WIN_INSTALLER_URL if (IS_WIN and FROZEN) else None,
     }
 
