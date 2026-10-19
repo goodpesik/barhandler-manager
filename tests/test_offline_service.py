@@ -821,3 +821,14 @@ def test_a_register_call_reaches_the_service_and_brings_its_refusal_back():
         srv.shutdown()
     assert (status, body) == (422, b'{"code": "KEY_REFUSED"}')
     assert seen == [("PUT", "/api/offline-fiscal/registers/r-1", b'{"name": "x"}', None)]
+
+
+@pytest.mark.parametrize("said, shown", [(True, True), (False, False), (None, False), ("yes", False)])
+def test_status_says_whether_the_tills_own_shift_is_open(said, shown):
+    """PET-1122 — Petshandler reminds the shop to close it; only a literal true counts."""
+    health = {"name": SERVICE_NAME, "version": "1.2.3", "queued": 0}
+    if said is not None:
+        health["shiftOpen"] = said
+    svc = OfflineService(lambda: None, argv=["node"], expected_version="1.2.3", fetch_health=lambda port: health)
+    assert asyncio.run(svc.refresh()) is not None
+    assert svc.state.extra["shiftOpen"] is shown

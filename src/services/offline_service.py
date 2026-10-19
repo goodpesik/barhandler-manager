@@ -546,6 +546,8 @@ class OfflineService:
             "queued": health.get("queued"),
             "dataAsOf": health.get("dataAsOf"),
             "needsPairing": bool(health.get("needsPairing")),
+            # PET-1122 — the till's own shift is open: Petshandler reminds the shop to close it.
+            "shiftOpen": health.get("shiftOpen") is True,
             "appid": health.get("appid"),
         }
 
