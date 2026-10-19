@@ -3,7 +3,10 @@
 #
 #   <out>/device-handler-offline[.exe]   the official Node binary, renamed so
 #                                        install/uninstall scripts can stop it
-#   <out>/service/main.js                the offline service bundle
+#   <out>/service/                       the service's whole dist/: main.js plus
+#                                        what its build lays beside it (the
+#                                        vendored DSTU crypto, the tax
+#                                        service certificates)
 #   <out>/service/version.txt            its version (the manager checks /health for it)
 #   <out>/app/                           the offline build of the app
 #
@@ -62,7 +65,11 @@ esac
 mkdir -p "$OUT/service" "$OUT/app"
 cp "$WORK/$BIN" "$OUT/$NAME"
 chmod 755 "$OUT/$NAME"
-cp "$SERVICE/dist/main.js" "$OUT/service/main.js"
+# The WHOLE dist/, not main.js alone: the service's build puts the vendored
+# DSTU crypto and the tax service certificates beside main.js, and a runtime
+# without them starts, answers /health and then fails every register lookup
+# and every signature (manager 1.0.5 shipped exactly that).
+cp -R "$SERVICE/dist/." "$OUT/service/"
 VERSION="$(sed -n 's/^[[:space:]]*"version":[[:space:]]*"\([^"]*\)".*/\1/p' "$SERVICE/package.json" | head -n1)"
 [ -n "$VERSION" ] || { echo "::error::no version in $SERVICE/package.json"; exit 1; }
 printf '%s\n' "$VERSION" > "$OUT/service/version.txt"
