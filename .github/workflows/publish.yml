@@ -332,6 +332,14 @@ jobs:
           out: "dist/Device Handler.app/Contents/Resources/offline-runtime/petshandler"
           token: ${{ env.OFFLINE_REPO_TOKEN }}
           app-env: ${{ secrets.PETSHANDLER_APP_ENV }}
+      # `xcrun stapler` fetches the ticket over HTTP/3 (UDP 443), and on
+      # GitHub-hosted runners that connection drops since 2026-10-12 (Error 68,
+      # actions/runner-images#14924). Blocking outgoing UDP 443 for this job
+      # makes it fall back to plain HTTPS over TCP, which works.
+      - name: Force TCP for Apple's ticket service
+        run: |
+          echo "block return out quick proto udp from any to any port 443" | sudo pfctl -f -
+          sudo pfctl -E
       - name: Sign, package and notarize
         env:
           MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
