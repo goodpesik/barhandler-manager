@@ -88,3 +88,41 @@ def test_no_place_kills_only_one_of_the_two(iss: str) -> None:
             f"{name} згадано в {targets.count(name)} taskkill, а місць два "
             f"(установка + видалення): {targets}"
         )
+
+
+# BH-190 — the manager starts at system start, not at the installing user's logon.
+
+
+def _boot_task_script(iss: str) -> str:
+    return iss.split("function RegisterBootTask", 1)[1].split("\nend;", 1)[0]
+
+
+def test_the_boot_task_starts_at_boot_without_a_logon(iss: str) -> None:
+    script = _boot_task_script(iss)
+    assert "New-ScheduledTaskTrigger -AtStartup" in script
+    assert "-AtLogOn" not in script
+    # S4U runs it whether the user is logged on or not; Interactive would not.
+    assert "-LogonType S4U" in script
+
+
+def test_the_boot_task_is_never_stopped_by_a_time_limit(iss: str) -> None:
+    """Without it the scheduler's default stops the task after 72 hours."""
+    assert "-ExecutionTimeLimit ([TimeSpan]::Zero)" in _boot_task_script(iss)
+
+
+def test_the_startup_shortcut_is_only_the_fallback(iss: str) -> None:
+    """A shortcut made unconditionally would keep the start bound to the logon
+    and start a second copy beside the task."""
+    icons = iss.split("[Icons]", 1)[1].split("\n[", 1)[0]
+    assert "{userstartup}" not in "\n".join(
+        line for line in icons.splitlines() if not line.lstrip().startswith(";")
+    )
+    step = iss.split("procedure CurStepChanged", 1)[1].split("\nend;", 1)[0]
+    assert step.index("MakeStartupShortcut") > step.index("else")
+
+
+def test_the_uninstaller_removes_the_task_and_the_shortcut(iss: str) -> None:
+    uninstall = iss.split("procedure CurUninstallStepChanged", 1)[1]
+    assert "Unregister-ScheduledTask -TaskName ''{#BootTaskName}''" in uninstall
+    section = iss.split("[UninstallDelete]", 1)[1].split("\n[", 1)[0]
+    assert "{userstartup}\\{#MyAppName}.lnk" in section

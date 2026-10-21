@@ -5,7 +5,8 @@
 ;   * BEFORE installing, wipes any previous install — the Python one at
 ;     %USERPROFILE%\.barhandler-manager (+ its "BarhandlerManager" scheduled
 ;     task) AND a prior setup — so it always installs clean/fresh
-;   * autostarts at logon (Startup shortcut), Start-menu "Dashboard" shortcut
+;   * autostarts at system start (a scheduled task, BH-190; a Startup
+;     shortcut only when the task could not be made), Start-menu "Dashboard" shortcut
 ;   * starts it right after install
 ;   * proper Uninstall entry in Programs & Features that stops + removes it
 ;
@@ -24,6 +25,9 @@
 #define MyAppExeAltName "device-handler.exe"
 #define MyAppUrl "http://localhost:9999/"
 #define TaskName "BarhandlerManager"
+; BH-190 — the task that starts the manager at system start. A name of its own:
+; CleanPrevious deletes the old Python install's "BarhandlerManager" task.
+#define BootTaskName "HandlerDeviceManager"
 
 #ifndef MyAppVersion
   #define MyAppVersion "0.0.0"
@@ -78,8 +82,8 @@ Type: filesandordirs; Name: "{app}\offline-runtime"
 [Icons]
 ; Start-menu shortcut that opens the dashboard in the browser.
 Name: "{autoprograms}\{#MyAppName} (Dashboard)"; Filename: "{#MyAppUrl}"
-; Autostart at logon — a Startup-folder shortcut to the headless exe.
-Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+; BH-190 — no Startup shortcut here: autostart is made in [Code]
+; (RegisterBootTask), and the shortcut is only its fallback.
 
 [Run]
 ; Launch now (headless, no window) so the operator doesn't have to log off/on.
@@ -92,6 +96,12 @@ Filename: "{cmd}"; Parameters: "/c taskkill /F /IM {#MyAppExeName}"; Flags: runh
 Filename: "{cmd}"; Parameters: "/c taskkill /F /IM {#MyAppExeAltName}"; Flags: runhidden; RunOnceId: "killexealt"
 ; PET-971 — the offline service the manager runs (Node, shipped under its own name).
 Filename: "{cmd}"; Parameters: "/c taskkill /F /IM device-handler-offline.exe"; Flags: runhidden; RunOnceId: "killoffline"
+; BH-190 — the boot task is removed in CurUninstallStepChanged (it needs admin).
+
+[UninstallDelete]
+; BH-190 — the fallback Startup shortcut is made in [Code], so Inno does not
+; know to remove it.
+Type: files; Name: "{userstartup}\{#MyAppName}.lnk"
 
 [Code]
 { Wipe any previous barhandler-manager before installing — the Python install
@@ -103,6 +113,12 @@ begin
   { Stop + delete the old "BarhandlerManager" scheduled task (Python install). }
   Exec('schtasks.exe', '/End /TN "{#TaskName}"', '', SW_HIDE, ewWaitUntilTerminated, Rc);
   Exec('schtasks.exe', '/Delete /TN "{#TaskName}" /F', '', SW_HIDE, ewWaitUntilTerminated, Rc);
+
+  { BH-190 — stop the boot task first: a copy it started and that is killed
+    below would be started again by the task's restart-on-failure, possibly
+    while the files are being copied. Its own user may end it without admin. }
+  Exec('schtasks.exe', '/End /TN "{#BootTaskName}"', '', SW_HIDE, ewWaitUntilTerminated, Rc);
+  Log('Boot task end requested, schtasks exit code ' + IntToStr(Rc));
 
   { Kill a running exe (our unique names — safe). Both names are ours: the
     installer lays the binary down as bhm.exe, but the release also ships it
@@ -219,4 +235,119 @@ begin
   end;
   MsgBox(BusyReason, mbError, MB_OK);
   Result := False;
+end;
+
+{ BH-190 — START AT SYSTEM START, NOT AT LOGON.
+
+  A Startup-folder shortcut runs the manager only when THE USER WHO INSTALLED
+  IT logs in. A till that sits at the sign-in screen after a reboot, or one
+  where the setup was run under an admin account and the cashier works under
+  another, had no manager at all — and from the server that looks exactly like
+  a computer that is switched off.
+
+  So the setup registers a scheduled task that starts at boot under the SAME
+  user (S4U: "whether the user is logged on or not", no password stored). The
+  same user and not SYSTEM: the manager's files (settings, printers, device
+  token, the offline queue) live beside the exe in that user's LocalAppData,
+  and the manager must keep reaching what that user reaches.
+
+  Making such a task needs admin rights, while the setup itself runs without
+  them — so only this step asks for elevation (UAC). The settings are the ones
+  install.ps1 already uses, with one change: no execution time limit at all.
+  The scheduler's default stops a task after 72 hours, i.e. the manager would
+  die on the third day.
+
+  The person refuses the UAC prompt, or the task cannot be made — the Startup
+  shortcut is the fallback, as before. A second copy that the shortcut may
+  start while the task already runs exits on its own (main.py: the port is
+  taken). }
+
+function PsQuote(const S: String): String;
+begin
+  Result := S;
+  StringChangeEx(Result, '''', '''''', True);
+end;
+
+function TaskUser: String;
+begin
+  Result := GetEnv('USERDOMAIN') + '\' + GetUserNameString;
+end;
+
+function RunElevatedPowerShell(const Script: String; var ResultCode: Integer): Boolean;
+begin
+  Result := ShellExec('runas', 'powershell.exe',
+    '-NoProfile -ExecutionPolicy Bypass -Command "' + Script + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+function RegisterBootTask: Boolean;
+var
+  Rc: Integer;
+  Script: String;
+begin
+  Script :=
+    '$ErrorActionPreference = ''Stop''; ' +
+    '$a = New-ScheduledTaskAction -Execute ''' + PsQuote(ExpandConstant('{app}\{#MyAppExeName}')) + ''' ' +
+      '-WorkingDirectory ''' + PsQuote(ExpandConstant('{app}')) + '''; ' +
+    '$t = New-ScheduledTaskTrigger -AtStartup; ' +
+    '$s = New-ScheduledTaskSettingsSet -StartWhenAvailable -DontStopOnIdleEnd ' +
+      '-AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -RestartCount 3 ' +
+      '-RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero); ' +
+    '$p = New-ScheduledTaskPrincipal -UserId ''' + PsQuote(TaskUser) + ''' -LogonType S4U -RunLevel Limited; ' +
+    'Register-ScheduledTask -TaskName ''{#BootTaskName}'' -Action $a -Trigger $t ' +
+      '-Settings $s -Principal $p -Force | Out-Null';
+  if not RunElevatedPowerShell(Script, Rc) then
+  begin
+    Log('Boot task not registered: elevation refused or powershell did not start');
+    Result := False;
+    Exit;
+  end;
+  Result := Rc = 0;
+  if Result then
+    Log('Boot task {#BootTaskName} registered for ' + TaskUser)
+  else
+    Log('Boot task registration failed, powershell exit code ' + IntToStr(Rc));
+end;
+
+procedure MakeStartupShortcut;
+var
+  Link: String;
+begin
+  Link := ExpandConstant('{userstartup}\{#MyAppName}.lnk');
+  try
+    CreateShellLink(Link, '', ExpandConstant('{app}\{#MyAppExeName}'), '',
+      ExpandConstant('{app}'), '', 0, SW_SHOWNORMAL);
+    Log('Fallback Startup shortcut made: ' + Link);
+  except
+    Log('Could not make the Startup shortcut: ' + GetExceptionMessage);
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+  if RegisterBootTask then
+  begin
+    { A shortcut left by an earlier setup would start a second copy at logon. }
+    if DeleteFile(ExpandConstant('{userstartup}\{#MyAppName}.lnk')) then
+      Log('Old Startup shortcut removed: the boot task replaces it');
+  end
+  else
+    MakeStartupShortcut;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Rc: Integer;
+begin
+  if CurUninstallStep <> usUninstall then
+    Exit;
+  { Best effort: a refused prompt leaves a task whose exe is gone, and it
+    fails at boot without harm. }
+  if RunElevatedPowerShell(
+    'Unregister-ScheduledTask -TaskName ''{#BootTaskName}'' -Confirm:$false -ErrorAction SilentlyContinue', Rc) then
+    Log('Boot task removal, powershell exit code ' + IntToStr(Rc))
+  else
+    Log('Boot task not removed: elevation refused');
 end;
