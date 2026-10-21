@@ -832,3 +832,15 @@ def test_status_says_whether_the_tills_own_shift_is_open(said, shown):
     svc = OfflineService(lambda: None, argv=["node"], expected_version="1.2.3", fetch_health=lambda port: health)
     assert asyncio.run(svc.refresh()) is not None
     assert svc.state.extra["shiftOpen"] is shown
+
+
+@pytest.mark.parametrize("said, shown", [(7, 7), (0, 0), (None, None), ("7", None), (True, None)])
+def test_status_says_how_many_fiscal_documents_are_unsent(said, shown):
+    """Petshandler's «back online» dialog waits for the documents to reach the tax service."""
+    health = {"name": SERVICE_NAME, "version": "1.2.3", "queued": 0}
+    if said is not None:
+        health["fiscalPending"] = said
+    svc = OfflineService(lambda: None, argv=["node"], expected_version="1.2.3", fetch_health=lambda port: health)
+    assert asyncio.run(svc.refresh()) is not None
+    assert svc.state.extra["fiscalPending"] == shown
+

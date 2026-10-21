@@ -548,6 +548,11 @@ class OfflineService:
             "needsPairing": bool(health.get("needsPairing")),
             # PET-1122 — the till's own shift is open: Petshandler reminds the shop to close it.
             "shiftOpen": health.get("shiftOpen") is True,
+            # Fiscal documents made offline not at the tax service yet: Petshandler's
+            # «back online» dialog waits for them. Only a whole number counts.
+            "fiscalPending": health.get("fiscalPending")
+            if isinstance(health.get("fiscalPending"), int) and not isinstance(health.get("fiscalPending"), bool)
+            else None,
             "appid": health.get("appid"),
         }
 
