@@ -58,6 +58,7 @@ import uvicorn
 
 from src.config import APP_DIR, load_config
 from src.server import create_app
+from src.services.single_instance import port_taken
 
 config = load_config()
 
@@ -205,6 +206,18 @@ if __name__ == "__main__":
     # людина не має жодної ознаки життя. Один раз за життя інсталяції.
     from src.services.first_run import open_dashboard_once
     open_dashboard_once(APP_DIR, config["server"]["port"])
+
+    # BH-190 — on Windows the manager starts from a boot task, and a Startup
+    # shortcut (the installer's fallback, or one left from an older setup) can
+    # start a second copy at logon. uvicorn runs the whole startup (printers,
+    # the uplink, the offline service) BEFORE it binds the port, so that copy
+    # would go through all of it and only then fail. It leaves at once instead.
+    if os.name == "nt" and port_taken("127.0.0.1", config["server"]["port"]):
+        logging.getLogger("bhm").warning(
+            "127.0.0.1:%s is already taken (most likely another manager copy), this copy exits",
+            config["server"]["port"],
+        )
+        sys.exit(0)
 
     # log_config=None keeps the file handlers wired up in
     # `_configure_logging` instead of letting uvicorn reinstall its own
