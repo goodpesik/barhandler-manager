@@ -138,13 +138,19 @@ def test_pending_jobs_of_a_device_without_the_method_are_ignored():
     assert printers_with_pending_jobs(request) == []
 
 
-# --- охорона маршрутів -----------------------------------------------------
+# --- the guard on the routes -----------------------------------------------
 #
-# Тут навмисно НЕ перебираються `app.routes`: у цій версії FastAPI підключені
-# роутери лежать там лінивими обгортками без `path`, і перебір тихо давав
-# порожній перелік — тобто «усе класифіковано» на будь-якій таблиці. Тому
-# маршрути беруться з самих роутерів, а те, що охорону справді повісили,
-# перевіряється і по коду server.py, і живим запитом через TestClient.
+# `app.routes` is NOT walked here, and the reason is worth keeping: what it
+# holds depends on the version. Up to fastapi 0.136 `include_router` flattens
+# the routes into it with their full paths; from 0.16x it appends one opaque
+# object and keeps the routes inside. A walk over it therefore gave an empty
+# list on the newer one — which reads as «everything is classified», whatever
+# the table says. (This note said so before PET-1161, and I walked `app.routes`
+# anyway; CI, which installs the newest fastapi, caught it.)
+#
+# So the routes come from two places that do not depend on that shape: the
+# router modules themselves, and the application's OpenAPI schema. That the
+# guard is really attached is checked by a live request through TestClient.
 
 GUARDED_ROUTERS: list[tuple[str, str]] = [
     ("/print", "print_routes"),
@@ -196,8 +202,8 @@ def test_every_device_route_is_classified() -> None:
         if key not in CRITICAL_OPERATIONS and key not in SAFE_OPERATIONS
     ]
     assert not unclassified, (
-        "маршрути не класифіковані — додай їх у CRITICAL_OPERATIONS "
-        f"або в SAFE_OPERATIONS: {sorted(unclassified)}"
+        "these routes are classified in neither table — add them to "
+        f"CRITICAL_OPERATIONS or to SAFE_OPERATIONS: {sorted(unclassified)}"
     )
 
 
@@ -451,15 +457,38 @@ def test_every_critical_route_really_takes_a_hold(client_with_terminal) -> None:
     assert not wrong, f"the hold carries another route's label: {wrong}"
 
 
+def _served_by(app) -> list[tuple[str, str]]:
+    """Every (method, full path) the application really serves.
+
+    Asked through the OpenAPI schema, which is public API and the same on
+    every version. `app.routes` is NOT: up to fastapi 0.136 `include_router`
+    flattened the routes into it with their full paths, and from 0.16x it puts
+    a single opaque object there instead and keeps the routes inside it. The
+    first version of this test walked `app.routes`, so on CI — which installs
+    the newest fastapi, because requirements only say `>=0.111` — it found no
+    routes at all and failed. Reaching into the new object's private fields
+    would be the very mistake this ticket is about: reading a detail of the
+    version instead of asking the application (PET-1161).
+    """
+    served: list[tuple[str, str]] = []
+    for path, operations in app.openapi()["paths"].items():
+        for method in operations:
+            upper = method.upper()
+            if upper in ("HEAD", "OPTIONS"):
+                continue
+            served.append((upper, path))
+    return served
+
+
 def test_every_critical_route_is_held_as_the_app_registers_it(config) -> None:
-    """PET-1161 — the tables are checked against what the APP registered, not
+    """PET-1161 — the tables are checked against what the APP serves, not
     against the paths composed in this very file.
 
     `_router_routes` above builds «prefix + route.path» from the router
     modules, which is the same arithmetic the broken guard did — so it agreed
-    with the tables while the guard, looking at `app.routes`, matched nothing.
-    Forty-five green table tests and the guard off on every route. Here the
-    keys come from the application itself.
+    with the tables while the guard, looking at the route it was handed,
+    matched nothing. Forty-five green table tests and the guard off on every
+    route. Here the keys come from the application itself.
     """
     from src.server import create_app
     from src.services.busy import CRITICAL_OPERATIONS, critical_label
@@ -467,10 +496,12 @@ def test_every_critical_route_is_held_as_the_app_registers_it(config) -> None:
     app = create_app(config)
     prefixes = [prefix for prefix, _ in GUARDED_ROUTERS]
 
+    served = _served_by(app)
+    assert served, "the application served nothing — this test checks nothing"
+
     held: dict[tuple[str, str], str] = {}
     unclassified: list[tuple[str, str]] = []
-    for route in app.routes:
-        path = getattr(route, "path", "")
+    for method, path in served:
         # The bare prefix counts too: `GET /terminal` is a real route
         # (`@router.get("")`), and matching only «prefix + /» let such a route
         # slip past the classification check entirely.
@@ -479,19 +510,34 @@ def test_every_critical_route_is_held_as_the_app_registers_it(config) -> None:
         )
         if prefix is None:
             continue
-        for method in sorted(getattr(route, "methods", None) or []):
-            if method in ("HEAD", "OPTIONS"):
-                continue
-            label = critical_label(method, prefix, path)
-            if label is not None:
-                held[(method, path)] = label
-            elif (method, path) not in SAFE_OPERATIONS:
-                unclassified.append((method, path))
+        label = critical_label(method, prefix, path)
+        if label is not None:
+            held[(method, path)] = label
+        elif (method, path) not in SAFE_OPERATIONS:
+            unclassified.append((method, path))
 
+    assert held, "no CRITICAL route was found at all — nothing is checked"
     assert not unclassified, (
         "a route under a guarded router is classified in neither table, so an "
         f"update will not be held back for it: {sorted(unclassified)}"
     )
+    # The schema is not the whole truth: a route declared with
+    # `include_in_schema=False` is served and never appears in it, so it
+    # would escape the check above entirely. The router modules know about it,
+    # so they are asked as well (found by the review).
+    hidden = [
+        key for key in _router_routes()
+        if any(
+            key[1] == p or key[1].startswith(p + "/")
+            for p in prefixes
+        )
+        and key not in served
+    ]
+    assert not hidden, (
+        "these routes are served but hidden from the schema, so the check "
+        f"above cannot see them: {sorted(hidden)}"
+    )
+
     # Set equality, not a count: `critical_label` accepts two shapes of the
     # key, so a typo in the table could be masked by a second, unintended
     # match elsewhere while the two totals still agreed.
@@ -511,7 +557,8 @@ def test_both_shapes_of_the_path_find_the_same_operation() -> None:
     """
     from src.services.busy import critical_label
 
-    # What `app.routes` carries on the version we ship.
+    # The full path — what the application serves, and what `app.routes` held
+    # on the versions that flattened it.
     assert critical_label("POST", "/terminal", "/terminal/charge") == "оплата карткою"
     # What the router module carries — and what route objects carried before
     # the upgrade.
