@@ -452,3 +452,152 @@ async def test_stopping_closes_a_transport_left_half_connected():
     await asyncio.wait_for(client.stop(), timeout=5)
 
     assert closed, "the half-open transport was left running"
+
+
+# ---------------------------------------------------------------------------
+# PET-1157 — a line logged OFF the loop's thread used to disappear.
+#
+# The scan of the network is the one thing the remote diagnostics were made
+# for, and it is the one thing that cannot run on the loop: it is a blocking
+# TCP sweep of a /24 and goes through `asyncio.to_thread`. Every line it wrote
+# was in the machine's own bhm.log and in none of ours: the uplink was
+# connected, so the handler did not buffer it, and the client swallowed the
+# `RuntimeError` from `asyncio.get_running_loop()` without a word.
+# ---------------------------------------------------------------------------
+
+
+def _connected_client(sent):
+    """A client that looks connected and records what it is asked to send."""
+    from src.services.log_uplink import LogUplinkClient
+
+    client = LogUplinkClient({"url": "https://x", "tenant": "t", "reconnect_delay": 1})
+    # `connected` asks the namespace, not the socket's own flag.
+    client._sio.namespaces = {"/managers": "sid-1"}
+
+    async def fake_emit(event, data, namespace=None):
+        sent.append((event, data))
+
+    client._sio.emit = fake_emit
+    return client
+
+
+@pytest.mark.asyncio
+async def test_a_line_logged_from_a_worker_thread_reaches_the_server():
+    sent = []
+    client = _connected_client(sent)
+    client._loop = asyncio.get_running_loop()  # what `start()` remembers
+    h = SocketIOLogHandler(client)
+
+    await asyncio.to_thread(h.emit, _record("terminal discovery: scanning 1 subnet(s)"))
+    await asyncio.sleep(0.05)  # the send is handed to the loop, not awaited
+
+    assert [d["msg"] for _, d in sent] == ["terminal discovery: scanning 1 subnet(s)"]
+    assert list(h._buffer) == [], "the line went through, nothing to keep"
+
+
+@pytest.mark.asyncio
+async def test_a_business_event_from_a_worker_thread_reaches_the_server():
+    # `discovery_run` is emitted by the scan itself, from inside the thread.
+    sent = []
+    client = _connected_client(sent)
+    client._loop = asyncio.get_running_loop()
+
+    await asyncio.to_thread(client.emit_event, "discovery_run", hosts_scanned=254)
+    await asyncio.sleep(0.05)
+
+    assert [e for e, _ in sent] == ["event"]
+    assert sent[0][1]["type"] == "discovery_run"
+    assert sent[0][1]["hosts_scanned"] == 254
+
+
+def test_a_line_with_no_loop_to_go_through_is_kept_instead_of_lost():
+    """No loop at all — the uplink is not started yet, or already stopping.
+
+    This is the case that used to lose the line in silence, and the one that
+    must now end in the buffer: the uplink counts as connected, so the
+    disconnected branch does not catch it.
+    """
+    sent = []
+    client = _connected_client(sent)
+    client._loop = None
+    h = SocketIOLogHandler(client)
+
+    h.emit(_record("terminal discovery: nothing answered"))
+
+    assert sent == [], "there was no loop — nothing could have been sent"
+    assert len(h._buffer) == 1
+    assert h._buffer[0]["msg"] == "terminal discovery: nothing answered"
+    assert h._deferred == 1
+
+
+@pytest.mark.asyncio
+async def test_what_waited_for_a_loop_is_sent_and_said_out_loud():
+    """The kept line goes on the next flush, and the gap leaves a trace.
+
+    Without the trace the next hole of this kind is again found only because
+    somebody goes looking for it — this one took reading two logs side by side.
+    """
+    sent = []
+    client = _connected_client(sent)
+    client._loop = None
+    h = SocketIOLogHandler(client)
+    # From a worker thread, with no loop remembered yet: that is the state
+    # a scan starting before the uplink is up runs into.
+    await asyncio.to_thread(h.emit, _record("terminal discovery: TCP-open hosts"))
+    assert h._deferred == 1
+    assert sent == []
+
+    client._loop = asyncio.get_running_loop()
+    h.flush_buffer()
+    await asyncio.sleep(0.05)
+
+    msgs = [d["msg"] for _, d in sent]
+    assert "terminal discovery: TCP-open hosts" in msgs
+    said = [m for m in msgs if "had no event loop" in m]
+    assert len(said) == 1, f"expected one line about the gap, got {msgs}"
+    assert "1 log line(s)" in said[0]
+    assert h._deferred == 0, "said once, not on every flush"
+
+
+@pytest.mark.asyncio
+async def test_starting_remembers_the_loop_the_threads_will_need():
+    """The one line the whole fix stands on.
+
+    Found by the review: every other test here sets `_loop` by hand, so
+    deleting this from `start()` would leave them all green and put the defect
+    straight back on a live install.
+    """
+    sent = []
+    client = _connected_client(sent)
+    assert client._loop is None
+
+    async def no_connect(*a, **kw):
+        return None
+
+    client._sio.connect = no_connect
+    await client.start("install-1", "1.0.8")
+
+    assert client._loop is asyncio.get_running_loop()
+    # And with only that, a line from a thread arrives.
+    h = SocketIOLogHandler(client)
+    await asyncio.to_thread(h.emit, _record("from the sweep"))
+    await asyncio.sleep(0.05)
+    assert [d["msg"] for _, d in sent] == ["from the sweep"]
+
+
+@pytest.mark.asyncio
+async def test_an_event_that_cannot_be_handed_over_says_so(caplog):
+    """An event has no buffer of its own, so the only thing left is a word.
+
+    Before, `discovery_run` from inside the scan thread disappeared exactly
+    like the log lines did.
+    """
+    sent = []
+    client = _connected_client(sent)
+    client._loop = None
+
+    with caplog.at_level(logging.WARNING, logger="uplink"):
+        await asyncio.to_thread(client.emit_event, "discovery_run", hosts_scanned=254)
+
+    assert sent == []
+    assert any("discovery_run" in r.message for r in caplog.records), caplog.text

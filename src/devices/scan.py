@@ -577,6 +577,40 @@ def discover_network() -> list[PrinterDescriptor]:
     return unique
 
 
+LOOPBACK_HOST = "127.0.0.1"
+
+
+def _without_loopback_twins(descriptors: list) -> list:
+    """PET-1159 — the same terminal, found twice.
+
+    A terminal (or its software emulator) bound to 0.0.0.0 answers both on
+    127.0.0.1 and on this machine's own LAN address, which is in the swept /24.
+    The identifier carries the host, so the till would see two terminals, and
+    the one registered under one id would look unknown under the other. Found
+    by the review.
+
+    The LAN address wins: it is reachable from the machine itself as well, so
+    nothing is lost by dropping the loopback copy. Only a REAL twin is dropped
+    — same serial and same port; without a serial there is nothing to match on
+    and both stay.
+    """
+    twins = {
+        (d.serial, d.network.port)
+        for d in descriptors
+        if d.serial and d.network and d.network.host != LOOPBACK_HOST
+    }
+    kept = []
+    for d in descriptors:
+        on_loopback = bool(d.network) and d.network.host == LOOPBACK_HOST
+        if on_loopback and d.serial and (d.serial, d.network.port) in twins:
+            logger.info(
+                "terminal discovery: %s answers on %s as well — keeping the "
+                "address of the network, not the loopback",
+                d.serial, LOOPBACK_HOST,
+            )
+            continue
+        kept.append(d)
+    return kept
 SSI_TCP_PORT = 3000     # SSI ECR JSON framed-TCP transport (doc §1.1)
 PB_TCP_PORT = 2000      # PrivatBank ECR JSON direct-terminal port (spec §1)
 POSAPI_TCP_PORT = 8080  # Printec PosAPI bridge (Raiffeisen / PUMB)
@@ -632,16 +666,23 @@ def discover_network_terminals(
     if not subnets:
         logger.warning(
             "terminal discovery: could not detect any local subnet — no "
-            "Wi-Fi/network interface? (all enumeration methods failed)",
+            "Wi-Fi/network interface? (all enumeration methods failed); "
+            "trying this machine itself",
         )
-        return []
     hosts: list[str] = []
     for sn in subnets:
         hosts.extend(str(h) for h in sn.hosts())
+    # PET-1159 — and this machine itself. The loopback is never among the
+    # local subnets (it is filtered out there as an address nobody else can
+    # reach), so a terminal listening on 127.0.0.1 could never be found — and
+    # that is exactly what a software terminal on the same machine as the till
+    # looks like. One host over five ports costs nothing next to a /24.
+    if LOOPBACK_HOST not in hosts:
+        hosts.insert(0, LOOPBACK_HOST)
     logger.info(
-        "terminal discovery: scanning %d subnet(s) %s (%d hosts total) "
+        "terminal discovery: scanning %d subnet(s) %s plus %s (%d hosts total) "
         "ports=%s tcp_timeout=%.1fs",
-        len(subnets), [str(s) for s in subnets], len(hosts),
+        len(subnets), [str(s) for s in subnets], LOOPBACK_HOST, len(hosts),
         scan_ports, timeout,
     )
     # Collect open host:port pairs across every terminal port.
@@ -680,13 +721,14 @@ def discover_network_terminals(
     )
     if not open_pairs:
         logger.warning(
-            "terminal discovery: nothing answered on ports %s across %s. "
+            "terminal discovery: nothing answered on ports %s across %s "
+            "plus this machine itself (%s). "
             "Common causes: terminal on another subnet our interface scan "
             "didn't enumerate (CGNAT/guest isolation); the bank bridge "
             "(Printec/BPOS/Oschad) not running next to the manager; host "
             "firewall; terminal offline. If you know the IP, use "
             "'Додати термінал вручну' in the dashboard.",
-            scan_ports, [str(s) for s in subnets],
+            scan_ports, [str(s) for s in subnets], LOOPBACK_HOST,
         )
         return []
 
@@ -711,7 +753,7 @@ def discover_network_terminals(
 
     import asyncio
 
-    return asyncio.run(_probe_all())
+    return _without_loopback_twins(asyncio.run(_probe_all()))
 
 
 def discover_windows_printers() -> list[PrinterDescriptor]:
