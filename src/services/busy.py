@@ -28,12 +28,15 @@ BH-164. `POST /system/update` доти не питав НІЧОГО: він за
 from __future__ import annotations
 
 import itertools
+import logging
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Iterator, Optional
 
 from fastapi import Request
+
+logger = logging.getLogger(__name__)
 
 # Маршрути, під час яких оновлюватись НЕ можна: гроші, фіскальні документи,
 # друк. Ключ — (метод, повний шлях, як його бачить FastAPI разом із префіксом
@@ -138,26 +141,85 @@ def busy_tracker(request: Request) -> BusyTracker:
     return tracker
 
 
+def operation_keys(method: str, prefix: str, route_path: str) -> tuple[
+    tuple[str, str], ...
+]:
+    """The keys this request could be known by in the tables.
+
+    There are two shapes, and which one a route carries is a detail of the
+    framework version. The route objects in `app.routes` hold the FULL path
+    («/terminal/charge»), while the routes of the router module itself hold the
+    relative one («/charge»), and `scope["route"]` is the former. An earlier
+    version of this file added the prefix to whatever it was given; after the
+    FastAPI upgrade that produced «/terminal/terminal/charge», no key matched,
+    and the guard was off on EVERY critical route — payment, refund, every
+    print, the drawer, the fiscal documents (PET-1161).
+
+    So both shapes are tried, and a route that fits neither table is reported
+    rather than passed over in silence — that silence is what let the guard sit
+    switched off.
+    """
+    return ((method, route_path), (method, prefix + route_path))
+
+
+def critical_label(method: str, prefix: str, route_path: str) -> Optional[str]:
+    """The text for a person, or None when this route is not a critical one."""
+    for key in operation_keys(method, prefix, route_path):
+        label = CRITICAL_OPERATIONS.get(key)
+        if label is not None:
+            return label
+    return None
+
+
+# Routes already reported as unclassified. The dashboard polls some of these
+# routes every second or two and the log is uplinked to a server, so a line per
+# request would drown the thing it is meant to make visible. Once per route is
+# enough: the point is to be told the tables have drifted, not how often.
+_reported: set[tuple[str, str]] = set()
+
+
+def _worth_reporting(method: str, prefix: str, route_path: str) -> bool:
+    """Whether to say out loud that this route is in neither table."""
+    if route_path:
+        keys = operation_keys(method, prefix, route_path)
+        if any(key in SAFE_OPERATIONS for key in keys):
+            return False
+    # No path at all means no route was chosen — the prefix must not be allowed
+    # to stand in for one, or «GET ''» under /terminal would read as the
+    # classified «GET /terminal» and say nothing.
+    once = (method, route_path)
+    if once in _reported:
+        return False
+    _reported.add(once)
+    return True
+
+
 def guard_critical(prefix: str):
-    """Залежність роутера: тримає операцію «в роботі» на час запиту.
+    """A router dependency: holds the operation «in progress» for the request.
 
-    Вішається на РОУТЕР цілком, а не на кожен маршрут, і сама вирішує за
-    таблицею — залежності виконуються ПІСЛЯ вибору маршруту, тож
-    `request.scope["route"]` тут уже відомий.
+    It hangs on the ROUTER as a whole rather than on each route, and decides by
+    the table — dependencies run AFTER the route has been chosen, so
+    `request.scope["route"]` is already known here.
 
-    Префікс передається ЯВНО, бо `route.path` у знайденому маршруті —
-    відносний («/charge», «/{terminal_id}/cancel»), без префікса роутера, а
-    `scope["root_path"]` тут порожній. Спершу тут стояло `route.path` без
-    префікса: жоден ключ не збігався, охорона не вмикалась НІ на одному
-    маршруті — і всі табличні тести при цьому зеленіли. Знайшов це живий
-    запит (`test_a_real_charge_marks_the_manager_busy`).
+    Which key to look the route up by: see `operation_keys`.
     """
 
     async def dependency(request: Request):
-        route = request.scope.get("route")
-        full_path = prefix + getattr(route, "path", "")
-        label = CRITICAL_OPERATIONS.get((request.method, full_path))
+        route_path = getattr(request.scope.get("route"), "path", "")
+        label = critical_label(request.method, prefix, route_path)
         if label is None:
+            if _worth_reporting(request.method, prefix, route_path):
+                # Neither table knows this route. Either it is new and nobody
+                # classified it, or the shape of the path changed again — and
+                # both mean the guard is off somewhere it may be needed.
+                logger.warning(
+                    "critical guard: route %s %s (prefix %s) is in neither "
+                    "CRITICAL_OPERATIONS nor SAFE_OPERATIONS — the update is "
+                    "not held back for it",
+                    request.method,
+                    route_path or "<unknown>",
+                    prefix,
+                )
             yield
             return
         with busy_tracker(request).hold(label):
