@@ -358,3 +358,126 @@ def test_discover_finds_both_ssi_and_pb_on_same_host(
     )
     assert by_kind["mono_pos"].serial == "V1E0207420"
     assert by_kind["privat_pos"].serial == "PB-SN"
+
+
+def test_discover_always_tries_this_machine_itself(monkeypatch) -> None:
+    """PET-1159 — a terminal on 127.0.0.1 could never be found.
+
+    The loopback is filtered out of the local subnets (nobody else can reach
+    it), so it never entered the host list — and a software terminal on the
+    same machine as the till is exactly that address.
+    """
+    import src.devices.scan as scan
+
+    probed: list[str] = []
+
+    def record(host, port, timeout=0.3):
+        probed.append(host)
+        return False
+
+    monkeypatch.setattr(scan, "_local_subnets", lambda: [])
+    monkeypatch.setattr(scan, "_probe_tcp", record)
+
+    assert discover_network_terminals(timeout=0.01) == []
+    assert "127.0.0.1" in probed, f"the machine itself was not tried: {probed}"
+
+
+def test_discovery_lists_a_terminal_bound_to_all_addresses_once(monkeypatch) -> None:
+    """The same thing through the whole pipeline, not through the helper.
+
+    A terminal bound to 0.0.0.0 answers on 127.0.0.1 AND on this machine's LAN
+    address, which the sweep covers anyway — so the till used to see two
+    terminals with different ids, and the one registered under one of them
+    looked unknown under the other.
+    """
+    import ipaddress
+
+    import src.devices.scan as scan
+    from src.models.terminal import (
+        TerminalDescriptor,
+        TerminalKind,
+        TerminalNetworkAddress,
+        TerminalTransport,
+    )
+
+    monkeypatch.setattr(
+        scan, "_local_subnets",
+        lambda: [ipaddress.ip_network("192.168.0.0/30", strict=False)],
+    )
+    # Both addresses accept the connect on the SSI port, nothing else does.
+    monkeypatch.setattr(
+        scan, "_probe_tcp",
+        lambda host, port, timeout=0.3: (
+            port == scan.SSI_TCP_PORT and host in ("127.0.0.1", "192.168.0.1")
+        ),
+    )
+
+    class OneTerminalEverywhere:
+        """The same unit, whichever address it is reached at."""
+
+        @staticmethod
+        async def probe(host: str, port: int):
+            return TerminalDescriptor(
+                id=f"{host}-{port}",
+                transport=TerminalTransport.network,
+                label=f"terminal @ {host}",
+                kind=TerminalKind.mono_pos,
+                model="Verifone X990",
+                serial="V1E0207420",
+                network=TerminalNetworkAddress(host=host, port=port),
+            )
+
+    monkeypatch.setattr(
+        scan, "_terminal_port_adapters",
+        lambda: {scan.SSI_TCP_PORT: [OneTerminalEverywhere]},
+    )
+
+    found = discover_network_terminals(timeout=0.01)
+
+    hosts = [d.network.host for d in found]
+    assert hosts == ["192.168.0.1"], (
+        f"one terminal, one entry, and at the address that works from "
+        f"anywhere: {hosts}"
+    )
+
+
+def test_one_terminal_bound_to_all_addresses_is_listed_once() -> None:
+    """PET-1159, found by the review — the loopback could double a terminal.
+
+    A terminal (or its emulator) bound to 0.0.0.0 answers both on 127.0.0.1
+    and on this machine's LAN address, which the sweep covers anyway. The id
+    carries the host, so the till saw two terminals, and the one registered
+    under one id looked unknown under the other.
+    """
+    from src.devices.scan import _without_loopback_twins
+    from src.models.terminal import (
+        TerminalDescriptor,
+        TerminalKind,
+        TerminalNetworkAddress,
+        TerminalTransport,
+    )
+
+    def made(host: str, serial: str) -> TerminalDescriptor:
+        return TerminalDescriptor(
+            id=f"{host}:{serial}",
+            transport=TerminalTransport.network,
+            label=f"terminal @ {host}",
+            kind=TerminalKind.mono_pos,
+            model="Verifone X990",
+            serial=serial,
+            network=TerminalNetworkAddress(host=host, port=3000),
+        )
+
+    on_lan = made("192.168.0.42", "V1E0207420")
+    on_loopback = made("127.0.0.1", "V1E0207420")
+    another = made("127.0.0.1", "V1E9999999")
+
+    kept = _without_loopback_twins([on_loopback, on_lan, another])
+
+    hosts = sorted(d.network.host for d in kept)
+    assert hosts == ["127.0.0.1", "192.168.0.42"], f"got {hosts}"
+    # The twin that was dropped is the loopback copy of the LAN one...
+    assert [d.serial for d in kept if d.network.host == "192.168.0.42"] == ["V1E0207420"]
+    # ...and a terminal that answers ONLY on the loopback stays, which is the
+    # whole point of scanning it.
+    assert [d.serial for d in kept if d.network.host == "127.0.0.1"] == ["V1E9999999"]
