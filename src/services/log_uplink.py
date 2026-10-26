@@ -49,6 +49,10 @@ class SocketIOLogHandler(logging.Handler):
         # LogRecord — не відправлені взагалі; dict — зірвались на відправці й
         # повернулись через requeue.
         self._buffer: deque[Any] = deque(maxlen=buffer_limit)
+        # PET-1157 — how many lines had no loop to go through. Said once on the
+        # next flush: a hole of this kind is otherwise found only by somebody
+        # going to look for it, which is how this one was found.
+        self._deferred = 0
 
     def emit(self, record: logging.LogRecord) -> None:  # noqa: D401
         try:
@@ -56,7 +60,19 @@ class SocketIOLogHandler(logging.Handler):
             if getattr(self._client, "connected", False):
                 # requeue: якщо зʼєднання впаде між цією перевіркою і самою
                 # відправкою, запис повернеться в буфер, а не зникне.
-                self._client.emit("log", payload, requeue=self._requeue_payload)
+                handed = self._client.emit(
+                    "log", payload, requeue=self._requeue_payload,
+                )
+                # PET-1157 — `False` means the client had no event loop to hand
+                # the line to (we are in a worker thread and the uplink is not
+                # started, or it is already stopping). Such a record used to
+                # vanish without a word: the uplink was CONNECTED, so the
+                # branch below did not buffer it either. Everything logged off
+                # the loop's thread was lost that way — the network scan among
+                # it, which is what the remote diagnostics exist for.
+                if handed is False:
+                    self._buffer.append(payload)
+                    self._deferred += 1
             else:
                 self._buffer.append(record)
         except RecursionError:
@@ -79,10 +95,41 @@ class SocketIOLogHandler(logging.Handler):
             item = self._buffer.popleft()
             payload = self._payload(item) if isinstance(item, logging.LogRecord) else item
             try:
-                self._client.emit("log", payload, requeue=self._requeue_payload)
+                if self._client.emit(
+                    "log", payload, requeue=self._requeue_payload,
+                ) is False:
+                    # PET-1157 — no loop to hand it to. Putting it back and
+                    # stopping is the only honest move: going on would spin
+                    # the whole buffer through the same refusal.
+                    self._buffer.appendleft(item)
+                    return
             except Exception:
                 self._buffer.appendleft(item)
                 return
+        self._say_deferred()
+
+    def _say_deferred(self) -> None:
+        """PET-1157 — one line about the records that had to wait for a loop.
+
+        Written from here, that is from the loop's own thread, and built by
+        hand rather than through `logging`: we are inside our own handler, and
+        a `logger.warning()` here would come straight back into `emit()`.
+        """
+        if not self._deferred or not getattr(self._client, "connected", False):
+            return
+        count, self._deferred = self._deferred, 0
+        try:
+            self._client.emit("log", {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "level": "WARNING",
+                "logger": "uplink",
+                "msg": (
+                    f"uplink: {count} log line(s) had no event loop to go "
+                    "through and went from the buffer instead"
+                ),
+            })
+        except Exception:
+            self._deferred = count
 
     def _payload(self, record: logging.LogRecord) -> dict:
         msg = record.getMessage()
@@ -125,6 +172,11 @@ class LogUplinkClient:
         self._install_id: str = ""
         self._version: str = ""
         self._tasks: set[asyncio.Task] = set()
+        # PET-1157 — the loop the uplink was started on. A log line written
+        # from a worker thread has no running loop of its own, and the scan of
+        # the network — the one thing the remote diagnostics are for — runs in
+        # exactly such a thread (`asyncio.to_thread`, a blocking TCP sweep).
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._sio.on("connect", self._on_connect, namespace="/managers")
         self._sio.on("disconnect", self._on_disconnect, namespace="/managers")
         self._sio.on("diagnostic", self._on_diagnostic, namespace="/managers")
@@ -152,8 +204,12 @@ class LogUplinkClient:
 
     def _spawn_emit(
         self, event: str, data: Any, requeue: Optional[Callable[[Any], None]] = None,
-    ) -> None:
+    ) -> bool:
         """Відправити, не чекаючи — але й не лишаючи виняток без господаря.
+
+        Returns True when the send was handed to the loop, False when there
+        was no loop to hand it to (PET-1157): then the caller keeps the line
+        instead of losing it.
 
         Доти тут було `loop.create_task(self._sio.emit(...))`. Якщо зʼєднання
         падало між перевіркою вище і виконанням задачі, `emit` кидав
@@ -166,7 +222,32 @@ class LogUplinkClient:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            return
+            # PET-1157 — we are NOT on the loop's thread. Until now this was
+            # the end of the line: `RuntimeError` → `return`, and the record
+            # disappeared — not into the buffer, not into a retry, without a
+            # word. Everything logged from a worker thread was lost, so the
+            # terminal and printer discovery (both `asyncio.to_thread`,
+            # because both are blocking sweeps) never showed up centrally at
+            # all, although the machine's own bhm.log had every line.
+            loop = self._loop
+            if loop is None or loop.is_closed():
+                return False
+            try:
+                loop.call_soon_threadsafe(self._send_on_loop, event, data, requeue)
+            except RuntimeError:
+                # The loop is on its way out (stopped between the check and
+                # now). The caller buffers it.
+                return False
+            return True
+        self._send_on_loop(event, data, requeue)
+        return True
+
+    def _send_on_loop(
+        self, event: str, data: Any, requeue: Optional[Callable[[Any], None]] = None,
+    ) -> None:
+        """Start the send. Always runs ON the loop's thread — either called
+        straight from async code, or handed over by `call_soon_threadsafe`."""
+        loop = asyncio.get_running_loop()
 
         async def _send() -> None:
             try:
@@ -193,17 +274,20 @@ class LogUplinkClient:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
-    def emit(self, event: str, data: Any, requeue: Optional[Callable[[Any], None]] = None) -> None:
+    def emit(
+        self, event: str, data: Any, requeue: Optional[Callable[[Any], None]] = None,
+    ) -> bool:
         """Sync entry point used by SocketIOLogHandler.
 
         We're inside `logging.Handler.emit()` which is a sync call — but
-        python-socketio's AsyncClient.emit is a coroutine. Schedule it on
-        the running loop without awaiting; if there's no loop (we're
-        being called from a non-async context), silently drop.
+        python-socketio's AsyncClient.emit is a coroutine, so it is handed to
+        the loop without awaiting. PET-1157 — this works from ANY thread now,
+        and says so: `False` means there was no loop to hand it to, and the
+        handler puts the line back in its buffer rather than losing it.
         """
         if not self.connected:
-            return
-        self._spawn_emit(event, data, requeue=requeue)
+            return False
+        return self._spawn_emit(event, data, requeue=requeue)
 
     def attach_handler_to_root(self) -> SocketIOLogHandler:
         h = SocketIOLogHandler(self)
@@ -229,6 +313,10 @@ class LogUplinkClient:
     async def start(self, install_id: str, version: str) -> None:
         self._install_id = install_id
         self._version = version
+        # PET-1157 — taken here and not in `__init__`: the client is built
+        # before the loop runs, and it is THIS loop that the worker threads
+        # need to reach.
+        self._loop = asyncio.get_running_loop()
         url = self._cfg["url"]
         try:
             await self._sio.connect(
@@ -258,6 +346,9 @@ class LogUplinkClient:
         #    кроками, воно не переживе метод.
         await self._drain_tasks()
         self.detach_handler_from_root()
+        # PET-1157 — and no thread may start a new send onto a loop that is
+        # closing: from here on such a line is refused, not scheduled.
+        self._loop = None
         # The diagnostics channel dies with the socket, not after it. Left in
         # place it would answer commands on any connection that came back.
         self._diagnostics_cb = None
@@ -415,15 +506,26 @@ class LogUplinkClient:
                 )
 
     def emit_event(self, event_type: str, **payload: Any) -> None:
-        """Fire-and-forget business event. Safe from any async context;
-        silently drops if uplink is disabled or offline."""
+        """Fire-and-forget business event. Safe from any thread and from any
+        async context; drops the event when the uplink is disabled or offline.
+
+        PET-1157 — an event has no buffer of its own (a log line does), so the
+        one case that can still lose it leaves a line instead of nothing: found
+        by the review, which pointed out that the commit claimed events took
+        the same path as log lines, and only their SCHEDULING did.
+        """
         if not self.connected:
             return
-        self._spawn_emit("event", {
+        handed = self._spawn_emit("event", {
             "type": event_type,
             "ts": datetime.now(timezone.utc).isoformat(),
             **payload,
         })
+        if handed is False:
+            self._log.warning(
+                f"uplink: the event {event_type!r} had no event loop to go "
+                "through and was dropped",
+            )
 
 
 def get_or_create_install_id(install_id_path: Path) -> str:

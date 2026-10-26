@@ -138,13 +138,19 @@ def test_pending_jobs_of_a_device_without_the_method_are_ignored():
     assert printers_with_pending_jobs(request) == []
 
 
-# --- охорона маршрутів -----------------------------------------------------
+# --- the guard on the routes -----------------------------------------------
 #
-# Тут навмисно НЕ перебираються `app.routes`: у цій версії FastAPI підключені
-# роутери лежать там лінивими обгортками без `path`, і перебір тихо давав
-# порожній перелік — тобто «усе класифіковано» на будь-якій таблиці. Тому
-# маршрути беруться з самих роутерів, а те, що охорону справді повісили,
-# перевіряється і по коду server.py, і живим запитом через TestClient.
+# `app.routes` is NOT walked here, and the reason is worth keeping: what it
+# holds depends on the version. Up to fastapi 0.136 `include_router` flattens
+# the routes into it with their full paths; from 0.16x it appends one opaque
+# object and keeps the routes inside. A walk over it therefore gave an empty
+# list on the newer one — which reads as «everything is classified», whatever
+# the table says. (This note said so before PET-1161, and I walked `app.routes`
+# anyway; CI, which installs the newest fastapi, caught it.)
+#
+# So the routes come from two places that do not depend on that shape: the
+# router modules themselves, and the application's OpenAPI schema. That the
+# guard is really attached is checked by a live request through TestClient.
 
 GUARDED_ROUTERS: list[tuple[str, str]] = [
     ("/print", "print_routes"),
@@ -196,8 +202,8 @@ def test_every_device_route_is_classified() -> None:
         if key not in CRITICAL_OPERATIONS and key not in SAFE_OPERATIONS
     ]
     assert not unclassified, (
-        "маршрути не класифіковані — додай їх у CRITICAL_OPERATIONS "
-        f"або в SAFE_OPERATIONS: {sorted(unclassified)}"
+        "these routes are classified in neither table — add them to "
+        f"CRITICAL_OPERATIONS or to SAFE_OPERATIONS: {sorted(unclassified)}"
     )
 
 
@@ -375,6 +381,287 @@ def test_a_real_charge_marks_the_manager_busy(client_with_terminal) -> None:
         f"спрацювала: {seen}"
     )
     assert app.state.busy.why_busy() is None, "операцію не відпустили"
+
+
+def test_a_cancel_marks_the_manager_busy_too(client_with_terminal) -> None:
+    """PET-1161 — the shape most likely to break: a path with a parameter in
+    it. The charge above is a plain path, so a key computed wrongly for
+    «/{terminal_id}/cancel» alone would still look fine there."""
+    from unittest.mock import patch
+
+    app = client_with_terminal.app
+    seen: list = []
+
+    async def _cancel(self):
+        seen.append(app.state.busy.why_busy())
+
+    with patch("src.services.terminals.ssi.SSITerminalAdapter.cancel", new=_cancel):
+        response = client_with_terminal.post(
+            "/terminal/abc123def456/cancel", headers={"X-Api-Key": _KEY},
+        )
+
+    assert response.status_code == 200, response.text
+    assert seen == ["скасування оплати на терміналі"], (
+        f"the manager is not counted busy during a cancellation: {seen}"
+    )
+    assert app.state.busy.why_busy() is None, "the operation was not released"
+
+
+def test_every_critical_route_really_takes_a_hold(client_with_terminal) -> None:
+    """PET-1161 — the one check the broken guard could not have survived.
+
+    The table test below reads `route.path` out of `app.routes`, which is the
+    very assumption that broke; only a real request proves what
+    `scope["route"]` carries. The two live tests above cover the payment and
+    the cancellation, so twelve critical routes were taken on trust — and the
+    guard being off on all of them is exactly what happened.
+
+    The handlers here mostly fail (there is no printer, no drawer, no fiscal
+    device in a test), and that does not matter: the dependency runs BEFORE the
+    handler, so the hold is taken either way. That is also why this is cheap
+    enough to do for every route.
+    """
+    from src.services.busy import CRITICAL_OPERATIONS, BusyTracker
+
+    client = client_with_terminal
+    taken: list[tuple[tuple[str, str], str]] = []
+    real_hold = BusyTracker.hold
+
+    for (method, path), label in sorted(CRITICAL_OPERATIONS.items()):
+        url = path.replace("{terminal_id}", "abc123def456")
+        seen: list[str] = []
+
+        def spy(self, held_label: str, _seen=seen):
+            _seen.append(held_label)
+            return real_hold(self, held_label)
+
+        BusyTracker.hold = spy
+        try:
+            client.request(method, url, headers={"X-Api-Key": _KEY}, json={})
+        finally:
+            BusyTracker.hold = real_hold
+        taken.append(((method, path), seen[0] if seen else None))
+
+    off = [key for key, held in taken if held is None]
+    assert not off, (
+        "the guard takes no hold on these critical routes, so an update may "
+        f"run in the middle of them: {off}"
+    )
+    # This compares the label held against the table, so it cannot catch a
+    # wrong TEXT in the table — there is no second source for that. What it
+    # does catch is a hold resolved from a DIFFERENT route's entry, which is
+    # how a false match across the two key shapes would show itself.
+    wrong = [
+        (key, held) for key, held in taken if held != CRITICAL_OPERATIONS[key]
+    ]
+    assert not wrong, f"the hold carries another route's label: {wrong}"
+
+
+def _served_by(app) -> list[tuple[str, str]]:
+    """Every (method, full path) the application really serves.
+
+    Asked through the OpenAPI schema, which is public API and the same on
+    every version. `app.routes` is NOT: up to fastapi 0.136 `include_router`
+    flattened the routes into it with their full paths, and from 0.16x it puts
+    a single opaque object there instead and keeps the routes inside it. The
+    first version of this test walked `app.routes`, so on CI — which installs
+    the newest fastapi, because requirements only say `>=0.111` — it found no
+    routes at all and failed. Reaching into the new object's private fields
+    would be the very mistake this ticket is about: reading a detail of the
+    version instead of asking the application (PET-1161).
+    """
+    served: list[tuple[str, str]] = []
+    for path, operations in app.openapi()["paths"].items():
+        for method in operations:
+            upper = method.upper()
+            if upper in ("HEAD", "OPTIONS"):
+                continue
+            served.append((upper, path))
+    return served
+
+
+def test_every_critical_route_is_held_as_the_app_registers_it(config) -> None:
+    """PET-1161 — the tables are checked against what the APP serves, not
+    against the paths composed in this very file.
+
+    `_router_routes` above builds «prefix + route.path» from the router
+    modules, which is the same arithmetic the broken guard did — so it agreed
+    with the tables while the guard, looking at the route it was handed,
+    matched nothing. Forty-five green table tests and the guard off on every
+    route. Here the keys come from the application itself.
+    """
+    from src.server import create_app
+    from src.services.busy import CRITICAL_OPERATIONS, critical_label
+
+    app = create_app(config)
+    prefixes = [prefix for prefix, _ in GUARDED_ROUTERS]
+
+    served = _served_by(app)
+    assert served, "the application served nothing — this test checks nothing"
+
+    held: dict[tuple[str, str], str] = {}
+    unclassified: list[tuple[str, str]] = []
+    for method, path in served:
+        # The bare prefix counts too: `GET /terminal` is a real route
+        # (`@router.get("")`), and matching only «prefix + /» let such a route
+        # slip past the classification check entirely.
+        prefix = next(
+            (p for p in prefixes if path == p or path.startswith(p + "/")), None
+        )
+        if prefix is None:
+            continue
+        label = critical_label(method, prefix, path)
+        if label is not None:
+            held[(method, path)] = label
+        elif (method, path) not in SAFE_OPERATIONS:
+            unclassified.append((method, path))
+
+    assert held, "no CRITICAL route was found at all — nothing is checked"
+    assert not unclassified, (
+        "a route under a guarded router is classified in neither table, so an "
+        f"update will not be held back for it: {sorted(unclassified)}"
+    )
+    # The schema is not the whole truth: a route declared with
+    # `include_in_schema=False` is served and never appears in it, so it
+    # would escape the check above entirely. The router modules know about it,
+    # so they are asked as well (found by the review).
+    hidden = [
+        key for key in _router_routes()
+        if any(
+            key[1] == p or key[1].startswith(p + "/")
+            for p in prefixes
+        )
+        and key not in served
+    ]
+    assert not hidden, (
+        "these routes are served but hidden from the schema, so the check "
+        f"above cannot see them: {sorted(hidden)}"
+    )
+
+    # Set equality, not a count: `critical_label` accepts two shapes of the
+    # key, so a typo in the table could be masked by a second, unintended
+    # match elsewhere while the two totals still agreed.
+    assert set(held) == set(CRITICAL_OPERATIONS), (
+        "the guard is not held on exactly the critical routes — missing "
+        f"{sorted(set(CRITICAL_OPERATIONS) - set(held))}, extra "
+        f"{sorted(set(held) - set(CRITICAL_OPERATIONS))}"
+    )
+
+
+def test_both_shapes_of_the_path_find_the_same_operation() -> None:
+    """PET-1161 — the guard looks up BOTH «/terminal/charge» and «/charge»
+    with the prefix added, because which of the two a route object carries is
+    a detail of the framework version. It changed once already and the guard
+    went off everywhere without a word; the second shape is what makes the
+    next such change harmless.
+    """
+    from src.services.busy import critical_label
+
+    # The full path — what the application serves, and what `app.routes` held
+    # on the versions that flattened it.
+    assert critical_label("POST", "/terminal", "/terminal/charge") == "оплата карткою"
+    # What the router module carries — and what route objects carried before
+    # the upgrade.
+    assert critical_label("POST", "/terminal", "/charge") == "оплата карткою"
+    # A route that is in neither shape is still not critical.
+    assert critical_label("POST", "/terminal", "/discover") is None
+
+
+def _pass_through(path: str, method: str = "POST", route: bool = True) -> None:
+    """Run the guard dependency for a route that is not critical.
+
+    `route=False` is the case where no route was chosen at all, so the path is
+    empty — FastAPI does not do that, but the code must not read the prefix as
+    a route of its own if it ever does.
+    """
+    import asyncio
+
+    from src.services.busy import guard_critical
+
+    class _Request:
+        scope = {"route": type("R", (), {"path": path})()} if route else {}
+        app = type("A", (), {"state": type("S", (), {})()})()
+
+    _Request.method = method
+
+    async def run() -> None:
+        gen = guard_critical("/terminal")(_Request())
+        await gen.asend(None)
+        await gen.aclose()
+
+    asyncio.run(run())
+
+
+def test_an_unclassified_route_is_reported_and_not_passed_over(caplog) -> None:
+    """A route in neither table used to go through without a word. That
+    silence is what kept the guard switched off unnoticed."""
+    import logging
+
+    from src.services import busy
+
+    busy._reported.clear()
+    with caplog.at_level(logging.WARNING):
+        _pass_through("/terminal/brand-new")
+
+    said = " ".join(r.getMessage() for r in caplog.records)
+    assert "/terminal/brand-new" in said
+
+
+def test_a_safe_route_is_not_reported(caplog) -> None:
+    """The mirror of the test above, and it is the one that matters for the
+    log: a guard that warned on EVERY uncritical request would put a line in
+    the uplinked log for each poll of the dashboard. Without this the warning
+    could be widened to «always» and nothing would notice."""
+    import logging
+
+    from src.services import busy
+
+    busy._reported.clear()
+    with caplog.at_level(logging.WARNING):
+        _pass_through("/terminal/discover")
+        _pass_through("/terminal/{terminal_id}/info", method="GET")
+
+    assert [r.getMessage() for r in caplog.records] == []
+
+
+def test_the_same_unclassified_route_is_reported_once(caplog) -> None:
+    """Said once per ROUTE — the «per route» half matters as much as the
+    «once» half. The dashboard polls some routes every second or two and this
+    log is uplinked, so a line per request would drown the thing it is meant
+    to make visible; but a single global «already said that» would silence
+    every route found after the first one, which is the very drift the
+    warning exists to surface (found by the review)."""
+    import logging
+
+    from src.services import busy
+
+    busy._reported.clear()
+    with caplog.at_level(logging.WARNING):
+        for _ in range(5):
+            _pass_through("/terminal/brand-new")
+            _pass_through("/terminal/another-new")
+
+    said = [r.getMessage() for r in caplog.records]
+    assert len(said) == 2, f"ten requests, two routes, lines said: {said}"
+    assert sum("/terminal/brand-new" in line for line in said) == 1
+    assert sum("/terminal/another-new" in line for line in said) == 1
+
+
+def test_a_request_without_a_route_is_not_read_as_the_prefix(caplog) -> None:
+    """With no route chosen the path is empty, and «prefix + ''» is
+    «/terminal» — a real, SAFE route. Letting the tables answer for that
+    would turn «we do not know what this is» into «this one is fine»
+    (found by the review)."""
+    import logging
+
+    from src.services import busy
+
+    busy._reported.clear()
+    with caplog.at_level(logging.WARNING):
+        _pass_through("", method="GET", route=False)
+
+    said = " ".join(r.getMessage() for r in caplog.records)
+    assert "<unknown>" in said, f"a request with no route said nothing: {said!r}"
 
 
 def test_a_read_only_request_does_not_mark_the_manager_busy(
