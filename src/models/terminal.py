@@ -230,12 +230,56 @@ class AcquirerResult(BaseModel):
 
 
 def make_terminal_id(transport: TerminalTransport, *parts: str) -> str:
-    """Stable 12-char hex id from transport + immutable address parts.
+    """Stable 12-char hex id from transport + the parts given.
 
-    For SSI terminals over LAN we hash transport + host + port + serial
-    (when known after the first GetTerminalInfo). Serial gives stability
-    across DHCP changes; before we know it, host+port is the fallback —
-    rediscovery will re-hash and update.
+    This is the raw hash. Callers should not decide the parts
+    themselves for network terminals — use `make_network_terminal_id`,
+    which knows which parts are allowed to change over the life of a
+    device.
     """
     payload = ":".join([transport.value, *parts]).encode("utf-8")
     return hashlib.sha1(payload).hexdigest()[:12]
+
+
+def make_network_terminal_id(
+    host: str, port: int | str, serial: Optional[str],
+) -> str:
+    """Id for a terminal reached over the network.
+
+    Two cases, and the difference matters:
+
+    * Serial known (the probe got as far as identify / GetTerminalInfo)
+      — the serial identifies the device, so only serial + port are
+      hashed. The host address is deliberately left out: a DHCP lease
+      shift must NOT mint a new id, otherwise the registration the POS
+      holds is orphaned and the operator has to add the terminal again.
+    * Serial unknown — the address is all we have, so host + port are
+      hashed and the id does change when the terminal moves. Nothing
+      better exists at that point; the next probe that reads the serial
+      produces the stable id.
+
+    The two spaces cannot collide: the serial slot is filled exactly
+    when the host slot is empty.
+    """
+    if serial:
+        return make_terminal_id(
+            TerminalTransport.network, "", str(port), serial,
+        )
+    return make_terminal_id(
+        TerminalTransport.network, host, str(port), "",
+    )
+
+
+def legacy_network_terminal_id(
+    host: str, port: int | str, serial: Optional[str],
+) -> str:
+    """The id a network terminal had before serials stopped carrying the
+    host address (PET-1304).
+
+    Kept so a terminal already registered on an older manager is
+    recognised on load and re-keyed in place instead of looking like a
+    device nobody ever added.
+    """
+    return make_terminal_id(
+        TerminalTransport.network, host, str(port), serial or "",
+    )

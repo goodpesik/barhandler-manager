@@ -22,6 +22,8 @@ from src.models.terminal import (
     TerminalRegistration,
     TerminalRegistrationRequest,
     TerminalTransport,
+    legacy_network_terminal_id,
+    make_network_terminal_id,
     make_terminal_id,
 )
 from src.services.terminals.base import TerminalAdapter
@@ -85,6 +87,11 @@ class TerminalRegistry:
         self.path = path
         self._registrations: Dict[str, TerminalRegistration] = {}
         self._last_discovery: Dict[str, TerminalDescriptor] = {}
+        # Old id the POS may still be holding -> the id we use now.
+        # Filled by `load()` when a stored registration predates
+        # PET-1304. Lookups accept both so nobody has to re-add a
+        # terminal that already works.
+        self._legacy_ids: Dict[str, str] = {}
 
     # ---------- persistence ----------
 
@@ -104,6 +111,67 @@ class TerminalRegistry:
                 continue
             self._registrations[reg.descriptor.id] = reg
         logger.info("loaded %d registered terminals", len(self._registrations))
+        self._index_legacy_network_ids()
+
+    def _index_legacy_network_ids(self) -> None:
+        """Make a terminal registered by an older manager keep working.
+
+        Before PET-1304 the host address was hashed into the id even
+        when the serial was known, so a terminal that already works on a
+        shop's till carries an id this code would no longer compute.
+        Left alone it would read as a device nobody ever registered, and
+        the operator would have to add it again — the exact complaint
+        the id change is fixing.
+
+        Two things happen here, for every stored network terminal that
+        has a serial:
+
+        * the old host-based id is derived from the registration's own
+          address and kept as an alias, so a till that still asks with
+          it is answered. It is derived and not stored, so it goes on
+          working after this file has been rewritten with the new id;
+        * if the stored id IS that old hash, the registration moves to
+          the id we compute now, and the file is written once. From then
+          on discovery and the file agree, and a DHCP move no longer
+          changes anything.
+
+        A stored id we cannot account for is left exactly as it is.
+        """
+        moves: list[tuple[str, str, TerminalRegistration]] = []
+        for stored_id, reg in self._registrations.items():
+            net = reg.descriptor.network
+            serial = reg.descriptor.serial
+            if net is None or not serial:
+                continue
+            current_id = make_network_terminal_id(net.host, net.port, serial)
+            legacy_id = legacy_network_terminal_id(net.host, net.port, serial)
+            if legacy_id != current_id:
+                self._legacy_ids[legacy_id] = current_id
+            if stored_id == current_id or stored_id != legacy_id:
+                continue
+            moves.append((stored_id, current_id, reg))
+        if not moves:
+            return
+        for stored_id, current_id, reg in moves:
+            self._registrations.pop(stored_id, None)
+            reg.descriptor.id = current_id
+            self._registrations[current_id] = reg
+            logger.info(
+                "terminal %s (s/n %s) re-keyed to %s: the address is no "
+                "longer part of the id, the old id still resolves",
+                stored_id, reg.descriptor.serial, current_id,
+            )
+        self.save()
+
+    def _resolve(self, terminal_id: str) -> Optional[str]:
+        """The id we store this terminal under, accepting an id from
+        before the re-keying. None when we know neither."""
+        if terminal_id in self._registrations:
+            return terminal_id
+        current = self._legacy_ids.get(terminal_id)
+        if current is not None and current in self._registrations:
+            return current
+        return None
 
     def save(self) -> None:
         payload = {
@@ -119,10 +187,10 @@ class TerminalRegistry:
     # ---------- lookups ----------
 
     def get_registration(self, terminal_id: str) -> TerminalRegistration:
-        reg = self._registrations.get(terminal_id)
-        if reg is None:
+        resolved = self._resolve(terminal_id)
+        if resolved is None:
             raise UnknownTerminal(terminal_id)
-        return reg
+        return self._registrations[resolved]
 
     def all_registrations(self) -> list[TerminalRegistration]:
         return list(self._registrations.values())
@@ -151,13 +219,13 @@ class TerminalRegistry:
         into `_last_discovery` so the existing `register()` path picks
         it up.
 
-        Serial is unknown until the first probe — we hash without it,
-        and the id stays stable across re-registrations of the same
-        host:port. If the operator later moves the terminal to a new
-        IP, the id changes (same as discovery's behavior)."""
-        terminal_id = make_terminal_id(
-            TerminalTransport.network, host, str(port), "",
-        )
+        Serial is unknown here — the operator types an address, nobody
+        has talked to the device yet — so the id can only be the address
+        itself, and it does change if the terminal later moves to a new
+        IP. That is the same fallback discovery uses when its probe
+        could not read a serial; both go through one helper so the two
+        paths cannot drift apart."""
+        terminal_id = make_network_terminal_id(host, port, None)
         descriptor = TerminalDescriptor(
             id=terminal_id,
             transport=TerminalTransport.network,
@@ -194,7 +262,8 @@ class TerminalRegistry:
 
     def register(self, req: TerminalRegistrationRequest) -> TerminalRegistration:
         descriptor = self._last_discovery.get(req.id)
-        existing = self._registrations.get(req.id)
+        resolved = self._resolve(req.id)
+        existing = self._registrations[resolved] if resolved else None
         if descriptor is None:
             # Allow re-register after a manager restart — operator can
             # then update nickname / default merchant without redoing
@@ -269,9 +338,13 @@ class TerminalRegistry:
         return merged
 
     def unregister(self, terminal_id: str) -> None:
-        if terminal_id not in self._registrations:
+        resolved = self._resolve(terminal_id)
+        if resolved is None:
             raise UnknownTerminal(terminal_id)
-        self._registrations.pop(terminal_id)
+        self._registrations.pop(resolved)
+        self._legacy_ids = {
+            old: new for old, new in self._legacy_ids.items() if new != resolved
+        }
         self.save()
 
     # ---------- adapter access ----------

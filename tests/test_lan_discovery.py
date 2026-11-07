@@ -143,11 +143,51 @@ def test_discover_finds_loopback_terminal(monkeypatch, loopback_terminal: int) -
 
 
 def test_discover_returns_empty_when_subnet_unknown(monkeypatch) -> None:
-    """No default route → empty list, never raises."""
+    """No default route → empty list, never raises.
+
+    Both enumerators are pinned: the sweep reads `_local_subnets`, so
+    leaving it live would have sent this test across the real network
+    of whatever machine runs it.
+    """
     import src.devices.scan as scan
 
     monkeypatch.setattr(scan, "_local_subnet", lambda: None)
+    monkeypatch.setattr(scan, "_local_subnets", lambda: [])
     assert discover_network_terminals() == []
+
+
+def test_discover_finds_a_terminal_slower_than_the_fast_pass(
+    monkeypatch, loopback_terminal: int,
+) -> None:
+    """PET-1304 — a busy terminal can be slow to accept a connection.
+    The sweep must come back for the addresses that stayed silent with
+    more patience, or such a terminal is never discoverable at all."""
+    import ipaddress
+
+    import src.devices.scan as scan
+
+    loop = ipaddress.ip_network("127.0.0.1/32", strict=False)
+    ssi_adapters = scan._terminal_port_adapters()[scan.SSI_TCP_PORT]
+    monkeypatch.setattr(scan, "_local_subnets", lambda: [loop])
+    monkeypatch.setattr(
+        scan, "_terminal_port_adapters", lambda: {loopback_terminal: ssi_adapters},
+    )
+
+    fast_ceiling = 0.3
+    real_probe = scan._probe_tcp
+
+    def refuses_the_fast_pass(host: str, port: int, timeout: float = 0.3) -> bool:
+        if timeout <= fast_ceiling:
+            return False
+        return real_probe(host, port, timeout)
+
+    monkeypatch.setattr(scan, "_probe_tcp", refuses_the_fast_pass)
+
+    descriptors = discover_network_terminals(
+        timeout=fast_ceiling, probe_timeout=2.0, slow_timeout=1.5,
+    )
+    assert len(descriptors) == 1, f"expected 1 terminal, got {descriptors}"
+    assert descriptors[0].serial == "V1E0207420"
 
 
 # ---------------------------------------------------------------------------

@@ -644,16 +644,60 @@ def _terminal_port_adapters() -> dict[int, list]:
     }
 
 
+TERMINAL_SWEEP_WORKERS = 256   # parallel TCP connects per sweep pass
+SLOW_SWEEP_TIMEOUT_S = 5.0     # connect timeout of the second pass
+
+
+def _sweep_open_pairs(
+    pairs: list[tuple[str, int]], timeout: float, workers: int,
+) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """TCP-connect every pair; return (answered, silent).
+
+    Split out so the sweep can run the same fan-out twice with
+    different patience.
+    """
+    answered: list[tuple[str, int]] = []
+    silent: list[tuple[str, int]] = []
+    if not pairs:
+        return answered, silent
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, min(workers, len(pairs))),
+    ) as pool:
+        future_map: dict = {
+            pool.submit(_probe_tcp, host, port, timeout): (host, port)
+            for host, port in pairs
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            pair = future_map[future]
+            try:
+                ok = future.result()
+            except Exception:  # noqa: BLE001
+                ok = False
+            (answered if ok else silent).append(pair)
+    return answered, silent
+
+
 def discover_network_terminals(
     timeout: float = 0.3,
     probe_timeout: float = 2.0,
+    slow_timeout: float = SLOW_SWEEP_TIMEOUT_S,
 ) -> list:
     """LAN scan for every supported POS-terminal protocol.
 
-    Two-phase: fast TCP connect across the host's /24 on every known
-    terminal/bridge port, then each open host:port is probed with the
-    adapters mapped to that port. The bank-specific handshake is what
-    tells a real terminal apart from "something listening on that port".
+    Fast TCP connect across the host's /24 on every known terminal/
+    bridge port, a second slower connect over whatever stayed silent,
+    then each open host:port is probed with the adapters mapped to that
+    port. The bank-specific handshake is what tells a real terminal
+    apart from "something listening on that port".
+
+    The second pass is PET-1304: a terminal in a bad state has been
+    measured taking many seconds to accept a connection, and a single
+    0.3 s ceiling means a sweep during such an episode can never find
+    it — the shop is then told its terminal can only be added by IP.
+    Raising the one ceiling instead would multiply the whole sweep by
+    the same factor, so the patience is spent only where it is needed:
+    on the addresses that did not answer at once, and with a wider
+    thread pool so the extra wait overlaps.
 
     Covered: SSI ECR JSON (Mono, 3000), PrivatBank JSON (2000),
     Printec PosAPI (Raif/PUMB bridge, 8080), BPOS1/Light (Pivdenny/Sense
@@ -681,25 +725,26 @@ def discover_network_terminals(
         hosts.insert(0, LOOPBACK_HOST)
     logger.info(
         "terminal discovery: scanning %d subnet(s) %s plus %s (%d hosts total) "
-        "ports=%s tcp_timeout=%.1fs",
+        "ports=%s tcp_timeout=%.1fs slow_timeout=%.1fs",
         len(subnets), [str(s) for s in subnets], LOOPBACK_HOST, len(hosts),
-        scan_ports, timeout,
+        scan_ports, timeout, slow_timeout,
     )
     # Collect open host:port pairs across every terminal port.
-    open_pairs: list[tuple[str, int]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
-        future_map: dict = {}
-        for host in hosts:
-            for port in scan_ports:
-                future_map[pool.submit(_probe_tcp, host, port, timeout)] = (host, port)
-        for future in concurrent.futures.as_completed(future_map):
-            host, port = future_map[future]
-            try:
-                if not future.result():
-                    continue
-            except Exception:  # noqa: BLE001
-                continue
-            open_pairs.append((host, port))
+    all_pairs = [(host, port) for host in hosts for port in scan_ports]
+    open_pairs, silent = _sweep_open_pairs(
+        all_pairs, timeout, TERMINAL_SWEEP_WORKERS,
+    )
+    if silent and slow_timeout > timeout:
+        slow_open, _ = _sweep_open_pairs(
+            silent, slow_timeout, TERMINAL_SWEEP_WORKERS,
+        )
+        if slow_open:
+            logger.info(
+                "terminal discovery: %d address(es) answered only on the "
+                "slow pass (%.1fs) — a busy or wedged terminal",
+                len(slow_open), slow_timeout,
+            )
+        open_pairs.extend(slow_open)
 
     open_by_port = {
         port: [h for h, p in open_pairs if p == port] for port in scan_ports

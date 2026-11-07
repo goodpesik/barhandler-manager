@@ -20,6 +20,8 @@ from src.models.terminal import (
     TerminalNetworkAddress,
     TerminalRegistrationRequest,
     TerminalTransport,
+    legacy_network_terminal_id,
+    make_network_terminal_id,
 )
 from src.services.terminals.ssi import SSITerminalAdapter
 
@@ -219,3 +221,60 @@ def test_first_returns_only_registered_terminal(tmp_path: Path) -> None:
     reg = registry.first()
     assert reg is not None
     assert reg.descriptor.id == "abc123"
+
+
+# ---------------------------------------------------------------------------
+# PET-1304 — the id of a network terminal
+# ---------------------------------------------------------------------------
+
+
+def test_one_serial_keeps_one_id_across_a_dhcp_move() -> None:
+    """A serial identifies the device, so a new lease must not mint a new
+    id — and two devices must never share one."""
+    at_first_lease = make_network_terminal_id("192.168.1.100", 3000, "V1E0207420")
+    at_second_lease = make_network_terminal_id("192.168.1.109", 3000, "V1E0207420")
+    assert at_first_lease == at_second_lease
+
+    other_device = make_network_terminal_id("192.168.1.100", 3000, "V1E0207421")
+    assert other_device != at_first_lease
+
+
+def test_without_a_serial_the_id_still_follows_the_address() -> None:
+    """Nothing better exists before a probe reads the serial, so the
+    address is the identity there, as it always was."""
+    here = make_network_terminal_id("192.168.1.100", 3000, None)
+    there = make_network_terminal_id("192.168.1.109", 3000, None)
+    assert here != there
+
+
+def test_terminal_registered_before_the_rekeying_is_still_found(tmp_path: Path) -> None:
+    """The upgrade: a terminal added by an older manager is stored under
+    the old host-based id. After loading it must answer to that id (the
+    till kept it) and to the id discovery computes now, without anyone
+    re-adding the terminal."""
+    path = tmp_path / "terminals.json"
+    host, port, serial = "192.168.1.109", 3000, "V1E0207420"
+    legacy_id = legacy_network_terminal_id(host, port, serial)
+    current_id = make_network_terminal_id(host, port, serial)
+    assert legacy_id != current_id  # otherwise this test proves nothing
+
+    descriptor = _descriptor(host=host, port=port, sid=legacy_id)
+    path.write_text(json.dumps({"terminals": [{
+        "descriptor": descriptor.model_dump(),
+        "kind": "mono_pos",
+        "nickname": "Бар 1",
+    }]}))
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    assert registry.get_registration(legacy_id).nickname == "Бар 1"
+    assert registry.get_registration(current_id).nickname == "Бар 1"
+    assert [r.descriptor.id for r in registry.all_registrations()] == [current_id]
+
+    # And after the rewritten file is loaded again — the id the till
+    # holds still resolves, because the old id is derived, not stored.
+    reloaded = TerminalRegistry(path=path)
+    reloaded.load()
+    assert reloaded.get_registration(legacy_id).nickname == "Бар 1"
+    assert reloaded.get_registration(current_id).nickname == "Бар 1"
