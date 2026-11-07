@@ -337,10 +337,14 @@ async def _cmd_terminal_probe(args: dict) -> dict:
         _, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=3,
         )
-        writer.close()
+        # BOTH halves of the release go inside the guard. The connect
+        # already succeeded, so the host IS reachable; a `close()` that
+        # raises on a half-dead socket would be caught by the handler
+        # below and reported as `ok: false` for a host that answered.
         try:
+            writer.close()
             await writer.wait_closed()
-        except Exception:
+        except Exception:  # noqa: BLE001 — close may double-fault
             pass
         return {"ok": True, "output": f"connected {host}:{port}"}
     except (asyncio.TimeoutError, OSError) as e:

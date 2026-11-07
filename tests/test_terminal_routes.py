@@ -9,6 +9,7 @@ itself (that's `test_ssi_adapter.py`).
 
 from __future__ import annotations
 
+import asyncio
 from typing import Iterator
 from unittest.mock import AsyncMock, patch
 
@@ -670,3 +671,173 @@ def test_a_card_refusal_the_terminal_spelled_out_stays_declined(
     assert row["status"] == "declined"
     # The bank's own code stays beside the words: it is what the bank asks for.
     assert row["detail"] == "Відмова · E05"
+
+
+# ---------------------------------------------------------------------------
+# One card operation per terminal at a time (PET-1304)
+#
+# A second click on Pay used to be stopped by the terminal: it refuses a second
+# ECR connection, and that refusal came back in about 3 s. With the bounded
+# connect retry a refused connect is tried for up to 14 s while a charge takes
+# 9-15 s, so the second Purchase can reach the terminal as the first finishes.
+# These run the two requests concurrently against the real ASGI app, because
+# that is the only way the race is the thing under test.
+# ---------------------------------------------------------------------------
+
+
+async def _two_charges_the_second_while_the_first_runs(
+    app, headers: dict, charge, first_is_in: "asyncio.Event",
+) -> tuple:
+    """Send the second /terminal/charge only once the first one is INSIDE the
+    adapter. Waiting for that instead of hoping the tasks interleave is the
+    difference between a case that pins the overlap and one that would pass
+    with the guard removed whenever the first request happened to finish."""
+    import httpx
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://manager",
+    ) as ac:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge", new=charge,
+        ):
+            running = asyncio.create_task(ac.post(
+                "/terminal/charge", headers=headers,
+                json={"amount_kopecks": 24500},
+            ))
+            await asyncio.wait_for(first_is_in.wait(), timeout=5)
+            second = await ac.post(
+                "/terminal/charge", headers=headers,
+                json={"amount_kopecks": 24500},
+            )
+            return await running, second
+
+
+@pytest.mark.asyncio
+async def test_a_second_charge_on_the_same_terminal_is_refused_while_the_first_runs(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """One terminal, two clicks: the terminal is asked ONCE and the second
+    caller is refused straight away. Refused, not queued — a queued second
+    charge is the same double charge a few seconds later."""
+    calls: list[int] = []
+    first_is_in = asyncio.Event()
+
+    async def slow_charge(self, request):
+        calls.append(request.amount_kopecks)
+        first_is_in.set()
+        # Stands in for the 9-15 s a charge takes on these terminals; the
+        # second request is already in by the time this returns.
+        await asyncio.sleep(0.05)
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    with patch("src.devices.scan.discover_usb", return_value=[]), \
+         patch("src.devices.scan.discover_network", return_value=[]), \
+         patch("src.devices.scan.discover_bluetooth", return_value=[]), \
+         patch(
+             "src.devices.scan.discover_network_terminals",
+             return_value=[fake_terminal],
+         ):
+        app = create_app(config)
+        with TestClient(app) as c:
+            _register_default(c, auth_headers, fake_terminal.id)
+        first, second = await _two_charges_the_second_while_the_first_runs(
+            app, auth_headers, slow_charge, first_is_in,
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "terminal_busy"
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_terminal_takes_the_next_charge_once_the_first_one_is_done(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The claim is held for one operation, not for the life of the process:
+    a guard that never let go would be worse than the double charge."""
+    calls: list[int] = []
+
+    async def quick_charge(self, request):
+        calls.append(request.amount_kopecks)
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    with patch("src.devices.scan.discover_usb", return_value=[]), \
+         patch("src.devices.scan.discover_network", return_value=[]), \
+         patch("src.devices.scan.discover_bluetooth", return_value=[]), \
+         patch(
+             "src.devices.scan.discover_network_terminals",
+             return_value=[fake_terminal],
+         ):
+        app = create_app(config)
+        with TestClient(app) as c:
+            _register_default(c, auth_headers, fake_terminal.id)
+            with patch(
+                "src.services.terminals.ssi.SSITerminalAdapter.charge",
+                new=quick_charge,
+            ):
+                for _ in range(3):
+                    assert c.post(
+                        "/terminal/charge", headers=auth_headers,
+                        json={"amount_kopecks": 24500},
+                    ).status_code == 200
+    assert len(calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_a_refund_waits_for_the_charge_on_the_same_terminal(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The slot belongs to the TERMINAL, not to the endpoint: it cannot run a
+    refund and a charge at the same time either."""
+    calls: list[str] = []
+    charge_is_in = asyncio.Event()
+
+    async def slow_charge(self, request):
+        calls.append("charge")
+        charge_is_in.set()
+        await asyncio.sleep(0.05)
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    async def refund(self, request):
+        calls.append("refund")
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    with patch("src.devices.scan.discover_usb", return_value=[]), \
+         patch("src.devices.scan.discover_network", return_value=[]), \
+         patch("src.devices.scan.discover_bluetooth", return_value=[]), \
+         patch(
+             "src.devices.scan.discover_network_terminals",
+             return_value=[fake_terminal],
+         ):
+        app = create_app(config)
+        with TestClient(app) as c:
+            _register_default(c, auth_headers, fake_terminal.id)
+        import httpx
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://manager",
+        ) as ac:
+            with patch(
+                "src.services.terminals.ssi.SSITerminalAdapter.charge",
+                new=slow_charge,
+            ), patch(
+                "src.services.terminals.ssi.SSITerminalAdapter.refund",
+                new=refund,
+            ):
+                running = asyncio.create_task(ac.post(
+                    "/terminal/charge", headers=auth_headers,
+                    json={"amount_kopecks": 24500},
+                ))
+                await asyncio.wait_for(charge_is_in.wait(), timeout=5)
+                returned = await ac.post(
+                    "/terminal/refund", headers=auth_headers,
+                    json={"amount_kopecks": 24500, "rrn": "9999999999"},
+                )
+                paid = await running
+
+    assert paid.status_code == 200
+    assert returned.status_code == 409
+    assert returned.json()["detail"]["code"] == "terminal_busy"
+    assert calls == ["charge"]

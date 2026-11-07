@@ -643,3 +643,27 @@ def test_the_dashboard_scan_button_is_bounded(
     # And it says it did not cover everything, rather than passing a cut
     # short sweep off as «no terminals here».
     assert response.json().get("partial") is True
+
+
+def test_a_reachable_port_stays_reachable_when_the_close_throws(monkeypatch) -> None:
+    """The connect decides the answer; the release cannot change it.
+
+    Same class as the terminal transports: the close used to run inside the
+    `except OSError`, so a close that raised on a half-dead socket reported a
+    port that had just accepted the connect as closed — and this probe is what
+    decides whether the terminal is discoverable at all.
+    """
+    import socket as socket_module
+
+    from src.devices import scan
+
+    class _ThrowsOnClose:
+        def close(self) -> None:
+            raise OSError("close failed")
+
+    monkeypatch.setattr(
+        socket_module, "create_connection",
+        lambda address, timeout=None: _ThrowsOnClose(),
+    )
+
+    assert scan._probe_tcp("127.0.0.1", 2000) is True

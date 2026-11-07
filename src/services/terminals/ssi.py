@@ -172,8 +172,13 @@ async def send_tcp(host: str, port: int, message: dict, timeout: float = REQUEST
             code="protocol_error",
         ) from exc
     finally:
-        writer.close()
+        # BOTH halves of the release go inside the guard. `close()` on a
+        # half-dead socket can raise, and raising from `finally` replaces
+        # whatever the caller was about to return — on a terminal that had
+        # just approved a payment that turned an approval into an error for
+        # money which had already moved.
         try:
+            writer.close()
             await writer.wait_closed()
         except Exception:  # noqa: BLE001 — close may double-fault
             pass

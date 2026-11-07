@@ -758,3 +758,62 @@ async def test_the_money_command_does_not_tread_on_the_merchant_question(monkeyp
     asked = next(t for m, t in term.stamps if m == "GetMerchantListDetailed")
     sent = next(t for m, t in term.stamps if m == "Refund")
     assert sent - asked >= 0.3, f"only {sent - asked:.3f}s between the two"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_close_does_not_lose_the_ssi_result(monkeypatch) -> None:
+    """The socket release can itself throw on a half-dead socket, and it
+    runs in a `finally` — so an unguarded `close()` replaces whatever the
+    caller was about to return. On a terminal that had just approved a
+    payment that turns an approval into an error for money which has
+    already moved. The real socket of the mock terminal cannot be made to
+    fail on close, so the connection is scripted here."""
+    from src.services.terminals import ssi as ssi_module
+
+    reply = {"method": "GetStatus", "responseCode": "0000", "status": "S00"}
+    wire = encode_frame(reply)
+
+    class _SlicingReader:
+        """Serves the framed reply in the exact slices SSI asks for."""
+
+        def __init__(self, data: bytes) -> None:
+            self._data = data
+            self._pos = 0
+
+        async def readexactly(self, n: int) -> bytes:
+            chunk = self._data[self._pos : self._pos + n]
+            self._pos += n
+            if len(chunk) < n:
+                raise asyncio.IncompleteReadError(chunk, n)
+            return chunk
+
+    class _ThrowingWriter:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def write(self, data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed += 1
+            raise OSError("close failed")
+
+        async def wait_closed(self) -> None:
+            raise OSError("wait_closed failed")
+
+    writer = _ThrowingWriter()
+
+    async def fake_open_connection(host, port):
+        return _SlicingReader(wire), writer
+
+    monkeypatch.setattr(ssi_module.asyncio, "open_connection", fake_open_connection)
+
+    response = await ssi_module.send_tcp(
+        "192.168.1.50", 9100, {"method": "GetStatus"},
+    )
+
+    assert response == reply
+    assert writer.closed == 1

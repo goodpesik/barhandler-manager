@@ -277,8 +277,13 @@ class PrinterDevice:
                 _, writer = await asyncio.wait_for(
                     asyncio.open_connection(host, port), timeout=2.0,
                 )
-                writer.close()
+                # BOTH halves of the release go inside the guard. The
+                # connect already succeeded, so the printer IS reachable;
+                # a `close()` that raises on a half-dead socket would be
+                # caught below and reported as offline, and the heartbeat
+                # would drop a working handle.
                 with suppress(Exception):
+                    writer.close()
                     await writer.wait_closed()
                 return True
             except Exception:

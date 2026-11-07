@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import socket
 
 
@@ -18,5 +19,9 @@ def port_taken(host: str, port: int) -> bool:
     except OSError:
         return True
     finally:
-        s.close()
+        # Guarded: this is a throwaway bind probe, and a close that raised
+        # would come out of the `finally` instead of the answer — the manager
+        # would fail to start over a socket nobody needs any more.
+        with contextlib.suppress(OSError):
+            s.close()
     return False

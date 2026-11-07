@@ -66,3 +66,45 @@ def test_printer_unavailable_carries_code() -> None:
 def test_printer_unavailable_defaults_to_unavailable() -> None:
     exc = PrinterUnavailable("generic")
     assert exc.code == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_close_does_not_report_a_reachable_printer_offline(
+    monkeypatch,
+) -> None:
+    """`async_probe` opens a throwaway connection to decide whether a
+    network printer is still there, and the heartbeat drops the handle
+    when it answers False. The connect succeeding IS the answer: a
+    `close()` that throws on a half-dead socket must not turn a reachable
+    printer into an offline one."""
+    import asyncio
+
+    from src.devices import printer as printer_module
+
+    class _ThrowingWriter:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+            raise OSError("close failed")
+
+        async def wait_closed(self) -> None:
+            raise OSError("wait_closed failed")
+
+    writer = _ThrowingWriter()
+
+    async def fake_open_connection(host, port):
+        return object(), writer
+
+    monkeypatch.setattr(
+        printer_module.asyncio, "open_connection", fake_open_connection,
+    )
+
+    device = PrinterDevice(
+        "net", {"connection": "network", "host": "192.168.1.70", "port": 9100},
+    )
+    device._printer = MagicMock()
+
+    assert await device.async_probe() is True
+    assert writer.closed == 1
