@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from src.devices import terminal_registry
 from src.devices.terminal_registry import TerminalRegistry, UnknownTerminal
 from src.models.terminal import (
     MerchantBinding,
@@ -334,8 +335,9 @@ def test_one_terminal_stored_under_two_addresses_loses_nothing(
     winner = registry.get_registration(current_id)
     assert winner.nickname == "Бар 1"
     assert winner.default_merchant_id == "000000060007176"
-    assert winner.descriptor.network.host == "10.0.0.5", (
-        "the furnished copy keeps the registration, including its address"
+    assert winner.descriptor.network.host == "10.0.0.9", (
+        "the furnished copy keeps the registration, but the address comes "
+        "from the copy registered after it — nothing else corrects it"
     )
     # And the one that gave way is not gone: a till holding either old id
     # is still answered, and the merchant bindings of both are kept.
@@ -461,3 +463,120 @@ def test_merchant_refresh_through_an_old_id_is_stored(tmp_path: Path) -> None:
     assert [m.merchant_id for m in reloaded.get_registration(pos_id).merchants] == [
         "60007176",
     ]
+
+
+# ---------------------------------------------------------------------------
+# PET-1304 — the file is UTF-8 on both halves
+# ---------------------------------------------------------------------------
+
+
+def test_a_cyrillic_nickname_round_trips_through_save_and_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`save()` writes UTF-8, so `load()` has to read UTF-8 — whatever
+    the station's own code page is. Read as ANSI instead, «Каса 1»
+    comes back as mojibake on a Ukrainian Windows and the next save
+    writes the mojibake back; on a Western one the same bytes raise and
+    the file reads as no terminals at all, after which the first
+    registration writes over every terminal the shop had."""
+    monkeypatch.setattr(
+        terminal_registry, "_station_encoding", lambda: "cp1251",
+    )
+    path = tmp_path / "terminals.json"
+    registry = TerminalRegistry(path=path)
+    descriptor = _descriptor()
+    registry.remember_descriptors([descriptor])
+    registry.register(TerminalRegistrationRequest(
+        id=descriptor.id, kind=TerminalKind.mono_pos, nickname="Каса 1",
+    ))
+
+    reloaded = TerminalRegistry(path=path)
+    reloaded.load()
+
+    assert reloaded.get_registration(descriptor.id).nickname == "Каса 1"
+
+
+def test_a_file_written_in_the_stations_code_page_is_still_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The upgrade from v1.0.10: that manager wrote the file in the
+    station's code page, and it is sitting on the till right now. It
+    has to be read, not refused — refusing it reads as zero
+    registrations, and the next register() overwrites it — and it is
+    put back as UTF-8 so this is the last start that has to guess."""
+    monkeypatch.setattr(
+        terminal_registry, "_station_encoding", lambda: "cp1251",
+    )
+    path = tmp_path / "terminals.json"
+    descriptor = _descriptor()
+    path.write_bytes(json.dumps({"terminals": [{
+        "descriptor": descriptor.model_dump(),
+        "kind": "mono_pos",
+        "nickname": "Каса 1",
+    }]}, ensure_ascii=False).encode("cp1251"))
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    assert registry.get_registration(descriptor.id).nickname == "Каса 1"
+    # Rewritten as UTF-8, so the guessing stops here.
+    rewritten = json.loads(path.read_text(encoding="utf-8"))
+    assert rewritten["terminals"][0]["nickname"] == "Каса 1"
+    # And the file as the shop had it is kept, in case the code page
+    # guessed above was the wrong one.
+    assert (tmp_path / "terminals.json.bak").read_bytes().decode("cp1251")
+
+
+# ---------------------------------------------------------------------------
+# PET-1304 — which address the survivor of a merge dials
+# ---------------------------------------------------------------------------
+
+
+def test_the_surviving_registration_carries_the_live_address(
+    tmp_path: Path,
+) -> None:
+    """The operator's typed work decides WHICH registration survives,
+    and that can easily be the copy sitting at an address the terminal
+    has since left. Nothing in the manager rewrites a stored address,
+    so the survivor must come out of the merge holding the newest one
+    — the later entry in the file — or a terminal that worked before
+    the upgrade starts sending every charge to a dead address."""
+    path = tmp_path / "terminals.json"
+    path.write_bytes(json.dumps({"terminals": [
+        _stored_under_its_legacy_id("10.0.0.1", nickname="Бар"),
+        _stored_under_its_legacy_id("10.0.0.2"),
+    ]}, ensure_ascii=False).encode("utf-8"))
+    current_id = make_network_terminal_id("10.0.0.1", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    winner = registry.get_registration(current_id)
+    # The nickname still decides who survives...
+    assert winner.nickname == "Бар"
+    # ...but not which address that survivor talks to.
+    assert winner.descriptor.network.host == "10.0.0.2"
+
+
+def test_the_winners_own_old_ids_still_resolve_after_a_rekey(
+    tmp_path: Path,
+) -> None:
+    """A registration can already carry ids of its own from an earlier
+    move. The re-key points the id it is leaving today at its new key,
+    and `_resolve` takes a single hop — so the earlier ones have to be
+    re-pointed in the same go, or a till holding one of them is told
+    the terminal is not registered."""
+    path = tmp_path / "terminals.json"
+    path.write_bytes(json.dumps({"terminals": [
+        _stored_under_its_legacy_id(
+            "10.0.0.5", nickname="Бар 1", known_ids=["an-even-older-id"],
+        ),
+    ]}, ensure_ascii=False).encode("utf-8"))
+    current_id = make_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    kept = registry.get_registration("an-even-older-id")
+    assert kept.descriptor.id == current_id
+    assert kept.nickname == "Бар 1"

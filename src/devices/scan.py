@@ -10,6 +10,7 @@ story is fiddly enough that the operator hand-registers paired devices.
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import ipaddress
 import logging
@@ -646,11 +647,34 @@ def _terminal_port_adapters() -> dict[int, list]:
 
 
 TERMINAL_SWEEP_WORKERS = 256   # parallel TCP connects per sweep pass
+# Budget of the sweep behind the dashboard's «Сканувати термінали».
+# Nobody is counting the seconds behind that button, but something in
+# front of it is: the sweep used to cost some 6 s and now costs 25–27 s
+# per /24 and some 80 s across four subnets, which is past the default
+# read timeout of every proxy a station could ever sit behind — and
+# then the operator gets a gateway error instead of the terminals that
+# WERE found. Bounded well under a minute, with the same partial answer
+# the remote command gives.
+DASHBOARD_SWEEP_BUDGET_S = 45.0
 SLOW_SWEEP_TIMEOUT_S = 5.0     # connect timeout of the second pass
+# A single probe's hard ceiling. The slowest handshake we ship is 2.5 s
+# of ping plus 5 s of info (BPOS / Oschad / PosAPI; SSI is 2 + 5), so
+# anything past this is not a terminal taking its time, it is a socket
+# that will not finish. Without the ceiling the budget is only checked
+# BEFORE a probe starts, and one probe begun with 2 s left could still
+# run 7 s and land the whole answer outside the window the server waits
+# in — exactly the slow-but-answering terminal this ticket is about.
+PROBE_CEILING_S = 9.0
 # Kept back from a budget for the probes: the sweep only says who is
 # listening, the probes are what turns that into a terminal, so spending
-# the whole budget on sweeping would answer «nothing found».
-PROBE_RESERVE_S = 8.0
+# the whole budget on sweeping would answer «nothing found». One full
+# probe's worth, so the reserve is never smaller than the thing it is
+# reserved for.
+PROBE_RESERVE_S = PROBE_CEILING_S
+# How much more patient the second sweep pass has to be than the first
+# to be worth running at all. Cut to 0.4 s against a 0.3 s fast pass it
+# proves nothing, and the log would still claim a patient pass had run.
+SLOW_PASS_MIN_MARGIN_S = 1.0
 
 
 def _sweep_open_pairs(
@@ -738,6 +762,7 @@ def discover_network_terminals(
             "slow_pass": "not needed",
             "probes_run": 0,
             "probes_skipped": 0,
+            "probes_cut_off": 0,
             "cut_short": False,
         })
 
@@ -787,16 +812,22 @@ def discover_network_terminals(
         batches = max(1, -(-len(silent) // TERMINAL_SWEEP_WORKERS))
         affordable = (_left() - PROBE_RESERVE_S) / batches
         effective_slow = min(slow_timeout, affordable)
-        if effective_slow <= timeout:
+        if effective_slow < timeout + SLOW_PASS_MIN_MARGIN_S:
             logger.warning(
-                "terminal discovery: no time left for the slow pass over %d "
-                "silent address(es) within the %.0fs budget — a terminal too "
-                "busy to answer in %.1fs stays unfound; scan one subnet at a "
-                "time to get the patient pass back",
-                len(silent), budget_s or 0.0, timeout,
+                "terminal discovery: no room for a slow pass over %d silent "
+                "address(es) within the %.0fs budget — %.1fs of patience "
+                "was affordable and anything under %.1fs would prove "
+                "nothing the %.1fs pass has not already; a terminal too busy "
+                "to answer in %.1fs stays unfound, scan one subnet at a time "
+                "to get the patient pass back",
+                len(silent), budget_s or 0.0, max(effective_slow, 0.0),
+                timeout + SLOW_PASS_MIN_MARGIN_S, timeout, timeout,
             )
             if coverage is not None:
-                coverage["slow_pass"] = "skipped: no time left in the budget"
+                coverage["slow_pass"] = (
+                    "skipped: the patience the budget allowed would have "
+                    "proved nothing the fast pass had not"
+                )
                 coverage["cut_short"] = True
         else:
             if coverage is not None:
@@ -858,6 +889,7 @@ def discover_network_terminals(
         seen: set[str] = set()
         run = 0
         skipped = 0
+        cut = 0
         for host, port in open_pairs:
             for adapter in port_adapters.get(port, []):
                 key = f"{host}:{port}:{adapter.__name__}"
@@ -869,16 +901,40 @@ def discover_network_terminals(
                 # a NAS, a dashboard, a dev server. Eight of those are
                 # enough to walk out of the budget, and then the whole
                 # answer is lost instead of part of it.
-                if _left() <= probe_timeout:
+                left = _left()
+                if left <= probe_timeout:
                     skipped += 1
                     continue
                 run += 1
+                # And the probe itself is held to what is left. The
+                # check above only says a probe may START; a handshake
+                # is up to 7.5 s of its own timeouts, so one begun with
+                # 2 s to spare would walk the whole sweep out of the
+                # window the server waits in, and the result would
+                # reach nobody. Cut short is counted as not run: the
+                # address was never answered for either way.
                 try:
-                    descriptor = await adapter.probe(host, port)
+                    descriptor = await asyncio.wait_for(
+                        adapter.probe(host, port),
+                        timeout=min(left, PROBE_CEILING_S),
+                    )
+                except asyncio.TimeoutError:
+                    descriptor = None
+                    run -= 1
+                    cut += 1
+                    logger.warning(
+                        "terminal discovery: %s probe of %s:%d given up on "
+                        "after %.1fs — a terminal that cannot finish a "
+                        "handshake in that long is not usable anyway, and "
+                        "the rest of the sweep still has to answer",
+                        adapter.__name__, host, port,
+                        min(left, PROBE_CEILING_S),
+                    )
                 except Exception:  # noqa: BLE001
                     descriptor = None
                 if descriptor is not None:
                     out.append(descriptor)
+        skipped += cut
         if skipped:
             logger.warning(
                 "terminal discovery: %d of %d probes left unrun — the %.0fs "
@@ -887,13 +943,16 @@ def discover_network_terminals(
                 skipped, run + skipped, budget_s or 0.0, len(out),
             )
         if coverage is not None:
+            # A probe given up on counts with the ones never started:
+            # neither answered for its address, and saying «run» of a
+            # probe that was cut off would be the dishonest half of the
+            # same report.
             coverage["probes_run"] = run
             coverage["probes_skipped"] = skipped
+            coverage["probes_cut_off"] = cut
             if skipped:
                 coverage["cut_short"] = True
         return out
-
-    import asyncio
 
     return _without_loopback_twins(asyncio.run(_probe_all()))
 

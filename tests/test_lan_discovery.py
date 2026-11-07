@@ -561,3 +561,85 @@ def test_remote_discovery_answers_inside_the_server_window(
     # And it says so, instead of reporting a clean "no terminals here".
     assert result.get("partial") is True
     assert "second patient pass" in result["note"]
+
+
+def test_a_probe_that_overruns_cannot_push_the_sweep_past_its_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PET-1304 — the budget was only checked BEFORE a probe started,
+    and a handshake is up to 7.5 s of its own timeouts: one probe begun
+    with 2 s left landed the whole sweep outside the window the server
+    waits in, and the result reached nobody. Each probe is bounded by
+    what is left of the budget."""
+    import ipaddress
+    import time
+
+    import src.devices.scan as scan
+
+    class _NeverFinishes:
+        """Listens, answers the connect, then says nothing — a wedged
+        terminal or a NAS on a terminal port."""
+
+        __name__ = "_NeverFinishes"
+
+        @staticmethod
+        async def probe(host: str, port: int):
+            await asyncio.sleep(5)
+            return None
+
+    monkeypatch.setattr(
+        scan, "_local_subnets",
+        lambda: [ipaddress.ip_network("127.0.0.1/32")],
+    )
+    monkeypatch.setattr(
+        scan, "_terminal_port_adapters", lambda: {SSI_TCP_PORT: [_NeverFinishes]},
+    )
+    monkeypatch.setattr(
+        scan, "_probe_tcp", lambda host, port, timeout=0.3: True,
+    )
+    monkeypatch.setattr(scan, "PROBE_CEILING_S", 0.5)
+
+    started = time.monotonic()
+    found = scan.discover_network_terminals(
+        timeout=0.01, probe_timeout=0.05, budget_s=2.0,
+    )
+    elapsed = time.monotonic() - started
+
+    assert found == []
+    assert elapsed < 2.0, f"the sweep took {elapsed:.1f}s against a 2s budget"
+
+
+def test_the_dashboard_scan_button_is_bounded(
+    client, auth_headers: dict, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PET-1304 — the dashboard's sweep gained the same patient second
+    pass, which costs 25–27 s per /24 and some 80 s across four
+    subnets. Unbounded behind an HTTP request it is only as good as the
+    shortest timeout in front of it, and the operator then gets a
+    gateway error instead of the terminals that were found."""
+    import ipaddress
+    import time
+
+    import src.devices.scan as scan
+
+    monkeypatch.setattr(
+        scan, "_local_subnets",
+        lambda: [ipaddress.ip_network("192.168.77.0/29")],
+    )
+    monkeypatch.setattr(scan, "DASHBOARD_SWEEP_BUDGET_S", 3.0)
+
+    def nothing_ever_answers(host: str, port: int, timeout: float = 0.3) -> bool:
+        time.sleep(timeout)
+        return False
+
+    monkeypatch.setattr(scan, "_probe_tcp", nothing_ever_answers)
+
+    started = time.monotonic()
+    response = client.post("/terminal/discover", headers=auth_headers)
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 200
+    assert elapsed < 3.0, f"answered after {elapsed:.1f}s, budget was 3s"
+    # And it says it did not cover everything, rather than passing a cut
+    # short sweep off as «no terminals here».
+    assert response.json().get("partial") is True

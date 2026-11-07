@@ -205,13 +205,32 @@ class _Operation:
 async def discover(request: Request) -> dict:
     """LAN-scan + probe. Returns discovered terminals merged with
     manually registered ones so the frontend always sees the full list.
+
+    Bounded by `DASHBOARD_SWEEP_BUDGET_S`, like the remote command is
+    by its own budget. The sweep is no longer the cheap thing it was —
+    it gained a second, patient pass worth 25–27 s per /24 and some
+    80 s across four subnets — and an unbounded sweep behind an HTTP
+    request is only as good as the shortest timeout in front of it.
+    What could not be covered is said out loud (`partial`) instead of
+    being passed off as a complete answer; the second pass is NOT made
+    conditional on the first one finding nothing, because a shop with
+    one quick terminal and one wedged one is exactly the case the
+    patient pass exists for.
     """
     import asyncio
+    import logging
 
-    from src.devices.scan import discover_network_terminals
+    from src.devices.scan import DASHBOARD_SWEEP_BUDGET_S, discover_network_terminals
+
+    log = logging.getLogger("src.routes.terminal")
 
     registry = _registry(request)
-    descriptors = await asyncio.to_thread(discover_network_terminals)
+    coverage: dict = {}
+    descriptors = await asyncio.to_thread(
+        discover_network_terminals,
+        budget_s=DASHBOARD_SWEEP_BUDGET_S,
+        coverage=coverage,
+    )
     registry.remember_descriptors(descriptors)
 
     # Merge: start with discovered, then add manually registered ones
@@ -223,7 +242,31 @@ async def discover(request: Request) -> dict:
         if reg.descriptor.id not in seen_ids
     ]
 
-    return {"terminals": [d.model_dump() for d in descriptors + manual]}
+    body: dict = {"terminals": [d.model_dump() for d in descriptors + manual]}
+    if coverage.get("cut_short"):
+        # The dashboard reads `terminals` and nothing else, so this is
+        # for the log and for whoever reads the API — it is the same
+        # answer, with the part that could not be covered named.
+        body["partial"] = True
+        body["note"] = (
+            f"the sweep was kept inside {DASHBOARD_SWEEP_BUDGET_S:.0f}s: "
+            f"{coverage['pairs']} address:port pairs over "
+            f"{coverage['hosts']} hosts, second patient pass "
+            f"{coverage['slow_pass']}, {coverage['probes_skipped']} probe(s) "
+            f"not run. A terminal may be missing; add it by address, or "
+            f"scan one subnet at a time."
+        )
+        log.warning(
+            "terminal discovery for the dashboard did not cover everything "
+            "inside its %.0fs budget: %s pairs over %s hosts, slow pass %s, "
+            "%s of %s probes not run (%s of them cut off) — %d terminal(s) "
+            "answered",
+            DASHBOARD_SWEEP_BUDGET_S, coverage["pairs"], coverage["hosts"],
+            coverage["slow_pass"], coverage["probes_skipped"],
+            coverage["probes_run"] + coverage["probes_skipped"],
+            coverage.get("probes_cut_off", 0), len(descriptors),
+        )
+    return body
 
 
 @router.get("")
