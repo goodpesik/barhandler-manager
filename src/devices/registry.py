@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -114,6 +115,34 @@ class PrinterRegistry:
         logger.info("loaded %d registered printers", len(self._registrations))
 
     def save(self) -> None:
+        """Replace printers.json in one step.
+
+        Writing over the file in place truncates it first, so a power cut
+        or a kill in the middle left a half-written file behind — and that
+        reads as zero printers on the next start, after which the first
+        `register()` writes the shop's one printer over the remains of all
+        of them. The temporary file sits in the same folder so the rename
+        stays on one filesystem and is therefore atomic. Same shape as
+        `terminal_registry`, `station_settings` and `offline_offer`.
+
+        The bytes are forced to the disk before the rename, because the
+        rename being atomic only says that the file is either the old one
+        or the new one — not that the new one has reached the platter.
+        Written and renamed inside the cache, a power cut right after can
+        leave NTFS holding the new name over a zero-length file, which is
+        the very loss the temporary file is here to prevent.
+
+        NO EXPLICIT ENCODING ON PURPOSE, and do not add one here alone:
+        `load()` reads with a bare `read_text()`, so both halves use the
+        station's own code page and agree with each other, which is the
+        whole requirement. Giving `save()` a `utf-8` it does not give
+        `load()` is exactly the bug review found in the terminal registry
+        — the nicknames there came back as mojibake on a Ukrainian
+        Windows and raised on a Western one, which reads as no devices at
+        all. Moving this file to UTF-8 means teaching `load()` to read
+        both, as the terminal registry now does, and that is a change of
+        its own.
+        """
         # Entries we could not parse ride along untouched. Writing only what we
         # understood would delete them, and every registration change calls
         # this — so the loss would arrive later, by an unrelated hand (BH-178,
@@ -122,7 +151,12 @@ class PrinterRegistry:
             "printers": [r.model_dump() for r in self._registrations.values()]
             + self._unreadable,
         }
-        self.path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        with open(tmp, "w", newline="\n") as handle:
+            handle.write(json.dumps(payload, indent=2, ensure_ascii=False))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, self.path)
 
     # ---------- discovery ----------
 

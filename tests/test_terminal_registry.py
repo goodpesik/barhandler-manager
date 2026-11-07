@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from src.devices import terminal_registry
 from src.devices.terminal_registry import TerminalRegistry, UnknownTerminal
 from src.models.terminal import (
     MerchantBinding,
@@ -20,6 +21,8 @@ from src.models.terminal import (
     TerminalNetworkAddress,
     TerminalRegistrationRequest,
     TerminalTransport,
+    legacy_network_terminal_id,
+    make_network_terminal_id,
 )
 from src.services.terminals.ssi import SSITerminalAdapter
 
@@ -219,3 +222,361 @@ def test_first_returns_only_registered_terminal(tmp_path: Path) -> None:
     reg = registry.first()
     assert reg is not None
     assert reg.descriptor.id == "abc123"
+
+
+# ---------------------------------------------------------------------------
+# PET-1304 — the id of a network terminal
+# ---------------------------------------------------------------------------
+
+
+def test_one_serial_keeps_one_id_across_a_dhcp_move() -> None:
+    """A serial identifies the device, so a new lease must not mint a new
+    id — and two devices must never share one."""
+    at_first_lease = make_network_terminal_id("192.168.1.100", 3000, "V1E0207420")
+    at_second_lease = make_network_terminal_id("192.168.1.109", 3000, "V1E0207420")
+    assert at_first_lease == at_second_lease
+
+    other_device = make_network_terminal_id("192.168.1.100", 3000, "V1E0207421")
+    assert other_device != at_first_lease
+
+
+def test_without_a_serial_the_id_still_follows_the_address() -> None:
+    """Nothing better exists before a probe reads the serial, so the
+    address is the identity there, as it always was."""
+    here = make_network_terminal_id("192.168.1.100", 3000, None)
+    there = make_network_terminal_id("192.168.1.109", 3000, None)
+    assert here != there
+
+
+def test_terminal_registered_before_the_rekeying_is_still_found(tmp_path: Path) -> None:
+    """The upgrade: a terminal added by an older manager is stored under
+    the old host-based id. After loading it must answer to that id (the
+    till kept it) and to the id discovery computes now, without anyone
+    re-adding the terminal."""
+    path = tmp_path / "terminals.json"
+    host, port, serial = "192.168.1.109", 3000, "V1E0207420"
+    legacy_id = legacy_network_terminal_id(host, port, serial)
+    current_id = make_network_terminal_id(host, port, serial)
+    assert legacy_id != current_id  # otherwise this test proves nothing
+
+    descriptor = _descriptor(host=host, port=port, sid=legacy_id)
+    path.write_text(json.dumps({"terminals": [{
+        "descriptor": descriptor.model_dump(),
+        "kind": "mono_pos",
+        "nickname": "Бар 1",
+    }]}))
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    assert registry.get_registration(legacy_id).nickname == "Бар 1"
+    assert registry.get_registration(current_id).nickname == "Бар 1"
+    assert [r.descriptor.id for r in registry.all_registrations()] == [current_id]
+
+    # And after the rewritten file is loaded again — the id the till
+    # holds still resolves, because the old id is derived, not stored.
+    reloaded = TerminalRegistry(path=path)
+    reloaded.load()
+    assert reloaded.get_registration(legacy_id).nickname == "Бар 1"
+    assert reloaded.get_registration(current_id).nickname == "Бар 1"
+
+
+# ---------------------------------------------------------------------------
+# PET-1304 — collapsing the old ids onto one, without losing a registration
+# ---------------------------------------------------------------------------
+
+
+_SERIAL = "V1E0207420"
+
+
+def _stored_under_its_legacy_id(host: str, **fields) -> dict:
+    """One terminals.json entry as an older manager wrote it: keyed by
+    the hash of the address it had at the time."""
+    descriptor = _descriptor(
+        host=host, sid=legacy_network_terminal_id(host, 3000, _SERIAL),
+    )
+    entry = {"descriptor": descriptor.model_dump(), "kind": "mono_pos"}
+    entry.update(fields)
+    return entry
+
+
+def test_one_terminal_stored_under_two_addresses_loses_nothing(
+    tmp_path: Path,
+) -> None:
+    """The same device is in the file twice, once per address it has
+    held, and both collapse onto one id. Overwriting one with the other
+    threw away a nickname and merchant bindings nobody could get back."""
+    path = tmp_path / "terminals.json"
+    path.write_text(json.dumps({"terminals": [
+        _stored_under_its_legacy_id(
+            "10.0.0.5",
+            nickname="Бар 1",
+            default_merchant_id="000000060007176",
+            merchants=[MerchantBinding(
+                merchant_id="60007176", nickname="Каса",
+            ).model_dump()],
+        ),
+        _stored_under_its_legacy_id(
+            "10.0.0.9",
+            merchants=[MerchantBinding(merchant_id="60007999").model_dump()],
+        ),
+    ]}))
+    first_id = legacy_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+    second_id = legacy_network_terminal_id("10.0.0.9", 3000, _SERIAL)
+    current_id = make_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    # One registration left, under the id this code computes now.
+    assert [r.descriptor.id for r in registry.all_registrations()] == [current_id]
+    # The furnished copy keeps the id — the operator's own work is what
+    # cannot be recovered, a stale address is rewritten by the next scan.
+    winner = registry.get_registration(current_id)
+    assert winner.nickname == "Бар 1"
+    assert winner.default_merchant_id == "000000060007176"
+    assert winner.descriptor.network.host == "10.0.0.9", (
+        "the furnished copy keeps the registration, but the address comes "
+        "from the copy registered after it — nothing else corrects it"
+    )
+    # And the one that gave way is not gone: a till holding either old id
+    # is still answered, and the merchant bindings of both are kept.
+    assert registry.get_registration(first_id).nickname == "Бар 1"
+    assert registry.get_registration(second_id).nickname == "Бар 1"
+    assert sorted(m.merchant_id for m in winner.merchants) == [
+        "60007176", "60007999",
+    ]
+
+
+def test_a_registration_already_on_the_current_id_is_not_overwritten(
+    tmp_path: Path,
+) -> None:
+    """The worst case of the same collision: one copy is already stored
+    under the id we compute now (it has been through this once), and a
+    legacy copy of the same device would land on top of it."""
+    path = tmp_path / "terminals.json"
+    current_id = make_network_terminal_id("10.0.0.9", 3000, _SERIAL)
+    already_current = _descriptor(host="10.0.0.9", sid=current_id)
+    path.write_text(json.dumps({"terminals": [
+        {
+            "descriptor": already_current.model_dump(),
+            "kind": "mono_pos",
+            "nickname": "Бар 1",
+            "default_merchant_id": "000000060007176",
+        },
+        _stored_under_its_legacy_id("10.0.0.5", nickname="Стара адреса"),
+    ]}))
+    legacy_id = legacy_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    assert [r.descriptor.id for r in registry.all_registrations()] == [current_id]
+    kept = registry.get_registration(current_id)
+    assert kept.nickname == "Бар 1"
+    assert kept.default_merchant_id == "000000060007176"
+    assert registry.get_registration(legacy_id).nickname == "Бар 1"
+
+
+def test_a_failed_save_during_load_does_not_stop_the_manager(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`load()` runs inside the server's lifespan, and the re-keying
+    writes the file. A read-only file or an antivirus holding it open
+    must cost the rewrite, not the whole start-up."""
+    path = tmp_path / "terminals.json"
+    path.write_text(json.dumps({"terminals": [
+        _stored_under_its_legacy_id("10.0.0.5", nickname="Бар 1"),
+    ]}))
+    legacy_id = legacy_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+    current_id = make_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+
+    def refuses_to_write() -> None:
+        raise PermissionError(path)
+
+    monkeypatch.setattr(registry, "save", refuses_to_write)
+    registry.load()
+
+    # Started, and usable by both ids for the whole of this run.
+    assert registry.get_registration(legacy_id).nickname == "Бар 1"
+    assert registry.get_registration(current_id).nickname == "Бар 1"
+
+
+def test_the_id_the_pos_holds_survives_an_address_change(tmp_path: Path) -> None:
+    """The sequence this ticket exists for. A shop upgrades while the
+    terminal is at one address, its lease then moves, and it is
+    re-registered at the new one. The id the POS has held all along has
+    to keep working after the next restart — the old id derived from the
+    stored address stops being derivable the moment that address
+    changes."""
+    path = tmp_path / "terminals.json"
+    path.write_text(json.dumps({"terminals": [
+        _stored_under_its_legacy_id("10.0.0.5", nickname="Бар 1"),
+    ]}))
+    pos_id = legacy_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+    current_id = make_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    # The lease moves; the scan reports the same device at the new
+    # address, and the operator re-registers with the id they have.
+    registry.remember_descriptors([_descriptor(host="10.0.0.99", sid=current_id)])
+    reg = registry.register(TerminalRegistrationRequest(
+        id=pos_id, kind=TerminalKind.mono_pos, nickname="Бар 1",
+    ))
+    assert reg.descriptor.network.host == "10.0.0.99", (
+        "re-registering through the old id must take the freshly "
+        "discovered address, not the stored one"
+    )
+
+    restarted = TerminalRegistry(path=path)
+    restarted.load()
+    assert restarted.get_registration(pos_id).descriptor.id == current_id
+    assert restarted.get_registration(pos_id).descriptor.network.host == "10.0.0.99"
+
+
+def test_merchant_refresh_through_an_old_id_is_stored(tmp_path: Path) -> None:
+    """`GET /terminal/{id}/merchants` refreshes the bank-side roster and
+    keeps it. Asked with the id the POS holds, the list was answered but
+    never written down, so the registration stayed empty."""
+    path = tmp_path / "terminals.json"
+    path.write_text(json.dumps({"terminals": [
+        _stored_under_its_legacy_id("10.0.0.5", nickname="Бар 1"),
+    ]}))
+    pos_id = legacy_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    merged = registry.merge_merchant_list(pos_id, [
+        MerchantBinding(merchant_id="60007176", merchant_name="ФОП Один"),
+    ])
+
+    assert [m.merchant_id for m in merged] == ["60007176"]
+    stored = registry.get_registration(pos_id)
+    assert [m.merchant_id for m in stored.merchants] == ["60007176"]
+    reloaded = TerminalRegistry(path=path)
+    reloaded.load()
+    assert [m.merchant_id for m in reloaded.get_registration(pos_id).merchants] == [
+        "60007176",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# PET-1304 — the file is UTF-8 on both halves
+# ---------------------------------------------------------------------------
+
+
+def test_a_cyrillic_nickname_round_trips_through_save_and_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`save()` writes UTF-8, so `load()` has to read UTF-8 — whatever
+    the station's own code page is. Read as ANSI instead, «Каса 1»
+    comes back as mojibake on a Ukrainian Windows and the next save
+    writes the mojibake back; on a Western one the same bytes raise and
+    the file reads as no terminals at all, after which the first
+    registration writes over every terminal the shop had."""
+    monkeypatch.setattr(
+        terminal_registry, "_station_encoding", lambda: "cp1251",
+    )
+    path = tmp_path / "terminals.json"
+    registry = TerminalRegistry(path=path)
+    descriptor = _descriptor()
+    registry.remember_descriptors([descriptor])
+    registry.register(TerminalRegistrationRequest(
+        id=descriptor.id, kind=TerminalKind.mono_pos, nickname="Каса 1",
+    ))
+
+    reloaded = TerminalRegistry(path=path)
+    reloaded.load()
+
+    assert reloaded.get_registration(descriptor.id).nickname == "Каса 1"
+
+
+def test_a_file_written_in_the_stations_code_page_is_still_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The upgrade from v1.0.10: that manager wrote the file in the
+    station's code page, and it is sitting on the till right now. It
+    has to be read, not refused — refusing it reads as zero
+    registrations, and the next register() overwrites it — and it is
+    put back as UTF-8 so this is the last start that has to guess."""
+    monkeypatch.setattr(
+        terminal_registry, "_station_encoding", lambda: "cp1251",
+    )
+    path = tmp_path / "terminals.json"
+    descriptor = _descriptor()
+    path.write_bytes(json.dumps({"terminals": [{
+        "descriptor": descriptor.model_dump(),
+        "kind": "mono_pos",
+        "nickname": "Каса 1",
+    }]}, ensure_ascii=False).encode("cp1251"))
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    assert registry.get_registration(descriptor.id).nickname == "Каса 1"
+    # Rewritten as UTF-8, so the guessing stops here.
+    rewritten = json.loads(path.read_text(encoding="utf-8"))
+    assert rewritten["terminals"][0]["nickname"] == "Каса 1"
+    # And the file as the shop had it is kept, in case the code page
+    # guessed above was the wrong one.
+    assert (tmp_path / "terminals.json.bak").read_bytes().decode("cp1251")
+
+
+# ---------------------------------------------------------------------------
+# PET-1304 — which address the survivor of a merge dials
+# ---------------------------------------------------------------------------
+
+
+def test_the_surviving_registration_carries_the_live_address(
+    tmp_path: Path,
+) -> None:
+    """The operator's typed work decides WHICH registration survives,
+    and that can easily be the copy sitting at an address the terminal
+    has since left. Nothing in the manager rewrites a stored address,
+    so the survivor must come out of the merge holding the newest one
+    — the later entry in the file — or a terminal that worked before
+    the upgrade starts sending every charge to a dead address."""
+    path = tmp_path / "terminals.json"
+    path.write_bytes(json.dumps({"terminals": [
+        _stored_under_its_legacy_id("10.0.0.1", nickname="Бар"),
+        _stored_under_its_legacy_id("10.0.0.2"),
+    ]}, ensure_ascii=False).encode("utf-8"))
+    current_id = make_network_terminal_id("10.0.0.1", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    winner = registry.get_registration(current_id)
+    # The nickname still decides who survives...
+    assert winner.nickname == "Бар"
+    # ...but not which address that survivor talks to.
+    assert winner.descriptor.network.host == "10.0.0.2"
+
+
+def test_the_winners_own_old_ids_still_resolve_after_a_rekey(
+    tmp_path: Path,
+) -> None:
+    """A registration can already carry ids of its own from an earlier
+    move. The re-key points the id it is leaving today at its new key,
+    and `_resolve` takes a single hop — so the earlier ones have to be
+    re-pointed in the same go, or a till holding one of them is told
+    the terminal is not registered."""
+    path = tmp_path / "terminals.json"
+    path.write_bytes(json.dumps({"terminals": [
+        _stored_under_its_legacy_id(
+            "10.0.0.5", nickname="Бар 1", known_ids=["an-even-older-id"],
+        ),
+    ]}, ensure_ascii=False).encode("utf-8"))
+    current_id = make_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    kept = registry.get_registration("an-even-older-id")
+    assert kept.descriptor.id == current_id
+    assert kept.nickname == "Бар 1"

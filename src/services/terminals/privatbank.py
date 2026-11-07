@@ -45,7 +45,7 @@ from src.models.terminal import (
     TerminalNetworkAddress,
     TerminalRegistration,
     TerminalTransport,
-    make_terminal_id,
+    make_network_terminal_id,
 )
 from src.services.terminals.base import (
     MerchantInfo,
@@ -335,12 +335,7 @@ class PrivatBankTerminalAdapter(TerminalAdapter):
             # Probe still useful even without identify — fall through.
             pass
 
-        terminal_id = make_terminal_id(
-            TerminalTransport.network,
-            host,
-            str(port),
-            serial or "",
-        )
+        terminal_id = make_network_terminal_id(host, port, serial)
         bits = [vendor, model] if (vendor or model) else ["PrivatBank POS"]
         label = f"{' '.join(b for b in bits if b)} @ {host}"
         if serial:

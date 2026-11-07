@@ -36,7 +36,7 @@ from src.models.terminal import (
     TerminalNetworkAddress,
     TerminalRegistration,
     TerminalTransport,
-    make_terminal_id,
+    make_network_terminal_id,
 )
 from src.services.terminals.base import (
     MerchantInfo,
@@ -125,9 +125,7 @@ class BposTerminalAdapter(TerminalAdapter):
         except (TerminalUnavailable, BridgeFrameError):
             pass
 
-        terminal_id = make_terminal_id(
-            TerminalTransport.network, host, str(port), serial or "",
-        )
+        terminal_id = make_network_terminal_id(host, port, serial)
         label = f"{model or 'BPOS terminal'} @ {host}"
         if serial:
             label = f"{label} (s/n {serial})"
