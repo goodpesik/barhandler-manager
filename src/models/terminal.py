@@ -124,6 +124,16 @@ class TerminalRegistration(BaseModel):
     nickname: Optional[str] = None  # "Каса 1" / "Бар"
     default_merchant_id: Optional[str] = None  # picked from GetMerchantListDetailed
     default_terminal_id: Optional[str] = None  # multi-merchant-multi-terminal case
+    known_ids: list[str] = Field(default_factory=list)
+    # ^ Ids this same registration has been reachable by before, kept so
+    # the POS is answered after the id has changed under it (PET-1304).
+    # The derived old id only survives while the address it was hashed
+    # from is still the stored one, and a DHCP move — the very thing
+    # this ticket is about — rewrites that address. So every id we move
+    # a registration away from is written down here instead of being
+    # recomputed later. An older manager ignores the field (the model
+    # does not forbid extra keys) but drops it when it rewrites the
+    # file; nothing can be done about that from here.
     merchants: list[MerchantBinding] = Field(default_factory=list)
     # ^ Snapshot of what's on the terminal at registration time, with
     # operator-set nicknames preserved across reboots. The route layer

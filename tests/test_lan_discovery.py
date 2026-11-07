@@ -521,3 +521,43 @@ def test_one_terminal_bound_to_all_addresses_is_listed_once() -> None:
     # ...and a terminal that answers ONLY on the loopback stays, which is the
     # whole point of scanning it.
     assert [d.serial for d in kept if d.network.host == "127.0.0.1"] == ["V1E9999999"]
+
+
+def test_remote_discovery_answers_inside_the_server_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PET-1304 — the sweep got a second, patient pass and with it the
+    ability to outlive the window the log server waits in: it gives up
+    after `_SCAN_WAIT_S` and says «diagnostic timeout» while the scan
+    goes on running on the till, and the operator's retry stacks
+    another one on top. The remote command has to come back inside its
+    budget and say that it did not cover everything."""
+    import ipaddress
+    import time
+
+    import src.devices.scan as scan
+    import src.services.diagnostics as diagnostics
+
+    monkeypatch.setattr(
+        scan, "_local_subnets",
+        lambda: [ipaddress.ip_network("192.168.77.0/29")],
+    )
+
+    def nothing_ever_answers(host: str, port: int, timeout: float = 0.3) -> bool:
+        # Every address silent, each connect costing its full timeout —
+        # the worst case the budget exists for.
+        time.sleep(timeout)
+        return False
+
+    monkeypatch.setattr(scan, "_probe_tcp", nothing_ever_answers)
+    monkeypatch.setattr(diagnostics, "_SCAN_BUDGET_S", 3)
+
+    started = time.monotonic()
+    result = asyncio.run(diagnostics.run_diagnostic("terminal_discover", {}))
+    elapsed = time.monotonic() - started
+
+    assert result["ok"] is True
+    assert elapsed < 3, f"answered after {elapsed:.1f}s, budget was 3s"
+    # And it says so, instead of reporting a clean "no terminals here".
+    assert result.get("partial") is True
+    assert "second patient pass" in result["note"]

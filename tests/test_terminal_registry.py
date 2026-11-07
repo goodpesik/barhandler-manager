@@ -278,3 +278,186 @@ def test_terminal_registered_before_the_rekeying_is_still_found(tmp_path: Path) 
     reloaded.load()
     assert reloaded.get_registration(legacy_id).nickname == "Бар 1"
     assert reloaded.get_registration(current_id).nickname == "Бар 1"
+
+
+# ---------------------------------------------------------------------------
+# PET-1304 — collapsing the old ids onto one, without losing a registration
+# ---------------------------------------------------------------------------
+
+
+_SERIAL = "V1E0207420"
+
+
+def _stored_under_its_legacy_id(host: str, **fields) -> dict:
+    """One terminals.json entry as an older manager wrote it: keyed by
+    the hash of the address it had at the time."""
+    descriptor = _descriptor(
+        host=host, sid=legacy_network_terminal_id(host, 3000, _SERIAL),
+    )
+    entry = {"descriptor": descriptor.model_dump(), "kind": "mono_pos"}
+    entry.update(fields)
+    return entry
+
+
+def test_one_terminal_stored_under_two_addresses_loses_nothing(
+    tmp_path: Path,
+) -> None:
+    """The same device is in the file twice, once per address it has
+    held, and both collapse onto one id. Overwriting one with the other
+    threw away a nickname and merchant bindings nobody could get back."""
+    path = tmp_path / "terminals.json"
+    path.write_text(json.dumps({"terminals": [
+        _stored_under_its_legacy_id(
+            "10.0.0.5",
+            nickname="Бар 1",
+            default_merchant_id="000000060007176",
+            merchants=[MerchantBinding(
+                merchant_id="60007176", nickname="Каса",
+            ).model_dump()],
+        ),
+        _stored_under_its_legacy_id(
+            "10.0.0.9",
+            merchants=[MerchantBinding(merchant_id="60007999").model_dump()],
+        ),
+    ]}))
+    first_id = legacy_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+    second_id = legacy_network_terminal_id("10.0.0.9", 3000, _SERIAL)
+    current_id = make_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    # One registration left, under the id this code computes now.
+    assert [r.descriptor.id for r in registry.all_registrations()] == [current_id]
+    # The furnished copy keeps the id — the operator's own work is what
+    # cannot be recovered, a stale address is rewritten by the next scan.
+    winner = registry.get_registration(current_id)
+    assert winner.nickname == "Бар 1"
+    assert winner.default_merchant_id == "000000060007176"
+    assert winner.descriptor.network.host == "10.0.0.5", (
+        "the furnished copy keeps the registration, including its address"
+    )
+    # And the one that gave way is not gone: a till holding either old id
+    # is still answered, and the merchant bindings of both are kept.
+    assert registry.get_registration(first_id).nickname == "Бар 1"
+    assert registry.get_registration(second_id).nickname == "Бар 1"
+    assert sorted(m.merchant_id for m in winner.merchants) == [
+        "60007176", "60007999",
+    ]
+
+
+def test_a_registration_already_on_the_current_id_is_not_overwritten(
+    tmp_path: Path,
+) -> None:
+    """The worst case of the same collision: one copy is already stored
+    under the id we compute now (it has been through this once), and a
+    legacy copy of the same device would land on top of it."""
+    path = tmp_path / "terminals.json"
+    current_id = make_network_terminal_id("10.0.0.9", 3000, _SERIAL)
+    already_current = _descriptor(host="10.0.0.9", sid=current_id)
+    path.write_text(json.dumps({"terminals": [
+        {
+            "descriptor": already_current.model_dump(),
+            "kind": "mono_pos",
+            "nickname": "Бар 1",
+            "default_merchant_id": "000000060007176",
+        },
+        _stored_under_its_legacy_id("10.0.0.5", nickname="Стара адреса"),
+    ]}))
+    legacy_id = legacy_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    assert [r.descriptor.id for r in registry.all_registrations()] == [current_id]
+    kept = registry.get_registration(current_id)
+    assert kept.nickname == "Бар 1"
+    assert kept.default_merchant_id == "000000060007176"
+    assert registry.get_registration(legacy_id).nickname == "Бар 1"
+
+
+def test_a_failed_save_during_load_does_not_stop_the_manager(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`load()` runs inside the server's lifespan, and the re-keying
+    writes the file. A read-only file or an antivirus holding it open
+    must cost the rewrite, not the whole start-up."""
+    path = tmp_path / "terminals.json"
+    path.write_text(json.dumps({"terminals": [
+        _stored_under_its_legacy_id("10.0.0.5", nickname="Бар 1"),
+    ]}))
+    legacy_id = legacy_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+    current_id = make_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+
+    def refuses_to_write() -> None:
+        raise PermissionError(path)
+
+    monkeypatch.setattr(registry, "save", refuses_to_write)
+    registry.load()
+
+    # Started, and usable by both ids for the whole of this run.
+    assert registry.get_registration(legacy_id).nickname == "Бар 1"
+    assert registry.get_registration(current_id).nickname == "Бар 1"
+
+
+def test_the_id_the_pos_holds_survives_an_address_change(tmp_path: Path) -> None:
+    """The sequence this ticket exists for. A shop upgrades while the
+    terminal is at one address, its lease then moves, and it is
+    re-registered at the new one. The id the POS has held all along has
+    to keep working after the next restart — the old id derived from the
+    stored address stops being derivable the moment that address
+    changes."""
+    path = tmp_path / "terminals.json"
+    path.write_text(json.dumps({"terminals": [
+        _stored_under_its_legacy_id("10.0.0.5", nickname="Бар 1"),
+    ]}))
+    pos_id = legacy_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+    current_id = make_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    # The lease moves; the scan reports the same device at the new
+    # address, and the operator re-registers with the id they have.
+    registry.remember_descriptors([_descriptor(host="10.0.0.99", sid=current_id)])
+    reg = registry.register(TerminalRegistrationRequest(
+        id=pos_id, kind=TerminalKind.mono_pos, nickname="Бар 1",
+    ))
+    assert reg.descriptor.network.host == "10.0.0.99", (
+        "re-registering through the old id must take the freshly "
+        "discovered address, not the stored one"
+    )
+
+    restarted = TerminalRegistry(path=path)
+    restarted.load()
+    assert restarted.get_registration(pos_id).descriptor.id == current_id
+    assert restarted.get_registration(pos_id).descriptor.network.host == "10.0.0.99"
+
+
+def test_merchant_refresh_through_an_old_id_is_stored(tmp_path: Path) -> None:
+    """`GET /terminal/{id}/merchants` refreshes the bank-side roster and
+    keeps it. Asked with the id the POS holds, the list was answered but
+    never written down, so the registration stayed empty."""
+    path = tmp_path / "terminals.json"
+    path.write_text(json.dumps({"terminals": [
+        _stored_under_its_legacy_id("10.0.0.5", nickname="Бар 1"),
+    ]}))
+    pos_id = legacy_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+
+    registry = TerminalRegistry(path=path)
+    registry.load()
+
+    merged = registry.merge_merchant_list(pos_id, [
+        MerchantBinding(merchant_id="60007176", merchant_name="ФОП Один"),
+    ])
+
+    assert [m.merchant_id for m in merged] == ["60007176"]
+    stored = registry.get_registration(pos_id)
+    assert [m.merchant_id for m in stored.merchants] == ["60007176"]
+    reloaded = TerminalRegistry(path=path)
+    reloaded.load()
+    assert [m.merchant_id for m in reloaded.get_registration(pos_id).merchants] == [
+        "60007176",
+    ]

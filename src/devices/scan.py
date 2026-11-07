@@ -14,6 +14,7 @@ import concurrent.futures
 import ipaddress
 import logging
 import socket
+import time
 from typing import Optional
 
 import usb.core
@@ -646,6 +647,10 @@ def _terminal_port_adapters() -> dict[int, list]:
 
 TERMINAL_SWEEP_WORKERS = 256   # parallel TCP connects per sweep pass
 SLOW_SWEEP_TIMEOUT_S = 5.0     # connect timeout of the second pass
+# Kept back from a budget for the probes: the sweep only says who is
+# listening, the probes are what turns that into a terminal, so spending
+# the whole budget on sweeping would answer «nothing found».
+PROBE_RESERVE_S = 8.0
 
 
 def _sweep_open_pairs(
@@ -681,6 +686,8 @@ def discover_network_terminals(
     timeout: float = 0.3,
     probe_timeout: float = 2.0,
     slow_timeout: float = SLOW_SWEEP_TIMEOUT_S,
+    budget_s: Optional[float] = None,
+    coverage: Optional[dict] = None,
 ) -> list:
     """LAN scan for every supported POS-terminal protocol.
 
@@ -699,10 +706,41 @@ def discover_network_terminals(
     on the addresses that did not answer at once, and with a wider
     thread pool so the extra wait overlaps.
 
+    `budget_s` caps the whole sweep for a caller that is itself being
+    waited on — remote diagnostics, where the server gives up after
+    `_SCAN_WAIT_S` and the operator is told «diagnostic timeout» while
+    the scan goes on running on the till with nobody left to hand the
+    result to. The patience of the second pass is cut to what fits
+    rather than the pass being dropped, so every address still gets a
+    second try; when even that does not fit, the second pass is skipped
+    and the probes stop at the deadline. `coverage` is filled with what
+    was actually done so the caller can say so out loud instead of
+    reporting a clean empty result for a scan that was cut short.
+
     Covered: SSI ECR JSON (Mono, 3000), PrivatBank JSON (2000),
     Printec PosAPI (Raif/PUMB bridge, 8080), BPOS1/Light (Pivdenny/Sense
     bridge, 8888), Oschad ECR (bridge, 7777).
     """
+    started = time.monotonic()
+    deadline = None if budget_s is None else started + budget_s
+
+    def _left() -> float:
+        return float("inf") if deadline is None else deadline - time.monotonic()
+
+    if coverage is not None:
+        # Filled before anything can go wrong, so a caller never reads the
+        # coverage of some earlier, luckier scan (as `discover_usb` does).
+        coverage.clear()
+        coverage.update({
+            "budget_s": budget_s,
+            "hosts": 0,
+            "pairs": 0,
+            "slow_pass": "not needed",
+            "probes_run": 0,
+            "probes_skipped": 0,
+            "cut_short": False,
+        })
+
     port_adapters = _terminal_port_adapters()
     scan_ports = list(port_adapters.keys())
 
@@ -731,20 +769,56 @@ def discover_network_terminals(
     )
     # Collect open host:port pairs across every terminal port.
     all_pairs = [(host, port) for host in hosts for port in scan_ports]
+    if coverage is not None:
+        coverage["hosts"] = len(hosts)
+        coverage["pairs"] = len(all_pairs)
     open_pairs, silent = _sweep_open_pairs(
         all_pairs, timeout, TERMINAL_SWEEP_WORKERS,
     )
     if silent and slow_timeout > timeout:
-        slow_open, _ = _sweep_open_pairs(
-            silent, slow_timeout, TERMINAL_SWEEP_WORKERS,
-        )
-        if slow_open:
-            logger.info(
-                "terminal discovery: %d address(es) answered only on the "
-                "slow pass (%.1fs) — a busy or wedged terminal",
-                len(slow_open), slow_timeout,
+        # What the second pass costs is its timeout once per batch of
+        # pairs, and over several subnets that is more than a diagnostic
+        # is allowed to take: four /24s are twenty batches, so 5 s of
+        # patience each is 100 s against a 25 s budget. Spend what is
+        # left, minus a reserve for the probes, across the batches —
+        # every silent address is still tried a second time, just less
+        # patiently. If that leaves no more patience than the fast pass
+        # already had, the pass would prove nothing and is skipped.
+        batches = max(1, -(-len(silent) // TERMINAL_SWEEP_WORKERS))
+        affordable = (_left() - PROBE_RESERVE_S) / batches
+        effective_slow = min(slow_timeout, affordable)
+        if effective_slow <= timeout:
+            logger.warning(
+                "terminal discovery: no time left for the slow pass over %d "
+                "silent address(es) within the %.0fs budget — a terminal too "
+                "busy to answer in %.1fs stays unfound; scan one subnet at a "
+                "time to get the patient pass back",
+                len(silent), budget_s or 0.0, timeout,
             )
-        open_pairs.extend(slow_open)
+            if coverage is not None:
+                coverage["slow_pass"] = "skipped: no time left in the budget"
+                coverage["cut_short"] = True
+        else:
+            if coverage is not None:
+                coverage["slow_pass"] = f"ran with {effective_slow:.1f}s patience"
+                coverage["cut_short"] = effective_slow < slow_timeout
+            if effective_slow < slow_timeout:
+                logger.info(
+                    "terminal discovery: slow pass over %d silent address(es) "
+                    "cut from %.1fs to %.1fs of patience to stay inside the "
+                    "%.0fs budget",
+                    len(silent), slow_timeout, effective_slow, budget_s or 0.0,
+                )
+            slow_open, _ = _sweep_open_pairs(
+                silent, effective_slow, TERMINAL_SWEEP_WORKERS,
+            )
+            if slow_open:
+                logger.info(
+                    "terminal discovery: %d address(es) answered only on the "
+                    "slow pass (%.1fs) — a busy or wedged terminal",
+                    len(slow_open), effective_slow,
+                )
+            open_pairs.extend(slow_open)
 
     open_by_port = {
         port: [h for h, p in open_pairs if p == port] for port in scan_ports
@@ -782,18 +856,41 @@ def discover_network_terminals(
     async def _probe_all() -> list:
         out: list = []
         seen: set[str] = set()
+        run = 0
+        skipped = 0
         for host, port in open_pairs:
             for adapter in port_adapters.get(port, []):
                 key = f"{host}:{port}:{adapter.__name__}"
                 if key in seen:
                     continue
                 seen.add(key)
+                # A probe is up to `probe_timeout` on anything that
+                # listens on a terminal port without being a terminal —
+                # a NAS, a dashboard, a dev server. Eight of those are
+                # enough to walk out of the budget, and then the whole
+                # answer is lost instead of part of it.
+                if _left() <= probe_timeout:
+                    skipped += 1
+                    continue
+                run += 1
                 try:
                     descriptor = await adapter.probe(host, port)
                 except Exception:  # noqa: BLE001
                     descriptor = None
                 if descriptor is not None:
                     out.append(descriptor)
+        if skipped:
+            logger.warning(
+                "terminal discovery: %d of %d probes left unrun — the %.0fs "
+                "budget ran out; %d terminal(s) found by the probes that did "
+                "run",
+                skipped, run + skipped, budget_s or 0.0, len(out),
+            )
+        if coverage is not None:
+            coverage["probes_run"] = run
+            coverage["probes_skipped"] = skipped
+            if skipped:
+                coverage["cut_short"] = True
         return out
 
     import asyncio

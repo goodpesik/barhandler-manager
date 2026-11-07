@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Dict, Optional, Type
 
@@ -74,6 +75,79 @@ _ADAPTER_FOR_KIND: Dict[TerminalKind, Type[TerminalAdapter]] = {
 }
 
 
+def _address_of(reg: TerminalRegistration) -> str:
+    net = reg.descriptor.network
+    return f"{net.host}:{net.port}" if net else "no address"
+
+
+def _rekey_winner_first(
+    stored_id: str, reg: TerminalRegistration,
+) -> tuple[int, int, int, int, str]:
+    """Sort key putting the registration that should keep the id first.
+
+    When one terminal is stored under several of its old addresses, one
+    of them keeps the id. There is no timestamp in the file to go by, so
+    the order is what the shop would lose by picking wrong: the operator's
+    own work — the nickname, the named merchant bindings, the default
+    merchant. A stale address is NOT part of this on purpose: the next
+    discovery or charge rewrites the address anyway, while a nickname
+    nobody typed again is gone for good.
+
+    The stored id is the last term so that two equally-furnished copies
+    still have one answer, and the same file always gives the same one —
+    dict order was what made the loss unpredictable in the first place.
+    """
+    merchants = reg.merchants or []
+    return (
+        0 if (reg.nickname or "").strip() else 1,
+        -sum(1 for m in merchants if (m.nickname or "").strip()),
+        -len(merchants),
+        0 if reg.default_merchant_id else 1,
+        stored_id,
+    )
+
+
+def _absorb_losing_registration(
+    winner: TerminalRegistration, loser: TerminalRegistration,
+) -> list[str]:
+    """Take into `winner` what only `loser` has; report what moved.
+
+    Both describe the same physical terminal, so the merchant bindings
+    are two readings of one device and can be put together. The winner's
+    own values are never overwritten — it was chosen for having them.
+    """
+    carried: list[str] = []
+    if not (winner.nickname or "").strip() and (loser.nickname or "").strip():
+        winner.nickname = loser.nickname
+        carried.append(f"nickname {loser.nickname!r}")
+    by_key = {
+        (m.merchant_id, m.terminal_id or ""): m for m in winner.merchants
+    }
+    added = 0
+    renamed = 0
+    for m in loser.merchants:
+        key = (m.merchant_id, m.terminal_id or "")
+        kept = by_key.get(key)
+        if kept is None:
+            winner.merchants.append(m)
+            by_key[key] = m
+            added += 1
+        elif not (kept.nickname or "").strip() and (m.nickname or "").strip():
+            kept.nickname = m.nickname
+            renamed += 1
+    if added:
+        carried.append(f"{added} merchant binding(s)")
+    if renamed:
+        carried.append(f"{renamed} merchant nickname(s)")
+    if not winner.default_merchant_id and loser.default_merchant_id:
+        winner.default_merchant_id = loser.default_merchant_id
+        winner.default_terminal_id = (
+            winner.default_terminal_id or loser.default_terminal_id
+        )
+        carried.append("default merchant")
+    return carried
+
+
 class TerminalRegistry:
     """In-memory map of registered terminals, backed by a JSON file.
 
@@ -111,7 +185,38 @@ class TerminalRegistry:
                 continue
             self._registrations[reg.descriptor.id] = reg
         logger.info("loaded %d registered terminals", len(self._registrations))
-        self._index_legacy_network_ids()
+        self._index_stored_known_ids()
+        try:
+            self._index_legacy_network_ids()
+        except Exception as exc:  # noqa: BLE001
+            # The re-keying rewrites terminals.json, and `load()` runs
+            # inside the server's lifespan, before the work journal and
+            # the station settings are loaded. A failed write — read-only
+            # file, antivirus holding it open, full disk — would stop the
+            # manager from starting at all, which is far worse than one
+            # terminal keeping its old id for one more run. Both ids
+            # resolve in memory either way, and the next start tries the
+            # rewrite again.
+            logger.warning(
+                "terminal ids not re-keyed in %s this start: %s — the ids "
+                "stored there keep working, the rewrite is tried again on "
+                "a later start",
+                self.path, exc,
+            )
+
+    def _index_stored_known_ids(self) -> None:
+        """Accept the ids a registration carries from its own past.
+
+        Written down by whoever moved the registration (see
+        `known_ids`), because the alias derived below only holds while
+        the stored address is still the one the old id was hashed from.
+        A live registration key is never shadowed by someone's alias.
+        """
+        for stored_id, reg in self._registrations.items():
+            for old_id in reg.known_ids:
+                if old_id == stored_id or old_id in self._registrations:
+                    continue
+                self._legacy_ids.setdefault(old_id, stored_id)
 
     def _index_legacy_network_ids(self) -> None:
         """Make a terminal registered by an older manager keep working.
@@ -136,8 +241,16 @@ class TerminalRegistry:
           changes anything.
 
         A stored id we cannot account for is left exactly as it is.
+
+        One physical terminal can be stored two or three times over, once
+        per address it has held, and all of those collapse onto one id
+        here. They are therefore merged, never overwritten: see
+        `_rekey_winner_first` for which one keeps the id and
+        `_absorb_losing_registration` for what is carried out of the
+        others. Nothing is dropped without a line in the log.
         """
-        moves: list[tuple[str, str, TerminalRegistration]] = []
+        groups: dict[str, list[tuple[str, TerminalRegistration]]] = {}
+        derived_aliases: list[tuple[str, str]] = []
         for stored_id, reg in self._registrations.items():
             net = reg.descriptor.network
             serial = reg.descriptor.serial
@@ -146,22 +259,73 @@ class TerminalRegistry:
             current_id = make_network_terminal_id(net.host, net.port, serial)
             legacy_id = legacy_network_terminal_id(net.host, net.port, serial)
             if legacy_id != current_id:
-                self._legacy_ids[legacy_id] = current_id
+                derived_aliases.append((legacy_id, current_id))
             if stored_id == current_id or stored_id != legacy_id:
                 continue
-            moves.append((stored_id, current_id, reg))
-        if not moves:
+            groups.setdefault(current_id, []).append((stored_id, reg))
+        for legacy_id, current_id in derived_aliases:
+            if legacy_id in self._registrations:
+                continue
+            self._legacy_ids.setdefault(legacy_id, current_id)
+        changed = False
+        # Sorted so the whole pass is reproducible, not just each group.
+        for current_id, group in sorted(groups.items()):
+            group.sort(key=lambda item: _rekey_winner_first(*item))
+            incumbent = self._registrations.get(current_id)
+            if incumbent is not None:
+                # Already stored under the id we compute now: it is the
+                # one discovery and this code agree on, so it keeps the
+                # id and every legacy copy gives way to it.
+                winner = incumbent
+                losers = group
+            else:
+                winner_id, winner = group[0]
+                losers = group[1:]
+                self._registrations.pop(winner_id, None)
+                winner.descriptor.id = current_id
+                self._registrations[current_id] = winner
+                self._remember_old_id(winner, winner_id, current_id)
+                logger.info(
+                    "terminal %s (s/n %s) re-keyed to %s: the address is no "
+                    "longer part of the id, the old id still resolves",
+                    winner_id, winner.descriptor.serial, current_id,
+                )
+            changed = True
+            for loser_id, loser in losers:
+                self._registrations.pop(loser_id, None)
+                self._remember_old_id(winner, loser_id, current_id)
+                for older in loser.known_ids:
+                    self._remember_old_id(winner, older, current_id)
+                carried = _absorb_losing_registration(winner, loser)
+                logger.warning(
+                    "terminal s/n %s was stored twice, as %s (address %s) "
+                    "and as %s (address %s) — the same device under two of "
+                    "its addresses. %s keeps the registration and answers "
+                    "to both ids; carried over from the other: %s",
+                    winner.descriptor.serial,
+                    current_id, _address_of(winner),
+                    loser_id, _address_of(loser),
+                    current_id,
+                    ", ".join(carried) if carried else "nothing it lacked",
+                )
+        if not changed:
             return
-        for stored_id, current_id, reg in moves:
-            self._registrations.pop(stored_id, None)
-            reg.descriptor.id = current_id
-            self._registrations[current_id] = reg
-            logger.info(
-                "terminal %s (s/n %s) re-keyed to %s: the address is no "
-                "longer part of the id, the old id still resolves",
-                stored_id, reg.descriptor.serial, current_id,
-            )
+        # This is the only write `load()` performs, and it can fail for
+        # reasons that have nothing to do with us: a read-only file, an
+        # antivirus or a backup agent holding terminals.json open on
+        # Windows, a full disk. It is guarded by the caller, and it has
+        # to stay that way — see the comment there.
         self.save()
+
+    def _remember_old_id(
+        self, reg: TerminalRegistration, old_id: str, current_id: str,
+    ) -> None:
+        """Keep answering to an id this registration has left behind."""
+        if not old_id or old_id == current_id:
+            return
+        if old_id not in reg.known_ids:
+            reg.known_ids.append(old_id)
+        self._legacy_ids[old_id] = current_id
 
     def _resolve(self, terminal_id: str) -> Optional[str]:
         """The id we store this terminal under, accepting an id from
@@ -174,10 +338,25 @@ class TerminalRegistry:
         return None
 
     def save(self) -> None:
+        """Replace terminals.json in one step.
+
+        Writing over the file in place truncates it first, so a power cut
+        or a kill in the middle left a half-written file behind — and
+        that reads as zero registrations on the next start, after which
+        the first `register()` writes the shop's only terminal over the
+        remains of all of them. The temporary file is in the same folder
+        so the rename stays on one filesystem and is therefore atomic.
+        Same shape as `station_settings` and `offline_offer` already use.
+        """
         payload = {
             "terminals": [r.model_dump() for r in self._registrations.values()],
         }
-        self.path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        os.replace(tmp, self.path)
 
     # ---------- discovery cache ----------
 
@@ -261,9 +440,16 @@ class TerminalRegistry:
         return descriptor
 
     def register(self, req: TerminalRegistrationRequest) -> TerminalRegistration:
-        descriptor = self._last_discovery.get(req.id)
         resolved = self._resolve(req.id)
         existing = self._registrations[resolved] if resolved else None
+        descriptor = self._last_discovery.get(req.id)
+        if descriptor is None and resolved is not None and resolved != req.id:
+            # The caller asked with an id this terminal used to have, so
+            # the scan filed its fresh descriptor under the id we use
+            # now. Without this the stored descriptor is reused and the
+            # address just discovered — the whole point of the scan — is
+            # thrown away, leaving the adapter aimed at the old one.
+            descriptor = self._last_discovery.get(resolved)
         if descriptor is None:
             # Allow re-register after a manager restart — operator can
             # then update nickname / default merchant without redoing
@@ -281,6 +467,20 @@ class TerminalRegistry:
             if req.merchants is not None
             else (existing.merchants if existing else [])
         )
+        known_ids = list(existing.known_ids) if existing else []
+        if resolved is not None and resolved != descriptor.id:
+            # Re-registering moved this terminal to another id: drop the
+            # old key instead of leaving a second copy behind, and keep
+            # answering to it.
+            self._registrations.pop(resolved, None)
+            if resolved not in known_ids:
+                known_ids.append(resolved)
+            self._legacy_ids = {
+                old: (descriptor.id if new == resolved else new)
+                for old, new in self._legacy_ids.items()
+            }
+            self._legacy_ids[resolved] = descriptor.id
+        known_ids = [i for i in known_ids if i != descriptor.id]
         reg = TerminalRegistration(
             descriptor=descriptor,
             kind=req.kind,
@@ -288,6 +488,7 @@ class TerminalRegistry:
             default_merchant_id=req.default_merchant_id,
             default_terminal_id=req.default_terminal_id,
             merchants=merchants,
+            known_ids=known_ids,
         )
         self._registrations[descriptor.id] = reg
         self.save()
@@ -315,8 +516,20 @@ class TerminalRegistry:
         but the operator's nicknames survive. Match is by
         merchant_id+terminal_id pair; unmatched stored entries are
         dropped (merchant removed bank-side).
+
+        The lookup goes through `_resolve`, like every other one: asked
+        with an id the terminal used to have, a direct dict read found
+        nothing, so the merged list was answered to the POS but never
+        stored — the refresh was silently thrown away.
         """
-        reg = self._registrations.get(terminal_id)
+        resolved = self._resolve(terminal_id)
+        reg = self._registrations[resolved] if resolved else None
+        if reg is None:
+            logger.info(
+                "merchant list of %s refreshed but not stored: no such "
+                "terminal registered (discover/register not finished yet)",
+                terminal_id,
+            )
         nickname_index: dict[tuple[str, str], str] = {}
         if reg is not None:
             for m in reg.merchants:
