@@ -73,13 +73,20 @@ class OfflineOffer:
             try:
                 self._path.parent.mkdir(parents=True, exist_ok=True)
                 tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-                tmp.write_text(
-                    json.dumps({
+                # The bytes are forced to the disk before the rename,
+                # because the rename being atomic only says the file is
+                # either the old one or the new one — not that the new one
+                # has reached the platter. A power cut right after can
+                # otherwise leave NTFS holding the new name over a
+                # zero-length file, which is the very loss the temporary
+                # file is here to prevent.
+                with open(tmp, "w", encoding="utf-8") as handle:
+                    handle.write(json.dumps({
                         "offered": word,
                         "at": datetime.now(timezone.utc).isoformat(),
-                    }),
-                    encoding="utf-8",
-                )
+                    }))
+                    handle.flush()
+                    os.fsync(handle.fileno())
                 os.replace(tmp, self._path)
             except OSError as e:
                 # Kept in memory anyway; only a restart would forget it.

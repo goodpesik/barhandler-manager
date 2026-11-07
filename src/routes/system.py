@@ -755,14 +755,51 @@ def _replace_uplink_in_config(
     return base + new_block
 
 
-def persist_uplink_state(uplink: dict) -> None:
-    """Write the uplink block to config.yaml from an already-updated dict.
+def _rewrite_uplink_block(
+    enabled: bool,
+    tenant: str,
+    tenant_id: str = "",
+    tenant_name: str = "",
+    url: str = _DEFAULT_UPLINK_URL,
+    enabled_at: str = "",
+) -> None:
+    """Put a new uplink block into config.yaml, in one step.
 
-    PET-928 — the dashboard endpoint below builds its own values and writes
-    them inline; this is the same write for the callers that have no request
-    behind them (the day running out, an order from the server). Raises on an
-    OSError so the caller can decide what that is worth — for a shutdown it is
-    worth a log line, not a refusal.
+    THE ONE PLACE config.yaml IS REWRITTEN. Both callers — the dashboard
+    endpoint below and `persist_uplink_state` for the callers with no
+    request behind them — go through here, because there is one decision
+    to get right and it should not be made twice.
+
+    Only the uplink block changes; the rest of the file is carried over
+    as it was read, comments and all. The whole file still goes back to
+    disk, though, and that is the risk this handles: writing over it in
+    place truncates it first, so a power cut or a kill in the middle
+    left a half-written config.yaml behind — and that file carries the
+    server port, the API key the app authenticates with and the uplink
+    tenant, so the manager came up on defaults and the shop dropped off
+    the dashboard. The temporary file is in the same folder, so the
+    rename stays on one filesystem and is therefore atomic. Same shape
+    as the terminal and printer registries, `station_settings` and
+    `offline_offer`.
+
+    The bytes are forced to the disk before the rename, because the
+    rename being atomic only says that the file is either the old one
+    or the new one — not that the new one has reached the platter. A
+    power cut right after can otherwise leave NTFS holding the new name
+    over a zero-length file, which is the very loss the temporary file
+    is here to prevent.
+
+    UTF-8 on this half because `load_config` reads UTF-8 on the other:
+    agreeing with each other is the whole requirement. Given the
+    station's own code page instead, a Cyrillic shop label comes back as
+    mojibake on a Ukrainian Windows and raises on a Western one, and a
+    config.yaml that will not parse reads as a manager with no config at
+    all — that is the bug review found in the terminal registry.
+    Nothing is escaped on the way out: the block is rendered as text,
+    not dumped by yaml, so the label is written as the letters it is.
+
+    Raises on an OSError so the caller can decide what that is worth —
+    for a shutdown it is worth a log line, not a refusal.
     """
     _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     text = (
@@ -770,17 +807,35 @@ def persist_uplink_state(uplink: dict) -> None:
         if _CONFIG_PATH.exists()
         else "server:\n  port: 9999\n"
     )
-    _CONFIG_PATH.write_text(
-        _replace_uplink_in_config(
-            text,
-            bool(uplink.get("enabled")),
-            str(uplink.get("tenant", "")),
-            tenant_id=str(uplink.get("tenant_id", "")),
-            tenant_name=str(uplink.get("tenant_name", "")),
-            url=str(uplink.get("url") or _DEFAULT_UPLINK_URL),
-            enabled_at=str(uplink.get("enabled_at", "")),
-        ),
-        encoding="utf-8",
+    new_text = _replace_uplink_in_config(
+        text, enabled, tenant,
+        tenant_id=tenant_id, tenant_name=tenant_name, url=url,
+        enabled_at=enabled_at,
+    )
+    tmp = _CONFIG_PATH.with_suffix(_CONFIG_PATH.suffix + ".tmp")
+    # No `newline=` on purpose: this keeps the line endings the ones the
+    # file has always had on each platform, so an operator editing the
+    # file by hand sees nothing new. The reader translates either way.
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(new_text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, _CONFIG_PATH)
+
+
+def persist_uplink_state(uplink: dict) -> None:
+    """Write the uplink block to config.yaml from an already-updated dict.
+
+    PET-928 — for the callers that have no request behind them: the day
+    running out, an order from the server.
+    """
+    _rewrite_uplink_block(
+        bool(uplink.get("enabled")),
+        str(uplink.get("tenant", "")),
+        tenant_id=str(uplink.get("tenant_id", "")),
+        tenant_name=str(uplink.get("tenant_name", "")),
+        url=str(uplink.get("url") or _DEFAULT_UPLINK_URL),
+        enabled_at=str(uplink.get("enabled_at", "")),
     )
 
 
@@ -854,23 +909,17 @@ async def set_uplink(payload: UplinkPayload, request: Request) -> dict:
         else ""
     )
 
-    # Persist to config.yaml so the next boot reflects this state.
+    # Persist to config.yaml so the next boot reflects this state. The file
+    # may not be there at all: load_config() falls back to defaults held in
+    # memory when it could not create one. That is no reason to fail the
+    # toggle — the uplink block is written into an empty text, and the file
+    # comes into being here.
     try:
-        # Файла може не бути: load_config() падає в дефолти в памʼяті, якщо
-        # не змогла його створити. Відсутність — не привід валити перемикач:
-        # блок uplink дописуємо в порожній текст, і файл зʼявляється тут.
-        _CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-        text = (
-            _CONFIG_PATH.read_text(encoding="utf-8")
-            if _CONFIG_PATH.exists()
-            else "server:\n  port: 9999\n"
-        )
-        new_text = _replace_uplink_in_config(
-            text, payload.enabled, tenant,
+        _rewrite_uplink_block(
+            payload.enabled, tenant,
             tenant_id=tenant_id, tenant_name=tenant_name,
             enabled_at=enabled_at,
         )
-        _CONFIG_PATH.write_text(new_text, encoding="utf-8")
     except OSError as exc:
         raise HTTPException(
             status_code=500, detail=f"can't write {_CONFIG_PATH}: {exc}",
