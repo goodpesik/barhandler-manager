@@ -13,6 +13,7 @@ old `/charge` stub functional during migration.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -30,6 +31,10 @@ from src.models.terminal import (
 )
 from src.services import work_journal
 from src.services.terminals.base import TerminalUnavailable
+
+# Same channel the charge route already logs on, so the line shape the
+# shops' logs are read by does not change.
+_log = logging.getLogger(__name__)
 
 
 class ManualTerminalRequest(BaseModel):
@@ -95,14 +100,79 @@ def _resolve(request: Request, terminal_id: Optional[str]):
         )
 
 
-def _surface_terminal_error(exc: TerminalUnavailable) -> HTTPException:
+def _surface_terminal_error(
+    exc: TerminalUnavailable,
+    *,
+    operation: str = "terminal",
+    terminal_id: Optional[str] = None,
+) -> HTTPException:
     """Map a TerminalUnavailable onto the same `{detail: {code, message}}`
     shape the printer routes use, so the frontend's existing 503
-    error-handler picks both up uniformly."""
+    error-handler picks both up uniformly.
+
+    The failure is logged here, which is the only place every endpoint
+    passes through. Until this line existed only `/charge` logged, so a
+    till whose terminal was unreachable answered the cashier 503 on
+    `/merchants`, `/ping` and `/refund` and left nothing in the manager's
+    own log — the failures had to be reconstructed from the uplink
+    service on the server side.
+    """
+    _log.warning(
+        "[%s] terminal=%s TerminalUnavailable code=%s msg=%s",
+        operation, terminal_id, getattr(exc, "code", None), exc,
+    )
     return HTTPException(
         status_code=503,
         detail={"code": getattr(exc, "code", "unavailable"), "message": str(exc)},
     )
+
+
+# One card operation per terminal at a time.
+#
+# A second click on Pay used to be stopped by the terminal itself: it refuses a
+# second ECR connection, and that refusal came back in about 3 s. With the
+# bounded connect retry a refused connect is tried for up to 14 s, and a charge
+# on these terminals takes 9-15 s, so the second Purchase can now reach the
+# terminal just as the first one finishes — a double charge on one basket.
+# Nothing in front of this stops it either: the till disables its own Pay
+# button, but a second browser tab or a second till does not go through that
+# button, the charge payload carries no `transaction_uid`, and the manager has
+# no idempotency key to recognise a repeat by.
+#
+# The second caller is refused immediately and is never queued: a queued second
+# charge is the same double charge a few seconds later. The claim is keyed by
+# the terminal, because the terminal is what cannot do two card operations at
+# once — so a refund lands on the same slot as a charge. Check and claim run
+# with no `await` between them, so two requests on the event loop cannot both
+# get the slot.
+_busy_terminals: set[str] = set()
+
+
+def _claim_terminal(terminal_id: str, operation: str) -> None:
+    """Take the card-operation slot for this terminal, or refuse the caller."""
+    if terminal_id in _busy_terminals:
+        _log.warning(
+            "[%s] terminal=%s refused: the terminal is already running a card "
+            "operation, and a second one could take the money twice",
+            operation, terminal_id,
+        )
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "terminal_busy",
+                "message": (
+                    "the terminal is already running a card operation; "
+                    "wait for it to finish"
+                ),
+            },
+        )
+    _busy_terminals.add(terminal_id)
+
+
+def _release_terminal(terminal_id: str) -> None:
+    """Hand the slot back. Runs in a `finally`, so it also runs when the
+    cashier's browser closes mid-payment."""
+    _busy_terminals.discard(terminal_id)
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +436,7 @@ async def ping(terminal_id: str, request: Request) -> dict:
     try:
         ok = await adapter.ping()
     except TerminalUnavailable as exc:
-        raise _surface_terminal_error(exc)
+        raise _surface_terminal_error(exc, operation="ping", terminal_id=terminal_id)
     return {"ok": ok, "terminal_id": terminal_id}
 
 
@@ -376,7 +446,7 @@ async def info(terminal_id: str, request: Request) -> dict:
     try:
         return {"terminal_id": terminal_id, "info": await adapter.get_info()}
     except TerminalUnavailable as exc:
-        raise _surface_terminal_error(exc)
+        raise _surface_terminal_error(exc, operation="info", terminal_id=terminal_id)
 
 
 @router.get("/{terminal_id}/merchants")
@@ -389,7 +459,7 @@ async def list_merchants(terminal_id: str, request: Request) -> dict:
     try:
         merchants = await adapter.list_merchants()
     except TerminalUnavailable as exc:
-        raise _surface_terminal_error(exc)
+        raise _surface_terminal_error(exc, operation="merchants", terminal_id=terminal_id)
     fresh = [
         MerchantBinding(
             merchant_id=m.merchant_id,
@@ -446,6 +516,7 @@ async def charge(
     import logging
     log = logging.getLogger("src.routes.terminal")
     adapter, used_id = _resolve(request, terminal_id)
+    _claim_terminal(used_id, "charge")
     log.info(
         "[charge] terminal=%s payload=%s",
         used_id,
@@ -456,12 +527,8 @@ async def charge(
         try:
             result = await adapter.charge(payload)
         except TerminalUnavailable as exc:
-            log.warning(
-                "[charge] terminal=%s TerminalUnavailable code=%s msg=%s",
-                used_id, getattr(exc, "code", None), exc,
-            )
             operation.failed(str(exc) or getattr(exc, "code", None))
-            raise _surface_terminal_error(exc)
+            raise _surface_terminal_error(exc, operation="charge", terminal_id=used_id)
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001 — surface root cause instead of bare 500
@@ -483,6 +550,7 @@ async def charge(
         # inside the adapter. The money may have moved, so the attempt is in
         # the journal either way.
         operation.unfinished()
+        _release_terminal(used_id)
 
 
 @router.post("/refund")
@@ -506,6 +574,7 @@ async def refund(
     import logging
     log = logging.getLogger("src.routes.terminal")
     adapter, used_id = _resolve(request, terminal_id)
+    _claim_terminal(used_id, "refund")
     log.info(
         "[refund] terminal=%s payload=%s", used_id, payload.model_dump_json(),
     )
@@ -514,12 +583,8 @@ async def refund(
         try:
             result = await adapter.refund(payload)
         except TerminalUnavailable as exc:
-            log.warning(
-                "[refund] terminal=%s TerminalUnavailable code=%s msg=%s",
-                used_id, getattr(exc, "code", None), exc,
-            )
             operation.failed(str(exc) or getattr(exc, "code", None))
-            raise _surface_terminal_error(exc)
+            raise _surface_terminal_error(exc, operation="refund", terminal_id=used_id)
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001 — surface root cause instead of bare 500
@@ -541,6 +606,7 @@ async def refund(
         # inside the adapter. The money may have moved, so the attempt is in
         # the journal either way.
         operation.unfinished()
+        _release_terminal(used_id)
 
 
 @router.post("/{terminal_id}/cancel")
@@ -567,5 +633,5 @@ async def last_result(
     try:
         result = await adapter.get_last_result(transaction_uid=transaction_uid)
     except TerminalUnavailable as exc:
-        raise _surface_terminal_error(exc)
+        raise _surface_terminal_error(exc, operation="last-result", terminal_id=terminal_id)
     return {"terminal_id": terminal_id, "result": result.model_dump()}

@@ -35,6 +35,9 @@ from src.models.terminal import (
 )
 from src.services.terminals.base import TerminalUnavailable
 from src.services.terminals.privatbank import (
+    CONNECT_ATTEMPTS,
+    CONNECT_RETRY_PAUSE_S,
+    CONNECT_TIMEOUT_S,
     DELIMITER,
     DELIMITER_BYTE,
     PrivatBankTerminalAdapter,
@@ -42,6 +45,7 @@ from src.services.terminals.privatbank import (
     _parse_adv,
     decode_frame,
     encode_frame,
+    send_tcp,
 )
 
 
@@ -477,3 +481,421 @@ async def test_get_last_result_maps_zero_to_ok() -> None:
         result = await adapter.get_last_result()
         assert result.status == "ok"
         assert "LastResult=0" in (result.raw_transaction_result or "")
+
+
+# ---------------------------------------------------------------------------
+# Connect lifecycle (PET-1304)
+#
+# A shop's terminal answered 22 of 28 payments over two days and refused or
+# timed out the other 5, recovering by itself within a minute. These cases
+# pin the two properties that decide whether such a terminal costs a sale:
+# a failed CONNECT is retried a bounded number of times, and the socket is
+# always handed back. The seam is `asyncio.open_connection` — the network
+# boundary — so the adapter under test runs for real.
+# ---------------------------------------------------------------------------
+
+
+class _FakeWriter:
+    """Records what the adapter wrote and whether it was closed."""
+
+    def __init__(self, fail_close: bool = False, fail_drain: bool = False) -> None:
+        self.frames: list[bytes] = []
+        self.closed = 0
+        self._fail_close = fail_close
+        self._fail_drain = fail_drain
+
+    def write(self, data: bytes) -> None:
+        self.frames.append(data)
+
+    async def drain(self) -> None:
+        if self._fail_drain:
+            raise ConnectionResetError("drain failed")
+        return None
+
+    def close(self) -> None:
+        self.closed += 1
+        if self._fail_close:
+            raise OSError("close failed")
+
+    async def wait_closed(self) -> None:
+        if self._fail_close:
+            raise OSError("wait_closed failed")
+
+
+class _FakeReader:
+    """Replies with one scripted frame, or raises instead of replying.
+
+    `raw` replaces the encoded reply with arbitrary bytes (a malformed
+    frame). With neither `reply` nor `raw` the reader answers b"" —
+    end of stream, which is how a terminal that hangs up mid-request
+    looks to `_read_until_null`.
+    """
+
+    def __init__(
+        self,
+        reply: Optional[dict],
+        raises: Optional[Exception] = None,
+        raw: Optional[bytes] = None,
+    ) -> None:
+        if raw is not None:
+            self._payload = raw
+        else:
+            self._payload = encode_frame(reply) if reply is not None else b""
+        self._raises = raises
+        self._sent = False
+
+    async def read(self, _n: int) -> bytes:
+        if self._raises is not None:
+            raise self._raises
+        if self._sent:
+            return b""
+        self._sent = True
+        return self._payload
+
+
+_APPROVED = {
+    "method": "Purchase", "step": 0, "error": False, "errorDescription": "",
+    "params": {"responseCode": "0000", "trnStatus": 1, "rrn": "024106595666"},
+}
+
+
+def _patch_connect(monkeypatch, outcomes: list) -> dict:
+    """Script `asyncio.open_connection`: each entry is either an exception
+    to raise or a (reader, writer) pair to hand back. `calls` counts the
+    connect attempts the adapter actually made."""
+    state: dict = {"calls": 0, "writers": []}
+
+    async def fake_open_connection(host, port):
+        i = state["calls"]
+        state["calls"] += 1
+        outcome = outcomes[i] if i < len(outcomes) else outcomes[-1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        state["writers"].append(outcome[1])
+        return outcome
+
+    monkeypatch.setattr(
+        "src.services.terminals.privatbank.asyncio.open_connection",
+        fake_open_connection,
+    )
+    monkeypatch.setattr(
+        "src.services.terminals.privatbank.CONNECT_RETRY_PAUSE_S", 0,
+    )
+    return state
+
+
+@pytest.mark.asyncio
+async def test_charge_retries_a_refused_connect_and_still_pays(monkeypatch) -> None:
+    """The terminal refused the first connect and answered the second.
+    WinError 1225 came back in ~3 s on the till, so the retry is what
+    turns that into a completed payment instead of a 503."""
+    writer = _FakeWriter()
+    state = _patch_connect(monkeypatch, [
+        ConnectionRefusedError("[WinError 1225] refused"),
+        (_FakeReader(_APPROVED), writer),
+    ])
+    adapter = PrivatBankTerminalAdapter(_registration(2000))
+
+    result = await adapter.charge(ChargeRequest(amount_kopecks=24500))
+
+    assert result.status == "ok"
+    assert state["calls"] == 2
+
+
+@pytest.mark.asyncio
+async def test_charge_gives_up_after_a_bounded_number_of_connect_attempts(
+    monkeypatch,
+) -> None:
+    """A terminal that is really off must not be retried for ever — the
+    cashier is standing in front of the customer. Bounded from below (it did
+    retry) and from above (what the worst case costs that cashier)."""
+    state = _patch_connect(monkeypatch, [ConnectionRefusedError("refused")])
+    adapter = PrivatBankTerminalAdapter(_registration(2000))
+
+    with pytest.raises(TerminalUnavailable) as caught:
+        await adapter.charge(ChargeRequest(amount_kopecks=24500))
+
+    assert caught.value.code == "unreachable"
+    # The literal, not the constant. Asserting against the constant imports
+    # the very thing the case exists to pin: raising it to 10 would pass.
+    assert state["calls"] == 3
+    # And the bound from above, in the figure the cashier feels: three attempts
+    # of the real connect budget with the real pause between them. The real
+    # 4.0 / 1.0 / 3 give 14 s, and the whole argument for retrying a payment at
+    # all is that the wait stays inside what someone will stand through.
+    worst_case_s = (
+        CONNECT_ATTEMPTS * CONNECT_TIMEOUT_S
+        + (CONNECT_ATTEMPTS - 1) * CONNECT_RETRY_PAUSE_S
+    )
+    assert worst_case_s <= 14.0
+
+
+@pytest.mark.asyncio
+async def test_refund_retries_a_refused_connect_and_still_refunds(
+    monkeypatch,
+) -> None:
+    """The refund opts into the retry for the same reason the charge does: the
+    customer is standing at the till waiting for their money back, and a
+    refused connect there costs the shop the same trip back."""
+    writer = _FakeWriter()
+    state = _patch_connect(monkeypatch, [
+        ConnectionRefusedError("[WinError 1225] refused"),
+        (_FakeReader(_APPROVED), writer),
+    ])
+    adapter = PrivatBankTerminalAdapter(_registration(2000))
+
+    result = await adapter.refund(
+        RefundRequest(amount_kopecks=24500, rrn="024106595666"),
+    )
+
+    assert result.status == "ok"
+    assert state["calls"] == 2
+
+
+def _post_connect_failure(kind: str) -> tuple["_FakeReader", "_FakeWriter"]:
+    """A socket that connected and then failed, one way per `kind`.
+
+    Each of these is a way the charge can fail AFTER the Purchase frame
+    has been written, i.e. after the terminal may already be taking the
+    money. The read timeout is the likeliest of them in the field: a
+    charge allows the request 120 s for chip and PIN, and a terminal
+    that goes away mid-transaction produces exactly that.
+    """
+    if kind == "read_reset":
+        return _FakeReader(None, raises=ConnectionResetError("reset mid-request")), _FakeWriter()
+    if kind == "read_timeout":
+        # What `asyncio.wait_for` raises inside `_read_until_null` when the
+        # request deadline runs out. Raised by the fake so the case costs
+        # milliseconds instead of the real 120 s.
+        return _FakeReader(None, raises=asyncio.TimeoutError()), _FakeWriter()
+    if kind == "hung_up":
+        # Reader at end of stream → asyncio.IncompleteReadError.
+        return _FakeReader(None), _FakeWriter()
+    if kind == "malformed_frame":
+        # A complete frame (0x00-terminated) whose body is not JSON → FrameError.
+        return _FakeReader(None, raw=b'{"method":"Purch\x00'), _FakeWriter()
+    if kind == "error_reply":
+        # The terminal ANSWERED, in a well-formed frame, that it will not do
+        # the job — busy, or the card refused. Nothing failed on the transport,
+        # so this is the one kind that comes back as a result instead of an
+        # exception, and it is the kind a re-send would look most harmless on.
+        return _FakeReader({
+            "method": "Purchase", "step": 0, "error": True,
+            "errorDescription": "terminal busy",
+            "params": {"responseCode": "1000"},
+        }), _FakeWriter()
+    if kind == "drain_failed":
+        # The write never reached the terminal — or reached it and the ACK
+        # did not come back. Indistinguishable from here, so it counts as
+        # "the Purchase may be live".
+        return _FakeReader(_APPROVED), _FakeWriter(fail_drain=True)
+    raise AssertionError(f"unknown failure kind {kind}")
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "read_reset", "read_timeout", "hung_up", "malformed_frame",
+        "drain_failed", "error_reply",
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_purchase_is_never_resent_once_the_connect_succeeded(
+    monkeypatch, kind: str,
+) -> None:
+    """The retry must cover the CONNECT only. Once a Purchase is on the
+    wire the terminal may already be taking the money, so a request that
+    fails after connecting is reported, never repeated — and that has to
+    hold for EVERY way the request can fail, not just a reset, and not only
+    the ways that fail loudly."""
+    reader, writer = _post_connect_failure(kind)
+    state = _patch_connect(monkeypatch, [(reader, writer)])
+    adapter = PrivatBankTerminalAdapter(_registration(2000))
+
+    if kind == "error_reply":
+        # An answer, so it comes back as a refusal and not as an exception.
+        result = await adapter.charge(ChargeRequest(amount_kopecks=24500))
+        assert result.status == "declined"
+    else:
+        with pytest.raises(TerminalUnavailable):
+            await adapter.charge(ChargeRequest(amount_kopecks=24500))
+
+    assert state["calls"] == 1
+    assert len(writer.frames) == 1
+
+
+@pytest.mark.asyncio
+async def test_socket_is_released_when_the_payment_succeeds(monkeypatch) -> None:
+    writer = _FakeWriter()
+    _patch_connect(monkeypatch, [(_FakeReader(_APPROVED), writer)])
+    adapter = PrivatBankTerminalAdapter(_registration(2000))
+
+    result = await adapter.charge(ChargeRequest(amount_kopecks=24500))
+
+    assert result.status == "ok"
+    assert writer.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_socket_is_released_when_the_payment_fails(monkeypatch) -> None:
+    writer = _FakeWriter()
+    _patch_connect(monkeypatch, [
+        (_FakeReader(None, raises=ConnectionResetError("reset")), writer),
+    ])
+    adapter = PrivatBankTerminalAdapter(_registration(2000))
+
+    with pytest.raises(TerminalUnavailable):
+        await adapter.charge(ChargeRequest(amount_kopecks=24500))
+
+    assert writer.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failing_close_does_not_lose_the_payment_result(monkeypatch) -> None:
+    """The release itself can throw on a half-dead socket. Losing the
+    result of a payment the terminal already approved would be worse
+    than the leak."""
+    writer = _FakeWriter(fail_close=True)
+    _patch_connect(monkeypatch, [(_FakeReader(_APPROVED), writer)])
+    adapter = PrivatBankTerminalAdapter(_registration(2000))
+
+    result = await adapter.charge(ChargeRequest(amount_kopecks=24500))
+
+    assert result.status == "ok"
+    assert writer.closed == 1
+
+
+@pytest.mark.asyncio
+async def test_a_connect_that_never_answers_is_cut_on_the_connect_budget(
+    monkeypatch,
+) -> None:
+    """A charge gives the REQUEST 120 s because the cardholder needs it.
+    The connect must not inherit that: on the till a dead terminal hung
+    the connect for 21 s before Windows gave up, and under the request
+    budget it could have held the cashier for two minutes."""
+    monkeypatch.setattr(
+        "src.services.terminals.privatbank.CONNECT_TIMEOUT_S", 0.05,
+    )
+
+    async def never_answers(host, port):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(
+        "src.services.terminals.privatbank.asyncio.open_connection", never_answers,
+    )
+    monkeypatch.setattr(
+        "src.services.terminals.privatbank.CONNECT_RETRY_PAUSE_S", 0,
+    )
+    adapter = PrivatBankTerminalAdapter(_registration(2000))
+
+    with pytest.raises(TerminalUnavailable) as caught:
+        await asyncio.wait_for(
+            adapter.charge(ChargeRequest(amount_kopecks=24500)), timeout=5,
+        )
+
+    assert caught.value.code == "unreachable"
+
+
+@pytest.mark.asyncio
+async def test_a_connect_says_how_long_the_endpoint_had_been_left_alone(
+    monkeypatch, caplog,
+) -> None:
+    """What the field fault turns on is how long the terminal had been left
+    alone before a connect failed, and the log is the only place that can
+    answer it. So a connect that SUCCEEDS is on the record too, at a level
+    production writes, carrying the gap since this process last closed a
+    connection to the same endpoint — the first one has no previous close and
+    says so, the second one measures it.
+    """
+    import logging as logging_module
+
+    from src.services.terminals import privatbank as pb
+
+    monkeypatch.setattr(pb, "_last_close_at", {})
+    _patch_connect(monkeypatch, [
+        (_FakeReader(_APPROVED), _FakeWriter()),
+        (_FakeReader(_APPROVED), _FakeWriter()),
+    ])
+    adapter = PrivatBankTerminalAdapter(_registration(2000))
+
+    with caplog.at_level(logging_module.INFO, logger=pb.__name__):
+        await adapter.charge(ChargeRequest(amount_kopecks=24500))
+        await adapter.charge(ChargeRequest(amount_kopecks=24500))
+
+    connected = [
+        r.getMessage() for r in caplog.records if ": connected on attempt" in r.getMessage()
+    ]
+    assert len(connected) == 2
+    assert all(r.levelno == logging_module.INFO for r in caplog.records
+               if ": connected on attempt" in r.getMessage())
+    assert "last close of a connection to this endpoint: none in this process" \
+        in connected[0]
+    # The second connect follows a close, so the gap is a measured figure.
+    assert "none in this process" not in connected[1]
+    assert "last close of a connection to this endpoint: 0." in connected[1]
+
+
+@pytest.mark.parametrize("call", ["ping", "probe", "merchants"])
+@pytest.mark.asyncio
+async def test_everything_but_a_payment_keeps_a_single_connect_attempt(
+    monkeypatch, call: str,
+) -> None:
+    """The retry is for the two calls where the alternative is a lost sale.
+
+    A liveness check has to report what is reachable RIGHT NOW. The discovery
+    probe runs against every host of a /24 — retrying each silent address
+    there turns one sweep into 254 x attempts x the connect budget and the
+    scan stops finishing. And the merchant list is read when the cashier
+    OPENS the payment window, before anybody has tried to pay: one attempt
+    answers or refuses in up to 5 s, three would hold that window for up to
+    14 s on every payment, in exchange for absorbing an outage that the
+    observed ones were all longer than.
+    """
+    state = _patch_connect(monkeypatch, [ConnectionRefusedError("refused")])
+
+    if call == "ping":
+        adapter = PrivatBankTerminalAdapter(_registration(2000))
+        assert await adapter.ping() is False
+    elif call == "merchants":
+        adapter = PrivatBankTerminalAdapter(_registration(2000))
+        with pytest.raises(TerminalUnavailable):
+            await adapter.list_merchants()
+    else:
+        assert await PrivatBankTerminalAdapter.probe("192.168.1.109", 2000) is None
+
+    assert state["calls"] == 1
+
+
+@pytest.mark.asyncio
+async def test_a_caller_asking_for_less_than_the_connect_budget_gets_less(
+    monkeypatch,
+) -> None:
+    """The connect budget is a CEILING, not a floor. `ping` asks for a
+    3 s round trip while the budget is 4 s, so a connect handed the bare
+    budget would outlive the deadline its own caller set. Here the caller
+    asks for far less and the connect must be cut on the caller's figure,
+    not on the budget."""
+
+    async def never_answers(host, port):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(
+        "src.services.terminals.privatbank.asyncio.open_connection", never_answers,
+    )
+
+    # The fence is wide of the caller's 0.05 s and well inside the 4 s
+    # connect budget, so it can only trip if the clamp is gone.
+    with pytest.raises(TerminalUnavailable) as caught:
+        await asyncio.wait_for(
+            send_tcp(
+                "192.168.1.109", 2000,
+                {"method": "PingDevice", "step": 0},
+                timeout=0.05,
+                # Pinned so this case can only ever fail on the clamp and
+                # not on someone changing how many attempts a connect gets.
+                connect_attempts=1,
+            ),
+            timeout=1.0,
+        )
+
+    assert caught.value.code == "unreachable"

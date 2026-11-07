@@ -430,3 +430,39 @@ async def test_a_scan_that_outgrows_the_budget_answers_with_what_it_has(monkeypa
     assert r.get("partial") is True, f"the answer has to say it is partial: {r}"
     assert "30" in r["note"], "and name the window it had to fit"
     assert r["found"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_failing_close_does_not_report_a_reachable_host_as_down(
+    monkeypatch,
+) -> None:
+    """`terminal_probe` answers the operator's "is the terminal there?"
+    with the connect alone. A `close()` that throws on a half-dead socket
+    must not turn a host that answered into `ok: false` — that is the
+    line the operator reads before deciding the terminal is broken."""
+    from src.services import diagnostics as diagnostics_module
+
+    class _ThrowingWriter:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+            raise OSError("close failed")
+
+        async def wait_closed(self) -> None:
+            raise OSError("wait_closed failed")
+
+    writer = _ThrowingWriter()
+
+    async def fake_open_connection(host, port):
+        return object(), writer
+
+    monkeypatch.setattr(
+        diagnostics_module.asyncio, "open_connection", fake_open_connection,
+    )
+
+    result = await run_diagnostic("terminal_probe", {"ip": "192.168.1.109", "port": 2000})
+
+    assert result["ok"] is True
+    assert writer.closed == 1

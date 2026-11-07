@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import ipaddress
 import logging
 import socket
@@ -318,7 +319,11 @@ def _local_subnet() -> Optional[ipaddress.IPv4Network]:
     except OSError:
         return None
     finally:
-        s.close()
+        # Guarded: raising out of a `finally` replaces the answer the caller
+        # was about to get, and here that would lose a subnet that had just
+        # been read successfully.
+        with contextlib.suppress(OSError):
+            s.close()
     try:
         return ipaddress.ip_network(f"{local_ip}/24", strict=False)
     except ValueError:
@@ -443,12 +448,21 @@ def _local_subnets() -> list[ipaddress.IPv4Network]:
 
 
 def _probe_tcp(host: str, port: int, timeout: float = 0.3) -> bool:
-    """True iff `host:port` accepts a TCP connect within `timeout`."""
+    """True iff `host:port` accepts a TCP connect within `timeout`.
+
+    The answer is decided by the connect and the release cannot change it.
+    Under the `with` the close ran inside the `except OSError`, so a close that
+    raised on a half-dead socket turned a port that had just accepted the
+    connect into False — the same shape as the terminal transports, where it
+    reported a reachable device as down.
+    """
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
+        sock = socket.create_connection((host, port), timeout=timeout)
     except (OSError, socket.timeout):
         return False
+    with contextlib.suppress(OSError):
+        sock.close()
+    return True
 
 
 def _reverse_dns(host: str) -> Optional[str]:
