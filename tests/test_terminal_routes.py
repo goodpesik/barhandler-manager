@@ -10,6 +10,9 @@ itself (that's `test_ssi_adapter.py`).
 from __future__ import annotations
 
 import asyncio
+import json
+from datetime import datetime
+from pathlib import Path
 from typing import Iterator
 from unittest.mock import AsyncMock, patch
 
@@ -841,3 +844,480 @@ async def test_a_refund_waits_for_the_charge_on_the_same_terminal(
     assert returned.status_code == 409
     assert returned.json()["detail"]["code"] == "terminal_busy"
     assert calls == ["charge"]
+
+
+# ---------------------------------------------------------------------------
+# PET-1304 — the key of one card operation
+#
+# The slot above stops two operations overlapping inside this process. These
+# stop the same operation being carried out twice, which is what is left when
+# the first attempt is no longer running: the manager restarted, the request
+# was retried, a second tab was opened.
+# ---------------------------------------------------------------------------
+
+
+def _charging_client(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> TestClient:
+    """An app with one registered terminal, ready to be charged."""
+    with patch("src.devices.scan.discover_usb", return_value=[]), \
+         patch("src.devices.scan.discover_network", return_value=[]), \
+         patch("src.devices.scan.discover_bluetooth", return_value=[]), \
+         patch(
+             "src.devices.scan.discover_network_terminals",
+             return_value=[fake_terminal],
+         ):
+        client = TestClient(create_app(config))
+        client.__enter__()
+        _register_default(client, auth_headers, fake_terminal.id)
+        return client
+
+
+def test_a_repeat_of_a_finished_key_is_refused_and_brings_its_answer_back(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The cashier's second press after a lost answer: the terminal is asked
+    once, and the repeat is told the operation is already done with the result
+    it had."""
+    calls: list[int] = []
+
+    async def charge(self, request):
+        calls.append(request.amount_kopecks)
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge", new=charge,
+        ):
+            body = {"amount_kopecks": 24500, "transaction_uid": "pet-card:one"}
+            first = client.post("/terminal/charge", headers=auth_headers, json=body)
+            second = client.post("/terminal/charge", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    detail = second.json()["detail"]
+    assert detail["code"] == "charge_already_done"
+    assert detail["result"]["rrn"] == "9999999999"
+    assert len(calls) == 1
+
+
+def test_a_charge_that_sends_no_key_is_not_held_back_by_one(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The BarHandler till and any Petshandler build older than this one send
+    no key. They must charge exactly as they did — twice over the same amount
+    is two legitimate sales when nothing names them as one."""
+    calls: list[int] = []
+
+    async def charge(self, request):
+        calls.append(request.amount_kopecks)
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge", new=charge,
+        ):
+            body = {"amount_kopecks": 24500}
+            first = client.post("/terminal/charge", headers=auth_headers, json=body)
+            second = client.post("/terminal/charge", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(calls) == 2
+
+
+def test_a_failure_that_may_have_charged_refuses_the_repeat_of_its_key(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """A timeout does not say whether the money moved, so the key stays — and
+    the repeat is told the operation was never finished rather than being sent
+    to the terminal again."""
+    calls: list[int] = []
+
+    async def timing_out(self, request):
+        calls.append(request.amount_kopecks)
+        raise TerminalUnavailable("timeout talking to the terminal", code="timeout")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge", new=timing_out,
+        ):
+            body = {"amount_kopecks": 24500, "transaction_uid": "pet-card:two"}
+            first = client.post("/terminal/charge", headers=auth_headers, json=body)
+            second = client.post("/terminal/charge", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 503
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "charge_unresolved"
+    assert len(calls) == 1
+
+
+def test_a_refusal_before_the_card_was_touched_leaves_the_key_usable(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """No merchant chosen is refused while the parameters are being assembled,
+    so nothing was put to the card. Holding the key would mean the cashier
+    could not put the same payment through at all once it is picked."""
+    answers: list[str] = []
+
+    async def refuse_then_charge(self, request):
+        if len(answers) == 0:
+            answers.append("refused")
+            raise TerminalUnavailable(
+                "no merchant to charge through", code="missing_merchant",
+            )
+        answers.append("charged")
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge",
+            new=refuse_then_charge,
+        ):
+            body = {"amount_kopecks": 24500, "transaction_uid": "pet-card:three"}
+            first = client.post("/terminal/charge", headers=auth_headers, json=body)
+            second = client.post("/terminal/charge", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 503
+    assert second.status_code == 200
+    assert answers == ["refused", "charged"]
+
+
+def test_the_answer_of_a_dated_charge_is_kept_and_given_to_the_repeat(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The terminal reports a transaction date on a real sale, so the answer
+    carries a datetime. It used to make the claim file unwritable from that
+    moment on — the claim stayed in flight on disk, the claims of every later
+    operation never reached it at all, and the repeat answered 500 while the
+    refusal was being built. The repeat must be refused and carry the answer.
+    """
+    async def charge(self, request):
+        return AcquirerResult(
+            status="ok",
+            rrn="9999999999",
+            payment_date=datetime(2026, 11, 8, 10, 30, 0),
+        )
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge", new=charge,
+        ):
+            body = {"amount_kopecks": 24500, "transaction_uid": "pet-card:dated"}
+            first = client.post("/terminal/charge", headers=auth_headers, json=body)
+            second = client.post("/terminal/charge", headers=auth_headers, json=body)
+            later = client.post(
+                "/terminal/charge",
+                headers=auth_headers,
+                json={"amount_kopecks": 100, "transaction_uid": "pet-card:later"},
+            )
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "charge_already_done"
+    assert second.json()["detail"]["result"]["rrn"] == "9999999999"
+    # And the operation that came after it is on disk, not only in memory.
+    assert later.status_code == 200
+    on_disk = json.loads(
+        (Path(config["server"]["charge_claims_path"])).read_text(encoding="utf-8"),
+    )["claims"]
+    assert "pet-card:later" in on_disk
+
+
+def test_an_answer_that_does_not_say_what_happened_keeps_the_key(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The adapters turn every outcome they do not recognise into `declined` —
+    here the first step read back after the second was already sent. Settled
+    as done, the till would drop its key and the cashier could run another
+    card for money that may already have moved."""
+    calls: list[int] = []
+
+    async def charge(self, request):
+        calls.append(request.amount_kopecks)
+        return AcquirerResult(
+            status="declined", raw_transaction_result="FIRST_STEP_COMPLETED",
+        )
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge", new=charge,
+        ):
+            body = {"amount_kopecks": 24500, "transaction_uid": "pet-card:nosay"}
+            first = client.post("/terminal/charge", headers=auth_headers, json=body)
+            second = client.post("/terminal/charge", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 200
+    assert first.json()["claim_state"] == "unresolved"
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "charge_unresolved"
+    assert len(calls) == 1
+
+
+def test_a_card_the_bank_named_as_refused_finishes_its_key(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The opposite side of the rule above, and the commonest card failure of
+    all: the bank answered with a code, nothing was taken, and the cashier may
+    try another card at once — the key must not hold them back."""
+    async def charge(self, request):
+        return AcquirerResult(
+            status="declined",
+            response_code="05",
+            raw_transaction_result="DECLINED_ONLINE",
+        )
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge", new=charge,
+        ):
+            answer = client.post(
+                "/terminal/charge",
+                headers=auth_headers,
+                json={"amount_kopecks": 24500, "transaction_uid": "pet-card:refused"},
+            )
+    finally:
+        client.__exit__(None, None, None)
+
+    assert answer.status_code == 200
+    assert answer.json()["claim_state"] == "done"
+
+
+def test_the_claim_is_on_disk_before_the_terminal_is_asked_anything(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The whole guard rests on this order. Written after the adapter, a
+    manager that stops mid-Purchase leaves no record of the attempt, and the
+    repeat charges the card a second time — so the adapter itself reads the
+    file and says what it found."""
+    seen: list[dict] = []
+    path = Path(config["server"]["charge_claims_path"])
+
+    async def charge(self, request):
+        seen.append(
+            json.loads(path.read_text(encoding="utf-8"))["claims"]
+            if path.exists() else {},
+        )
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge", new=charge,
+        ):
+            client.post(
+                "/terminal/charge",
+                headers=auth_headers,
+                json={"amount_kopecks": 24500, "transaction_uid": "pet-card:order"},
+            )
+    finally:
+        client.__exit__(None, None, None)
+
+    assert seen, "the adapter was never called"
+    assert seen[0].get("pet-card:order", {}).get("state") == "in_flight"
+
+
+def test_a_repeat_of_a_refund_key_is_refused_without_paying_twice(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """Money leaves the shop on this route as surely as it arrives on the
+    charge, and the refund window has sent a key of its own since PET-902."""
+    calls: list[int] = []
+
+    async def refund(self, request):
+        calls.append(request.amount_kopecks)
+        return AcquirerResult(status="ok", rrn="8888888888")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.refund", new=refund,
+        ):
+            body = {
+                "amount_kopecks": 24500,
+                "rrn": "9999999999",
+                "transaction_uid": "pet-refund:one",
+            }
+            first = client.post("/terminal/refund", headers=auth_headers, json=body)
+            second = client.post("/terminal/refund", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "charge_already_done"
+    assert len(calls) == 1
+
+
+def test_a_cable_pulled_before_the_purchase_leaves_the_key_usable(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The transport never connected, so not a byte of the Purchase was
+    written and the money provably did not move. The cashier plugs the cable
+    back in and presses Start again: the same key must reach the terminal
+    instead of being refused as a repeat.
+
+    `unreachable` is NOT on the code allow-list and must not be — a socket
+    that dies mid-Purchase raises it too. What frees the key here is the fact
+    the adapter puts on the exception.
+    """
+    answers: list[str] = []
+
+    async def cable_then_charge(self, request):
+        if len(answers) == 0:
+            answers.append("refused")
+            raise TerminalUnavailable(
+                "cannot connect to 10.0.0.42:3000: refused",
+                code="unreachable",
+                nothing_sent=True,
+            )
+        answers.append("charged")
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge",
+            new=cable_then_charge,
+        ):
+            body = {"amount_kopecks": 24500, "transaction_uid": "pet-card:cable"}
+            first = client.post("/terminal/charge", headers=auth_headers, json=body)
+            second = client.post("/terminal/charge", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 503
+    assert first.json()["detail"]["code"] == "unreachable"
+    assert second.status_code == 200
+    assert answers == ["refused", "charged"]
+
+
+def test_a_refund_whose_request_never_left_leaves_its_key_usable(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The same fact, on the refund route: money leaves the shop there as
+    surely as it arrives on the charge, and a refund the terminal never heard
+    of must be repeatable once the cable is back."""
+    answers: list[str] = []
+
+    async def cable_then_refund(self, request):
+        if len(answers) == 0:
+            answers.append("refused")
+            raise TerminalUnavailable(
+                "cannot connect to 10.0.0.42:3000: refused",
+                code="unreachable",
+                nothing_sent=True,
+            )
+        answers.append("refunded")
+        return AcquirerResult(status="ok", rrn="8888888888")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.refund",
+            new=cable_then_refund,
+        ):
+            body = {
+                "amount_kopecks": 24500,
+                "rrn": "9999999999",
+                "transaction_uid": "pet-refund:cable",
+            }
+            first = client.post("/terminal/refund", headers=auth_headers, json=body)
+            second = client.post("/terminal/refund", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 503
+    assert second.status_code == 200
+    assert answers == ["refused", "refunded"]
+
+
+@pytest.mark.parametrize("code", ["unreachable", "protocol_error"])
+def test_a_transport_failure_that_says_nothing_keeps_its_key(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+    code: str,
+) -> None:
+    """Neither code is on the allow-list, and must never be put on it.
+
+    `unreachable` is raised both by a connection that was refused and by a
+    socket that died with the `Purchase` already written; `protocol_error` by
+    a malformed reply, which means a reply came back and the request went out.
+    Without the adapter's own fact on the exception, both keep the key: the
+    repeat is refused instead of charging a card that may already have paid.
+    """
+    calls: list[int] = []
+
+    async def failing(self, request):
+        calls.append(request.amount_kopecks)
+        raise TerminalUnavailable("the terminal failed", code=code)
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge", new=failing,
+        ):
+            body = {"amount_kopecks": 24500, "transaction_uid": f"pet-card:{code}"}
+            first = client.post("/terminal/charge", headers=auth_headers, json=body)
+            second = client.post("/terminal/charge", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 503
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "charge_unresolved"
+    assert len(calls) == 1
+
+
+def test_the_refusal_names_the_operation_the_answer_belongs_to(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """What the till matches on before it takes a kept answer as its own.
+
+    The key names one sale on one till; the operation, the terminal and the
+    amount are checked beside it. Drop any of the four from the body and the
+    till either cannot match at all (and sends the cashier to write the
+    payment down by hand with the answer in the manager's hand) or matches
+    too loosely and records another sale's payment.
+    """
+    async def charge(self, request):
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge", new=charge,
+        ):
+            body = {
+                "amount_kopecks": 24500,
+                "transaction_uid": "pet-card:sale-a:0001",
+            }
+            client.post("/terminal/charge", headers=auth_headers, json=body)
+            repeat = client.post("/terminal/charge", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert repeat.status_code == 409
+    detail = repeat.json()["detail"]
+    assert detail["key"] == "pet-card:sale-a:0001"
+    assert detail["operation"] == "charge"
+    assert detail["terminal_id"] == fake_terminal.id
+    assert detail["amount"] == 24500

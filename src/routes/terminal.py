@@ -30,7 +30,15 @@ from src.models.terminal import (
     TerminalRegistrationRequest,
 )
 from src.services import work_journal
-from src.services.terminals.base import TerminalUnavailable
+from src.services.charge_claim import (
+    STATE_DONE,
+    STATE_UNRESOLVED,
+    ChargeClaims,
+    kept_result,
+    says_what_happened,
+    usable_key,
+)
+from src.services.terminals.base import NOTHING_WAS_SENT_CODES, TerminalUnavailable
 
 # Same channel the charge route already logs on, so the line shape the
 # shops' logs are read by does not change.
@@ -136,8 +144,7 @@ def _surface_terminal_error(
 # terminal just as the first one finishes — a double charge on one basket.
 # Nothing in front of this stops it either: the till disables its own Pay
 # button, but a second browser tab or a second till does not go through that
-# button, the charge payload carries no `transaction_uid`, and the manager has
-# no idempotency key to recognise a repeat by.
+# button.
 #
 # The second caller is refused immediately and is never queued: a queued second
 # charge is the same double charge a few seconds later. The claim is keyed by
@@ -145,6 +152,13 @@ def _surface_terminal_error(
 # once — so a refund lands on the same slot as a charge. Check and claim run
 # with no `await` between them, so two requests on the event loop cannot both
 # get the slot.
+#
+# THIS SET IS IN MEMORY, AND THAT IS DELIBERATE. It is the overlap of two
+# operations it stops, which only exists while a request of this process is
+# running; a process that dies takes the set with it and holds no terminal
+# afterwards. What it cannot see — the same operation carried out twice, the
+# second time after the first has gone — is what the operation's key stops, in
+# `src/services/charge_claim.py` (PET-1304).
 _busy_terminals: set[str] = set()
 
 
@@ -173,6 +187,177 @@ def _release_terminal(terminal_id: str) -> None:
     """Hand the slot back. Runs in a `finally`, so it also runs when the
     cashier's browser closes mid-payment."""
     _busy_terminals.discard(terminal_id)
+
+
+def _claims(request: Request) -> ChargeClaims:
+    """The station's claimed operation keys, built on demand so a manager
+    started without our lifespan (tests, an old embedded build) still has
+    one — the same shape as `_registry` above."""
+    claims = getattr(request.app.state, "charge_claims", None)
+    if claims is None:
+        claims = ChargeClaims()
+        claims.load()
+        request.app.state.charge_claims = claims
+    return claims
+
+
+def _claim_operation(
+    request: Request,
+    *,
+    operation: str,
+    terminal_id: str,
+    key: Optional[str],
+    amount_kopecks: int,
+) -> Optional[str]:
+    """Take the terminal's card slot and the operation's key, or refuse.
+
+    PET-1304. Two guards, and they stop different things. The slot stops two
+    card operations overlapping on one terminal inside this process. The key
+    stops the SAME operation being carried out twice — the repeat the slot
+    cannot see, because the first attempt is no longer running: the manager
+    restarted, the request was retried, a second tab was opened.
+
+    Both are taken here, before the caller goes anywhere near the terminal.
+    Answers the key that was claimed, or None when the caller sent none — a
+    till that sends no key charges exactly as it did before.
+
+    On a refusal nothing stays taken: the slot goes back before the refusal
+    leaves, or the next caller would meet a terminal held by a request that
+    never ran.
+    """
+    _claim_terminal(terminal_id, operation)
+    claimed = usable_key(key)
+    if claimed is None:
+        return None
+    refusal = _claims(request).begin(
+        claimed,
+        operation=operation,
+        terminal_id=terminal_id,
+        amount_kopecks=amount_kopecks,
+    )
+    if refusal is None:
+        return claimed
+    _release_terminal(terminal_id)
+    _log.warning(
+        "[%s] terminal=%s key=...%s refused: this operation is already %s, "
+        "and carrying it out again could take the money twice",
+        operation, terminal_id, claimed[-8:], refusal["state"],
+    )
+    raise HTTPException(status_code=409, detail=refusal)
+
+
+def _settle_claim(
+    request: Request,
+    key: Optional[str],
+    result,
+    *,
+    operation: str,
+    terminal_id: str,
+    amount_kopecks: int,
+) -> Optional[str]:
+    """Finish the key if the terminal said what happened — and not otherwise.
+
+    Answers the claim's state for the caller to carry back, so the till knows
+    whether its key is spent or still in doubt. None when no key was sent.
+
+    AN ANSWER THAT DOES NOT SAY WHAT HAPPENED DOES NOT FINISH ANYTHING. The
+    adapters turn every outcome they do not recognise into `declined` — a
+    timeout, an empty transaction result, a first step read back as if it were
+    the last. Settling those as `done` lets the key go, and the cashier can
+    then put a second card through for money that may already have moved. So
+    the claim is left as it stands and the `finally` below writes it
+    `unresolved`: the repeat is refused and named, which costs a manual check.
+    """
+    if key is None:
+        return None
+    # `mode="json"` and nothing else: the terminal fills `payment_date` with a
+    # datetime whenever it reports a transaction time, and a datetime in here
+    # made the claim file unwritable from that moment on (found by review).
+    answered = result.model_dump(mode="json") if result is not None else None
+    if not says_what_happened(answered):
+        _log.error(
+            "[%s] terminal=%s key=...%s amount=%s the answer does not say what "
+            "happened to the money (status=%s result=%s error_code=%s "
+            "response_code=%s): the operation is left unresolved, and a repeat "
+            "of this key will be refused instead of being sent to the terminal "
+            "again",
+            operation, terminal_id, key[-8:], amount_kopecks,
+            (answered or {}).get("status"),
+            (answered or {}).get("raw_transaction_result"),
+            (answered or {}).get("error_code"),
+            (answered or {}).get("response_code"),
+        )
+        return STATE_UNRESOLVED
+    kept = kept_result(answered)
+    _claims(request).settle(key, kept)
+    _log.info(
+        "[%s] terminal=%s key=...%s amount=%s settled as %s (rrn=%s auth=%s); "
+        "a repeat of this key is answered from it",
+        operation, terminal_id, key[-8:], amount_kopecks,
+        (kept or {}).get("status"), (kept or {}).get("rrn"),
+        (kept or {}).get("auth_code"),
+    )
+    return STATE_DONE
+
+
+def _free_claim_if_nothing_was_sent(
+    request: Request, key: Optional[str], exc: TerminalUnavailable, *, operation: str,
+) -> None:
+    """Free the key when the failure happened before the card was touched.
+
+    A terminal with no address or no merchant chosen is the commonest way a
+    charge fails, and nothing was put to the card: holding the key would mean
+    the cashier could not retry the same payment at all after fixing it. Every
+    other failure keeps its key — a timeout or a broken connection does not say
+    whether the money moved, and a repeat under that key must not charge again.
+
+    TWO WAYS A FAILURE CAN SAY NOTHING WAS SENT, and nothing else counts:
+
+    * its code is one of the few that are raised while the parameters are
+      still being assembled (`NOTHING_WAS_SENT_CODES`);
+    * the adapter says so on the exception itself — the transport never
+      connected, and no frame that could move money had gone out before it
+      tried. A pulled cable arrives this way: the code is `unreachable`, which
+      is not and must not be on the list, because the same code is raised by a
+      socket that died mid-`Purchase`.
+
+    THE DEFAULT IS TO KEEP. The fact is read as true only when it is exactly
+    `True`: an adapter that does not set it, an older adapter that has never
+    heard of it, anything uncertain — all keep the key, which costs a manual
+    check. Read the other way round it would cost a second charge.
+    """
+    if key is None:
+        return
+    code = getattr(exc, "code", None)
+    code_says_so = code in NOTHING_WAS_SENT_CODES
+    adapter_says_so = getattr(exc, "nothing_sent", False) is True
+    if not code_says_so and not adapter_says_so:
+        _log.warning(
+            "[%s] key=...%s stays claimed: the terminal failed with %s and "
+            "nothing says the request never left, so the money may have "
+            "moved; a repeat of this key will be refused instead of charging "
+            "again",
+            operation, key[-8:], code,
+        )
+        return
+    _claims(request).release(key)
+    _log.info(
+        "[%s] key=...%s is free again: refused with %s before anything was "
+        "put to the card (%s)",
+        operation, key[-8:], code,
+        "a refusal raised before the request was built" if code_says_so
+        else "the transport never connected, so not a byte of the request "
+             "was written",
+    )
+
+
+def _leave_claim_unfinished(request: Request, key: Optional[str]) -> None:
+    """Runs in the same `finally` as the journal's row: whatever became of the
+    request, a claim this process is no longer holding must not read as one
+    somebody is working on."""
+    if key is None:
+        return
+    _claims(request).unfinished(key)
 
 
 # ---------------------------------------------------------------------------
@@ -516,11 +701,20 @@ async def charge(
     import logging
     log = logging.getLogger("src.routes.terminal")
     adapter, used_id = _resolve(request, terminal_id)
-    _claim_terminal(used_id, "charge")
     log.info(
         "[charge] terminal=%s payload=%s",
         used_id,
         payload.model_dump_json(),
+    )
+    # Both guards before the first irreversible step. PET-1304: the key is
+    # claimed here, not after the terminal has answered — a refusal issued
+    # once the card has been charged refuses nothing.
+    key = _claim_operation(
+        request,
+        operation="charge",
+        terminal_id=used_id,
+        key=payload.transaction_uid,
+        amount_kopecks=payload.amount_kopecks,
     )
     operation = _Operation(used_id, work_journal.ACTION_SALE, payload.amount_kopecks)
     try:
@@ -528,6 +722,7 @@ async def charge(
             result = await adapter.charge(payload)
         except TerminalUnavailable as exc:
             operation.failed(str(exc) or getattr(exc, "code", None))
+            _free_claim_if_nothing_was_sent(request, key, exc, operation="charge")
             raise _surface_terminal_error(exc, operation="charge", terminal_id=used_id)
         except HTTPException:
             raise
@@ -543,13 +738,27 @@ async def charge(
             )
         log.info("[charge] terminal=%s result=%s", used_id, result.model_dump_json())
         operation.done(result)
-        return {"terminal_id": used_id, "result": result.model_dump()}
+        claim_state = _settle_claim(
+            request, key, result,
+            operation="charge",
+            terminal_id=used_id,
+            amount_kopecks=payload.amount_kopecks,
+        )
+        # The till reads this to decide whether its key is spent: an answer
+        # that does not say what happened leaves the key in doubt, and the
+        # till must keep it rather than mint a new one for the next press.
+        return {
+            "terminal_id": used_id,
+            "result": result.model_dump(),
+            "claim_state": claim_state,
+        }
     finally:
         # Nothing answered and nothing was recorded: a cancelled request (the
         # cashier's browser closed mid-payment) or an HTTPException raised
         # inside the adapter. The money may have moved, so the attempt is in
-        # the journal either way.
+        # the journal either way — and the operation's key says so too.
         operation.unfinished()
+        _leave_claim_unfinished(request, key)
         _release_terminal(used_id)
 
 
@@ -574,9 +783,17 @@ async def refund(
     import logging
     log = logging.getLogger("src.routes.terminal")
     adapter, used_id = _resolve(request, terminal_id)
-    _claim_terminal(used_id, "refund")
     log.info(
         "[refund] terminal=%s payload=%s", used_id, payload.model_dump_json(),
+    )
+    # The same two guards as the charge: money leaves the shop here as surely
+    # as it arrives there (PET-1304).
+    key = _claim_operation(
+        request,
+        operation="refund",
+        terminal_id=used_id,
+        key=payload.transaction_uid,
+        amount_kopecks=payload.amount_kopecks,
     )
     operation = _Operation(used_id, work_journal.ACTION_REFUND, payload.amount_kopecks)
     try:
@@ -584,6 +801,7 @@ async def refund(
             result = await adapter.refund(payload)
         except TerminalUnavailable as exc:
             operation.failed(str(exc) or getattr(exc, "code", None))
+            _free_claim_if_nothing_was_sent(request, key, exc, operation="refund")
             raise _surface_terminal_error(exc, operation="refund", terminal_id=used_id)
         except HTTPException:
             raise
@@ -599,13 +817,24 @@ async def refund(
             )
         log.info("[refund] terminal=%s result=%s", used_id, result.model_dump_json())
         operation.done(result)
-        return {"terminal_id": used_id, "result": result.model_dump()}
+        claim_state = _settle_claim(
+            request, key, result,
+            operation="refund",
+            terminal_id=used_id,
+            amount_kopecks=payload.amount_kopecks,
+        )
+        return {
+            "terminal_id": used_id,
+            "result": result.model_dump(),
+            "claim_state": claim_state,
+        }
     finally:
         # Nothing answered and nothing was recorded: a cancelled request (the
         # cashier's browser closed mid-payment) or an HTTPException raised
         # inside the adapter. The money may have moved, so the attempt is in
-        # the journal either way.
+        # the journal either way — and the operation's key says so too.
         operation.unfinished()
+        _leave_claim_unfinished(request, key)
         _release_terminal(used_id)
 
 
