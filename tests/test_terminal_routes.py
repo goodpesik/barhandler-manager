@@ -841,3 +841,152 @@ async def test_a_refund_waits_for_the_charge_on_the_same_terminal(
     assert returned.status_code == 409
     assert returned.json()["detail"]["code"] == "terminal_busy"
     assert calls == ["charge"]
+
+
+# ---------------------------------------------------------------------------
+# PET-1304 — the key of one card operation
+#
+# The slot above stops two operations overlapping inside this process. These
+# stop the same operation being carried out twice, which is what is left when
+# the first attempt is no longer running: the manager restarted, the request
+# was retried, a second tab was opened.
+# ---------------------------------------------------------------------------
+
+
+def _charging_client(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> TestClient:
+    """An app with one registered terminal, ready to be charged."""
+    with patch("src.devices.scan.discover_usb", return_value=[]), \
+         patch("src.devices.scan.discover_network", return_value=[]), \
+         patch("src.devices.scan.discover_bluetooth", return_value=[]), \
+         patch(
+             "src.devices.scan.discover_network_terminals",
+             return_value=[fake_terminal],
+         ):
+        client = TestClient(create_app(config))
+        client.__enter__()
+        _register_default(client, auth_headers, fake_terminal.id)
+        return client
+
+
+def test_a_repeat_of_a_finished_key_is_refused_and_brings_its_answer_back(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The cashier's second press after a lost answer: the terminal is asked
+    once, and the repeat is told the operation is already done with the result
+    it had."""
+    calls: list[int] = []
+
+    async def charge(self, request):
+        calls.append(request.amount_kopecks)
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge", new=charge,
+        ):
+            body = {"amount_kopecks": 24500, "transaction_uid": "pet-card:one"}
+            first = client.post("/terminal/charge", headers=auth_headers, json=body)
+            second = client.post("/terminal/charge", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 200
+    assert second.status_code == 409
+    detail = second.json()["detail"]
+    assert detail["code"] == "charge_already_done"
+    assert detail["result"]["rrn"] == "9999999999"
+    assert len(calls) == 1
+
+
+def test_a_charge_that_sends_no_key_is_not_held_back_by_one(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The BarHandler till and any Petshandler build older than this one send
+    no key. They must charge exactly as they did — twice over the same amount
+    is two legitimate sales when nothing names them as one."""
+    calls: list[int] = []
+
+    async def charge(self, request):
+        calls.append(request.amount_kopecks)
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge", new=charge,
+        ):
+            body = {"amount_kopecks": 24500}
+            first = client.post("/terminal/charge", headers=auth_headers, json=body)
+            second = client.post("/terminal/charge", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert len(calls) == 2
+
+
+def test_a_failure_that_may_have_charged_refuses_the_repeat_of_its_key(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """A timeout does not say whether the money moved, so the key stays — and
+    the repeat is told the operation was never finished rather than being sent
+    to the terminal again."""
+    calls: list[int] = []
+
+    async def timing_out(self, request):
+        calls.append(request.amount_kopecks)
+        raise TerminalUnavailable("timeout talking to the terminal", code="timeout")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge", new=timing_out,
+        ):
+            body = {"amount_kopecks": 24500, "transaction_uid": "pet-card:two"}
+            first = client.post("/terminal/charge", headers=auth_headers, json=body)
+            second = client.post("/terminal/charge", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 503
+    assert second.status_code == 409
+    assert second.json()["detail"]["code"] == "charge_unresolved"
+    assert len(calls) == 1
+
+
+def test_a_refusal_before_the_card_was_touched_leaves_the_key_usable(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """No merchant chosen is refused while the parameters are being assembled,
+    so nothing was put to the card. Holding the key would mean the cashier
+    could not put the same payment through at all once it is picked."""
+    answers: list[str] = []
+
+    async def refuse_then_charge(self, request):
+        if len(answers) == 0:
+            answers.append("refused")
+            raise TerminalUnavailable(
+                "no merchant to charge through", code="missing_merchant",
+            )
+        answers.append("charged")
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge",
+            new=refuse_then_charge,
+        ):
+            body = {"amount_kopecks": 24500, "transaction_uid": "pet-card:three"}
+            first = client.post("/terminal/charge", headers=auth_headers, json=body)
+            second = client.post("/terminal/charge", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 503
+    assert second.status_code == 200
+    assert answers == ["refused", "charged"]

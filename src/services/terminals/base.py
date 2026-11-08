@@ -37,6 +37,30 @@ class TerminalUnavailable(RuntimeError):
         self.code = code
 
 
+#: PET-1304 — the refusals that happen BEFORE anything is put to the card.
+#:
+#: A terminal with no address, no merchant to charge through, a refund asked
+#: without the numbers the operation needs: every one of these is raised while
+#: the parameters are being assembled, before the Purchase/Refund frame is
+#: written. They are named here, where a new code is added, because the route
+#: layer frees an operation's idempotency key for exactly these and keeps it
+#: for everything else — a failure that may have reached the card must not let
+#: a repeat charge again.
+#:
+#: Written as the list of what IS safe, never as a list of what is not: a code
+#: added later and forgotten by this list keeps its key, which costs a manual
+#: retry; the other way round it would cost a second charge.
+NOTHING_WAS_SENT_CODES: frozenset[str] = frozenset({
+    "not_configured",
+    "missing_merchant",
+    "merchant_lookup_failed",
+    "refund_unsupported",
+    "bad_refund_operation",
+    "missing_refund_reference",
+    "missing_invoice_num",
+})
+
+
 class MerchantInfo:
     """Lightweight DTO returned by `list_merchants()` — keeps the
     adapter return type stable even as SSI doc rev adds optional

@@ -53,6 +53,10 @@ def config(tmp_registry: Path, tmp_terminal_registry: Path, tmp_path: Path) -> d
             "station_settings_path": str(tmp_path / "app-settings.json"),
             # Whether the client app offers offline mode — per test too.
             "offline_offer_path": str(tmp_path / "offline-offer.json"),
+            # PET-1304 — the keys of the card operations already started. Per
+            # test as well: a claim leaking between tests would refuse a
+            # charge that nothing had started.
+            "charge_claims_path": str(tmp_path / "charge-claims.json"),
         },
     }
 
