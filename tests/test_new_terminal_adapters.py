@@ -282,3 +282,58 @@ def test_posapi_probe_rejects_bpos_server():
             await server.wait_closed()
 
     asyncio.run(body())
+
+
+# ---------------------------------------------------------------------------
+# Socket release — shared by all three protocols above
+# ---------------------------------------------------------------------------
+
+
+def test_a_failing_close_does_not_lose_the_bridge_result(monkeypatch):
+    """`exchange` is the single transport under BPOS, Oschad and PosAPI.
+    Its release runs in a `finally`, so an unguarded `close()` that throws
+    on a half-dead socket replaces whatever the caller was about to
+    return — on a bridge that had just approved a payment that turns an
+    approval into an error for money which has already moved. A real
+    loopback socket cannot be made to fail on close, so the connection is
+    scripted."""
+    from src.services.terminals import bridge as bridge_module
+
+    class _ThrowingWriter:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def write(self, data: bytes) -> None:
+            return None
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed += 1
+            raise OSError("close failed")
+
+        async def wait_closed(self) -> None:
+            raise OSError("wait_closed failed")
+
+    writer = _ThrowingWriter()
+
+    async def fake_open_connection(host, port):
+        return object(), writer
+
+    async def read_one_frame(reader, timeout):
+        return b'{"responseCode":"00","rrn":"777"}'
+
+    async def body():
+        monkeypatch.setattr(
+            bridge_module.asyncio, "open_connection", fake_open_connection,
+        )
+        response = await bridge_module.exchange(
+            "192.168.1.60", 3000, {"function": "SALE"},
+            encode=lambda request: json.dumps(request).encode("utf-8"),
+            read_frame=read_one_frame,
+        )
+        assert response == {"responseCode": "00", "rrn": "777"}
+        assert writer.closed == 1
+
+    asyncio.run(body())

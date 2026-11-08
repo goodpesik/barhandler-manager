@@ -10,10 +10,13 @@ story is fiddly enough that the operator hand-registers paired devices.
 
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
+import contextlib
 import ipaddress
 import logging
 import socket
+import time
 from typing import Optional
 
 import usb.core
@@ -316,7 +319,11 @@ def _local_subnet() -> Optional[ipaddress.IPv4Network]:
     except OSError:
         return None
     finally:
-        s.close()
+        # Guarded: raising out of a `finally` replaces the answer the caller
+        # was about to get, and here that would lose a subnet that had just
+        # been read successfully.
+        with contextlib.suppress(OSError):
+            s.close()
     try:
         return ipaddress.ip_network(f"{local_ip}/24", strict=False)
     except ValueError:
@@ -441,12 +448,21 @@ def _local_subnets() -> list[ipaddress.IPv4Network]:
 
 
 def _probe_tcp(host: str, port: int, timeout: float = 0.3) -> bool:
-    """True iff `host:port` accepts a TCP connect within `timeout`."""
+    """True iff `host:port` accepts a TCP connect within `timeout`.
+
+    The answer is decided by the connect and the release cannot change it.
+    Under the `with` the close ran inside the `except OSError`, so a close that
+    raised on a half-dead socket turned a port that had just accepted the
+    connect into False — the same shape as the terminal transports, where it
+    reported a reachable device as down.
+    """
     try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
+        sock = socket.create_connection((host, port), timeout=timeout)
     except (OSError, socket.timeout):
         return False
+    with contextlib.suppress(OSError):
+        sock.close()
+    return True
 
 
 def _reverse_dns(host: str) -> Optional[str]:
@@ -644,21 +660,126 @@ def _terminal_port_adapters() -> dict[int, list]:
     }
 
 
+TERMINAL_SWEEP_WORKERS = 256   # parallel TCP connects per sweep pass
+# Budget of the sweep behind the dashboard's «Сканувати термінали».
+# Nobody is counting the seconds behind that button, but something in
+# front of it is: the sweep used to cost some 6 s and now costs 25–27 s
+# per /24 and some 80 s across four subnets, which is past the default
+# read timeout of every proxy a station could ever sit behind — and
+# then the operator gets a gateway error instead of the terminals that
+# WERE found. Bounded well under a minute, with the same partial answer
+# the remote command gives.
+DASHBOARD_SWEEP_BUDGET_S = 45.0
+SLOW_SWEEP_TIMEOUT_S = 5.0     # connect timeout of the second pass
+# A single probe's hard ceiling. The slowest handshake we ship is 2.5 s
+# of ping plus 5 s of info (BPOS / Oschad / PosAPI; SSI is 2 + 5), so
+# anything past this is not a terminal taking its time, it is a socket
+# that will not finish. Without the ceiling the budget is only checked
+# BEFORE a probe starts, and one probe begun with 2 s left could still
+# run 7 s and land the whole answer outside the window the server waits
+# in — exactly the slow-but-answering terminal this ticket is about.
+PROBE_CEILING_S = 9.0
+# Kept back from a budget for the probes: the sweep only says who is
+# listening, the probes are what turns that into a terminal, so spending
+# the whole budget on sweeping would answer «nothing found». One full
+# probe's worth, so the reserve is never smaller than the thing it is
+# reserved for.
+PROBE_RESERVE_S = PROBE_CEILING_S
+# How much more patient the second sweep pass has to be than the first
+# to be worth running at all. Cut to 0.4 s against a 0.3 s fast pass it
+# proves nothing, and the log would still claim a patient pass had run.
+SLOW_PASS_MIN_MARGIN_S = 1.0
+
+
+def _sweep_open_pairs(
+    pairs: list[tuple[str, int]], timeout: float, workers: int,
+) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """TCP-connect every pair; return (answered, silent).
+
+    Split out so the sweep can run the same fan-out twice with
+    different patience.
+    """
+    answered: list[tuple[str, int]] = []
+    silent: list[tuple[str, int]] = []
+    if not pairs:
+        return answered, silent
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, min(workers, len(pairs))),
+    ) as pool:
+        future_map: dict = {
+            pool.submit(_probe_tcp, host, port, timeout): (host, port)
+            for host, port in pairs
+        }
+        for future in concurrent.futures.as_completed(future_map):
+            pair = future_map[future]
+            try:
+                ok = future.result()
+            except Exception:  # noqa: BLE001
+                ok = False
+            (answered if ok else silent).append(pair)
+    return answered, silent
+
+
 def discover_network_terminals(
     timeout: float = 0.3,
     probe_timeout: float = 2.0,
+    slow_timeout: float = SLOW_SWEEP_TIMEOUT_S,
+    budget_s: Optional[float] = None,
+    coverage: Optional[dict] = None,
 ) -> list:
     """LAN scan for every supported POS-terminal protocol.
 
-    Two-phase: fast TCP connect across the host's /24 on every known
-    terminal/bridge port, then each open host:port is probed with the
-    adapters mapped to that port. The bank-specific handshake is what
-    tells a real terminal apart from "something listening on that port".
+    Fast TCP connect across the host's /24 on every known terminal/
+    bridge port, a second slower connect over whatever stayed silent,
+    then each open host:port is probed with the adapters mapped to that
+    port. The bank-specific handshake is what tells a real terminal
+    apart from "something listening on that port".
+
+    The second pass is PET-1304: a terminal in a bad state has been
+    measured taking many seconds to accept a connection, and a single
+    0.3 s ceiling means a sweep during such an episode can never find
+    it — the shop is then told its terminal can only be added by IP.
+    Raising the one ceiling instead would multiply the whole sweep by
+    the same factor, so the patience is spent only where it is needed:
+    on the addresses that did not answer at once, and with a wider
+    thread pool so the extra wait overlaps.
+
+    `budget_s` caps the whole sweep for a caller that is itself being
+    waited on — remote diagnostics, where the server gives up after
+    `_SCAN_WAIT_S` and the operator is told «diagnostic timeout» while
+    the scan goes on running on the till with nobody left to hand the
+    result to. The patience of the second pass is cut to what fits
+    rather than the pass being dropped, so every address still gets a
+    second try; when even that does not fit, the second pass is skipped
+    and the probes stop at the deadline. `coverage` is filled with what
+    was actually done so the caller can say so out loud instead of
+    reporting a clean empty result for a scan that was cut short.
 
     Covered: SSI ECR JSON (Mono, 3000), PrivatBank JSON (2000),
     Printec PosAPI (Raif/PUMB bridge, 8080), BPOS1/Light (Pivdenny/Sense
     bridge, 8888), Oschad ECR (bridge, 7777).
     """
+    started = time.monotonic()
+    deadline = None if budget_s is None else started + budget_s
+
+    def _left() -> float:
+        return float("inf") if deadline is None else deadline - time.monotonic()
+
+    if coverage is not None:
+        # Filled before anything can go wrong, so a caller never reads the
+        # coverage of some earlier, luckier scan (as `discover_usb` does).
+        coverage.clear()
+        coverage.update({
+            "budget_s": budget_s,
+            "hosts": 0,
+            "pairs": 0,
+            "slow_pass": "not needed",
+            "probes_run": 0,
+            "probes_skipped": 0,
+            "probes_cut_off": 0,
+            "cut_short": False,
+        })
+
     port_adapters = _terminal_port_adapters()
     scan_ports = list(port_adapters.keys())
 
@@ -681,25 +802,68 @@ def discover_network_terminals(
         hosts.insert(0, LOOPBACK_HOST)
     logger.info(
         "terminal discovery: scanning %d subnet(s) %s plus %s (%d hosts total) "
-        "ports=%s tcp_timeout=%.1fs",
+        "ports=%s tcp_timeout=%.1fs slow_timeout=%.1fs",
         len(subnets), [str(s) for s in subnets], LOOPBACK_HOST, len(hosts),
-        scan_ports, timeout,
+        scan_ports, timeout, slow_timeout,
     )
     # Collect open host:port pairs across every terminal port.
-    open_pairs: list[tuple[str, int]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=64) as pool:
-        future_map: dict = {}
-        for host in hosts:
-            for port in scan_ports:
-                future_map[pool.submit(_probe_tcp, host, port, timeout)] = (host, port)
-        for future in concurrent.futures.as_completed(future_map):
-            host, port = future_map[future]
-            try:
-                if not future.result():
-                    continue
-            except Exception:  # noqa: BLE001
-                continue
-            open_pairs.append((host, port))
+    all_pairs = [(host, port) for host in hosts for port in scan_ports]
+    if coverage is not None:
+        coverage["hosts"] = len(hosts)
+        coverage["pairs"] = len(all_pairs)
+    open_pairs, silent = _sweep_open_pairs(
+        all_pairs, timeout, TERMINAL_SWEEP_WORKERS,
+    )
+    if silent and slow_timeout > timeout:
+        # What the second pass costs is its timeout once per batch of
+        # pairs, and over several subnets that is more than a diagnostic
+        # is allowed to take: four /24s are twenty batches, so 5 s of
+        # patience each is 100 s against a 25 s budget. Spend what is
+        # left, minus a reserve for the probes, across the batches —
+        # every silent address is still tried a second time, just less
+        # patiently. If that leaves no more patience than the fast pass
+        # already had, the pass would prove nothing and is skipped.
+        batches = max(1, -(-len(silent) // TERMINAL_SWEEP_WORKERS))
+        affordable = (_left() - PROBE_RESERVE_S) / batches
+        effective_slow = min(slow_timeout, affordable)
+        if effective_slow < timeout + SLOW_PASS_MIN_MARGIN_S:
+            logger.warning(
+                "terminal discovery: no room for a slow pass over %d silent "
+                "address(es) within the %.0fs budget — %.1fs of patience "
+                "was affordable and anything under %.1fs would prove "
+                "nothing the %.1fs pass has not already; a terminal too busy "
+                "to answer in %.1fs stays unfound, scan one subnet at a time "
+                "to get the patient pass back",
+                len(silent), budget_s or 0.0, max(effective_slow, 0.0),
+                timeout + SLOW_PASS_MIN_MARGIN_S, timeout, timeout,
+            )
+            if coverage is not None:
+                coverage["slow_pass"] = (
+                    "skipped: the patience the budget allowed would have "
+                    "proved nothing the fast pass had not"
+                )
+                coverage["cut_short"] = True
+        else:
+            if coverage is not None:
+                coverage["slow_pass"] = f"ran with {effective_slow:.1f}s patience"
+                coverage["cut_short"] = effective_slow < slow_timeout
+            if effective_slow < slow_timeout:
+                logger.info(
+                    "terminal discovery: slow pass over %d silent address(es) "
+                    "cut from %.1fs to %.1fs of patience to stay inside the "
+                    "%.0fs budget",
+                    len(silent), slow_timeout, effective_slow, budget_s or 0.0,
+                )
+            slow_open, _ = _sweep_open_pairs(
+                silent, effective_slow, TERMINAL_SWEEP_WORKERS,
+            )
+            if slow_open:
+                logger.info(
+                    "terminal discovery: %d address(es) answered only on the "
+                    "slow pass (%.1fs) — a busy or wedged terminal",
+                    len(slow_open), effective_slow,
+                )
+            open_pairs.extend(slow_open)
 
     open_by_port = {
         port: [h for h, p in open_pairs if p == port] for port in scan_ports
@@ -737,21 +901,72 @@ def discover_network_terminals(
     async def _probe_all() -> list:
         out: list = []
         seen: set[str] = set()
+        run = 0
+        skipped = 0
+        cut = 0
         for host, port in open_pairs:
             for adapter in port_adapters.get(port, []):
                 key = f"{host}:{port}:{adapter.__name__}"
                 if key in seen:
                     continue
                 seen.add(key)
+                # A probe is up to `probe_timeout` on anything that
+                # listens on a terminal port without being a terminal —
+                # a NAS, a dashboard, a dev server. Eight of those are
+                # enough to walk out of the budget, and then the whole
+                # answer is lost instead of part of it.
+                left = _left()
+                if left <= probe_timeout:
+                    skipped += 1
+                    continue
+                run += 1
+                # And the probe itself is held to what is left. The
+                # check above only says a probe may START; a handshake
+                # is up to 7.5 s of its own timeouts, so one begun with
+                # 2 s to spare would walk the whole sweep out of the
+                # window the server waits in, and the result would
+                # reach nobody. Cut short is counted as not run: the
+                # address was never answered for either way.
                 try:
-                    descriptor = await adapter.probe(host, port)
+                    descriptor = await asyncio.wait_for(
+                        adapter.probe(host, port),
+                        timeout=min(left, PROBE_CEILING_S),
+                    )
+                except asyncio.TimeoutError:
+                    descriptor = None
+                    run -= 1
+                    cut += 1
+                    logger.warning(
+                        "terminal discovery: %s probe of %s:%d given up on "
+                        "after %.1fs — a terminal that cannot finish a "
+                        "handshake in that long is not usable anyway, and "
+                        "the rest of the sweep still has to answer",
+                        adapter.__name__, host, port,
+                        min(left, PROBE_CEILING_S),
+                    )
                 except Exception:  # noqa: BLE001
                     descriptor = None
                 if descriptor is not None:
                     out.append(descriptor)
+        skipped += cut
+        if skipped:
+            logger.warning(
+                "terminal discovery: %d of %d probes left unrun — the %.0fs "
+                "budget ran out; %d terminal(s) found by the probes that did "
+                "run",
+                skipped, run + skipped, budget_s or 0.0, len(out),
+            )
+        if coverage is not None:
+            # A probe given up on counts with the ones never started:
+            # neither answered for its address, and saying «run» of a
+            # probe that was cut off would be the dishonest half of the
+            # same report.
+            coverage["probes_run"] = run
+            coverage["probes_skipped"] = skipped
+            coverage["probes_cut_off"] = cut
+            if skipped:
+                coverage["cut_short"] = True
         return out
-
-    import asyncio
 
     return _without_loopback_twins(asyncio.run(_probe_all()))
 

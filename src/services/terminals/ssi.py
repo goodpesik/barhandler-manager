@@ -36,10 +36,11 @@ from src.models.terminal import (
     TerminalNetworkAddress,
     TerminalRegistration,
     TerminalTransport,
-    make_terminal_id,
+    make_network_terminal_id,
 )
 from src.services.terminals.base import (
     MerchantInfo,
+    MoneyFrameTrace,
     TerminalAdapter,
     TerminalUnavailable,
 )
@@ -128,10 +129,23 @@ async def send_tcp(host: str, port: int, message: dict, timeout: float = REQUEST
             timeout=timeout,
         )
     except (OSError, asyncio.TimeoutError) as exc:
-        logger.warning("[ssi %s:%s] connect failed for %s: %s", host, port, method, exc)
+        logger.warning(
+            "[ssi %s:%s] connect failed for %s: the connection was never "
+            "opened, so no byte of THIS request was written. Whether a frame "
+            "that can move money went out earlier in the same operation is "
+            "decided by the operation's own record, not here: %s",
+            host, port, method, exc,
+        )
+        # PET-1304 — the one failure of this function that can say no byte of
+        # the request left this machine: there was no socket to write it to.
+        # The connection is opened before the frame is written, so the port
+        # being shut, the host being unreachable and the connect timing out
+        # all land here and nowhere else. Every other failure below happens
+        # with the frame already handed to the socket.
         raise TerminalUnavailable(
             f"cannot connect to {host}:{port}: {exc}",
             code="unreachable",
+            nothing_sent=True,
         ) from exc
 
     try:
@@ -172,8 +186,13 @@ async def send_tcp(host: str, port: int, message: dict, timeout: float = REQUEST
             code="protocol_error",
         ) from exc
     finally:
-        writer.close()
+        # BOTH halves of the release go inside the guard. `close()` on a
+        # half-dead socket can raise, and raising from `finally` replaces
+        # whatever the caller was about to return — on a terminal that had
+        # just approved a payment that turned an approval into an error for
+        # money which had already moved.
         try:
+            writer.close()
             await writer.wait_closed()
         except Exception:  # noqa: BLE001 — close may double-fault
             pass
@@ -223,12 +242,7 @@ class SSITerminalAdapter(TerminalAdapter):
         except (TerminalUnavailable, FrameError):
             pass
 
-        terminal_id = make_terminal_id(
-            TerminalTransport.network,
-            host,
-            str(port),
-            serial or "",
-        )
+        terminal_id = make_network_terminal_id(host, port, serial)
         label = f"{model or 'SSI POS'} @ {host}"
         if serial:
             label = f"{label} (s/n {serial})"
@@ -356,6 +370,25 @@ class SSITerminalAdapter(TerminalAdapter):
         )
 
     async def charge(self, request: ChargeRequest) -> AcquirerResult:
+        """End-to-end Purchase, and the one place the operation's own fact
+        about the money is settled.
+
+        PET-1304 — a failure that leaves here must say whether a byte of a
+        `Purchase` can have gone out, because the route frees this operation's
+        idempotency key on that fact and on nothing else. The transport knows
+        it for the connection it opened; only here is it known for the whole
+        operation, which opens one connection per request.
+        """
+        wire = MoneyFrameTrace()
+        try:
+            return await self._charge(request, wire)
+        except TerminalUnavailable as exc:
+            wire.seal(exc)
+            raise
+
+    async def _charge(
+        self, request: ChargeRequest, wire: MoneyFrameTrace,
+    ) -> AcquirerResult:
         """End-to-end Purchase flow per doc §3.1:
 
             1. send Purchase, terminal acks {error: false}
@@ -401,8 +434,10 @@ class SSITerminalAdapter(TerminalAdapter):
             merchant_id=merchant_id,
             transaction_uid=request.transaction_uid,
         )
-        ack = await self._send(
-            {"method": "Purchase", "step": "1", "params": params},
+        # The frame that moves the money, sent through the operation's record
+        # of whether any of it reached the socket (PET-1304).
+        ack = await wire.send(
+            self._send, {"method": "Purchase", "step": "1", "params": params},
         )
         # Business-class error on the ack (operator cancelled, card
         # declined at swipe, EMV failure) is a legitimate transaction
@@ -454,8 +489,8 @@ class SSITerminalAdapter(TerminalAdapter):
             "[%s] first step done (raw=%s), sending step:2 for authorisation",
             self.descriptor.id, first.raw_transaction_result,
         )
-        ack2 = await self._send(
-            {"method": "Purchase", "step": "2", "params": params},
+        ack2 = await wire.send(
+            self._send, {"method": "Purchase", "step": "2", "params": params},
         )
         business2 = _business_error_to_result(ack2)
         if business2 is not None:
@@ -529,6 +564,23 @@ class SSITerminalAdapter(TerminalAdapter):
         return result
 
     async def refund(self, request: RefundRequest) -> AcquirerResult:
+        """Money back to the card, and the same settling of the operation's
+        own fact as the charge above.
+
+        PET-1304 — money leaves the shop here as surely as it arrives there,
+        the route claims a key for it the same way, and a failure must say
+        whether a byte of the refund frame can have gone out.
+        """
+        wire = MoneyFrameTrace()
+        try:
+            return await self._refund(request, wire)
+        except TerminalUnavailable as exc:
+            wire.seal(exc)
+            raise
+
+    async def _refund(
+        self, request: RefundRequest, wire: MoneyFrameTrace,
+    ) -> AcquirerResult:
         """PET-882 — гроші назад на ту саму картку.
 
         Той самий танець, що й у ``charge``: надсилаємо, чекаємо, поки
@@ -607,7 +659,9 @@ class SSITerminalAdapter(TerminalAdapter):
             transaction_uid=request.transaction_uid,
         )
 
-        ack = await self._send({"method": operation, "params": params})
+        # The frame that moves the money, through the operation's record of
+        # whether any of it reached the socket (PET-1304).
+        ack = await wire.send(self._send, {"method": operation, "params": params})
         # Відмова оператора чи банку — це ЗАКОННИЙ результат операції, а не
         # збій сервісу: касир мусить побачити «відхилено» й піти проводити
         # руками, а не помилку з'єднання.

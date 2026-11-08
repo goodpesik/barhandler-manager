@@ -337,10 +337,14 @@ async def _cmd_terminal_probe(args: dict) -> dict:
         _, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=3,
         )
-        writer.close()
+        # BOTH halves of the release go inside the guard. The connect
+        # already succeeded, so the host IS reachable; a `close()` that
+        # raises on a half-dead socket would be caught by the handler
+        # below and reported as `ok: false` for a host that answered.
         try:
+            writer.close()
             await writer.wait_closed()
-        except Exception:
+        except Exception:  # noqa: BLE001 — close may double-fault
             pass
         return {"ok": True, "output": f"connected {host}:{port}"}
     except (asyncio.TimeoutError, OSError) as e:
@@ -568,12 +572,46 @@ async def _cmd_terminal_scan_subnet(args: dict) -> dict:
 async def _cmd_terminal_discover(args: dict) -> dict:
     """Run /terminal/discover synchronously and return the JSON-able list of
     descriptors. Equivalent to a dashboard 'Сканувати термінали' click but
-    callable remotely without X-Api-Key."""
+    callable remotely without X-Api-Key.
+
+    Bounded by `_SCAN_BUDGET_S`, exactly like `terminal_scan_subnet`:
+    the server stops waiting after `_SCAN_WAIT_S` and says «diagnostic
+    timeout», and a sweep that overran that window used to go on
+    running on the till with nobody left to take the result — a retry
+    then stacked a second sweep on top of the first. The sweep is no
+    longer the cheap thing it was: a second, patient pass over the
+    silent addresses costs 27 s on one /24 and some 80 s across four
+    subnets, so without a budget one subnet already sat on the line and
+    a till with several interfaces went straight past it.
+    """
     try:
         from src.devices.scan import discover_network_terminals
-        descriptors = await asyncio.to_thread(discover_network_terminals)
+        coverage: dict = {}
+        descriptors = await asyncio.to_thread(
+            discover_network_terminals,
+            budget_s=_SCAN_BUDGET_S, coverage=coverage,
+        )
         out = [d.model_dump(mode="json") for d in descriptors]
-        return {"ok": True, "output": json.dumps(out, indent=2, ensure_ascii=False)}
+        result = {
+            "ok": True,
+            "found": bool(out),
+            "output": json.dumps(out, indent=2, ensure_ascii=False),
+        }
+        if coverage.get("cut_short"):
+            result["partial"] = True
+            result["note"] = (
+                f"kept inside {_SCAN_BUDGET_S}s so that the answer still "
+                f"reaches the server (it waits {_SCAN_WAIT_S}s): "
+                f"{coverage['pairs']} address:port pairs over "
+                f"{coverage['hosts']} hosts, second patient pass "
+                f"{coverage['slow_pass']}, "
+                f"{coverage['probes_skipped']} of "
+                f"{coverage['probes_run'] + coverage['probes_skipped']} "
+                f"probes not run. A terminal may be missing from this list. "
+                f"Scan one subnet with terminal_scan_subnet, or probe a "
+                f"single address with terminal_probe_protocol."
+            )
+        return result
     except Exception as e:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 

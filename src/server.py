@@ -26,6 +26,7 @@ from src.services.busy import BusyTracker, guard_critical
 from src.services.station_settings import StationSettings
 from src.services.offline_offer import OfflineOffer
 from src.services import work_journal as work_journal_service
+from src.services.charge_claim import ChargeClaims
 from src.services.work_journal import WorkJournal
 from src.services.update_check import UpdateChecker
 from src.version import installed_version
@@ -51,6 +52,13 @@ def create_app(config: dict) -> FastAPI:
     # reason: they belong to the machine, not to the browser that drives it.
     journal = WorkJournal(
         path=Path(config["server"].get("journal_path", APP_DIR / "work-journal.jsonl")),
+    )
+    # PET-1304 — the keys of the card operations this station has started, so
+    # a repeat is recognised after a restart as well as during one. Beside the
+    # registries and the journal, for the same reason: it belongs to the
+    # machine that drives the terminal.
+    charge_claims = ChargeClaims(
+        path=Path(config["server"].get("charge_claims_path", APP_DIR / "charge-claims.json")),
     )
     station_settings = StationSettings(
         path=Path(config["server"].get("station_settings_path", APP_DIR / "app-settings.json")),
@@ -98,9 +106,14 @@ def create_app(config: dict) -> FastAPI:
         registry.load()
         terminal_registry.load()
         app.state.work_journal = journal
+        app.state.charge_claims = charge_claims
         app.state.station_settings = station_settings
         app.state.offline_offer = offline_offer
         journal.load()
+        # Read before the first charge can arrive: an operation that was in
+        # flight when the process last stopped is read back as unresolved, and
+        # a repeat of its key is refused rather than charged again.
+        charge_claims.load()
         station_settings.load()
         offline_offer.load()
         # The device layer records through the module singleton, so it does not

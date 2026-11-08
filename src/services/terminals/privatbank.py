@@ -34,6 +34,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from datetime import datetime, timezone
 from typing import Optional
 
 from src.models.terminal import (
@@ -45,7 +47,7 @@ from src.models.terminal import (
     TerminalNetworkAddress,
     TerminalRegistration,
     TerminalTransport,
-    make_terminal_id,
+    make_network_terminal_id,
 )
 from src.services.terminals.base import (
     MerchantInfo,
@@ -63,6 +65,68 @@ REQUEST_TIMEOUT_S = 15.0       # spec §1.1 max per-request
 INTER_REQUEST_PAUSE_S = 1.0    # spec §3 — 1s after PingDevice; safe general default
 HANDSHAKE_PAUSE_S = 1.0        # 3-5s for Verifone per spec, 1s for others
 MAX_FRAME_SIZE = 64 * 1024     # JSON ≤64K — same envelope guard as SSI
+
+# The connect has its own deadline, separate from the per-request one. A
+# charge gives the request 120 s because the cardholder needs that long for
+# chip and PIN, but the TCP connect to a terminal on the same LAN either
+# answers in milliseconds or is not going to answer: on one shop's till a
+# dead terminal returned WinError 121 (semaphore timeout) after 21 s, and
+# under the shared 120 s deadline it could have held the till for two
+# minutes before saying anything.
+CONNECT_TIMEOUT_S = 4.0
+# How many times a FAILED CONNECT is tried, first attempt included, for the
+# calls that opt in. Observed on the same till: the terminal refuses or
+# times out for a window of seconds to a couple of minutes and then answers
+# normally again, with no restart of anything on our side.
+CONNECT_ATTEMPTS = 3
+CONNECT_RETRY_PAUSE_S = 1.0
+
+# When this process last closed a connection to a given endpoint, and when the
+# process itself started. Both exist so the log can answer the one question the
+# field fault turns on: how long the endpoint had been left alone before the
+# connect that failed. Without the gap a terminal-side listener that stays shut
+# for a while after our connection closes and a plain LAN fault produce the
+# same lines. Keyed by endpoint, so the size is the number of terminals a till
+# talks to.
+_last_close_at: dict[tuple[str, int], float] = {}
+_PROCESS_START = time.monotonic()
+_PROCESS_START_AT = datetime.now(timezone.utc)
+_process_start_logged = False
+
+
+def _note_close(host: str, port: int) -> None:
+    """Remember that the connection to this endpoint has just been closed."""
+    _last_close_at[(host, port)] = time.monotonic()
+
+
+def _since_last_close(host: str, port: int) -> Optional[float]:
+    """Seconds since this process last closed a connection to the endpoint,
+    or None when it has not had one yet."""
+    at = _last_close_at.get((host, port))
+    return None if at is None else time.monotonic() - at
+
+
+def _gap_text(host: str, port: int) -> str:
+    since = _since_last_close(host, port)
+    return f"{since:.1f}s ago" if since is not None else "none in this process"
+
+
+def _log_process_start_once() -> None:
+    """One line per process, on the first use of the terminal transport.
+
+    The first connect of a process has no previous close to measure against.
+    Against the process start time that case reads as what it is, instead of
+    looking like a long quiet period.
+    """
+    global _process_start_logged
+    if _process_start_logged:
+        return
+    _process_start_logged = True
+    logger.info(
+        "[pb] terminal transport first use; this process started at %s, %.0fs ago",
+        _PROCESS_START_AT.isoformat(timespec="seconds"),
+        time.monotonic() - _PROCESS_START,
+    )
 
 # trnStatus enum (Purchase 5.1.2)
 _TRN_APPROVED = 1
@@ -152,6 +216,74 @@ async def _read_until_null(reader: asyncio.StreamReader, timeout: float) -> byte
             return bytes(buf[: idx + 1])
 
 
+async def connect_tcp(
+    host: str,
+    port: int,
+    *,
+    method: str,
+    # Both defaults are dead: every caller passes both explicitly, and
+    # `send_tcp` is the only caller. They are kept so the signature reads on
+    # its own, and they are deliberately not tested — a test of a value
+    # nothing can reach pins nothing.
+    attempts: int = 1,
+    connect_timeout: float = CONNECT_TIMEOUT_S,
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Open a TCP connection to the terminal, retrying a failed connect
+    up to `attempts` times.
+
+    ONLY the connect is retried, and that is what makes the retry safe to
+    use on a payment: a connect that failed put no bytes on the wire, so
+    the terminal never saw a Purchase and no money can move twice. Once
+    this function returns, the caller owns the socket and never comes back
+    here — a request that failed after the connect is never re-sent.
+
+    Every attempt is logged with the endpoint, the method, the attempt number
+    and how long it is since this process last closed a connection to the same
+    endpoint — the success at `info`, a failure at `warning`, both levels that
+    are written in production. The success line is what makes the failures
+    readable: it marks when a connection existed and when it went away, so a
+    failing connect can be placed against the last one that worked. The error
+    type stays in the line because a refusal and a connect that never answers
+    are different faults.
+    """
+    last: Optional[BaseException] = None
+    tried = max(attempts, 1)
+    _log_process_start_once()
+    for attempt in range(1, tried + 1):
+        gap = _gap_text(host, port)
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=connect_timeout,
+            )
+        except (OSError, asyncio.TimeoutError) as exc:
+            last = exc
+            logger.warning(
+                "[pb %s:%s] %s: connect attempt %d of %d failed after up to "
+                "%.1fs (last close of a connection to this endpoint: %s): "
+                "%s: %s",
+                host, port, method, attempt, tried,
+                connect_timeout, gap, type(exc).__name__, exc,
+            )
+            if attempt < tried:
+                await asyncio.sleep(CONNECT_RETRY_PAUSE_S)
+        else:
+            logger.info(
+                "[pb %s:%s] %s: connected on attempt %d of %d (last close of "
+                "a connection to this endpoint: %s)",
+                host, port, method, attempt, tried, gap,
+            )
+            return reader, writer
+    logger.warning(
+        "[pb %s:%s] %s: unreachable, gave up after %d connect attempt(s)",
+        host, port, method, tried,
+    )
+    raise TerminalUnavailable(
+        f"cannot connect to {host}:{port} after {tried} attempt(s): {last}",
+        code="unreachable",
+    ) from last
+
+
 async def send_tcp(
     host: str,
     port: int,
@@ -159,22 +291,28 @@ async def send_tcp(
     *,
     leading_delimiter: bool = False,
     timeout: float = REQUEST_TIMEOUT_S,
+    connect_attempts: int = 1,
 ) -> dict:
     """Open a connection, send one framed message, read one framed
     response, close. Caller decides when to add the handshake leading-
     delimiter (only for the very first PingDevice after a fresh
     connect).
+
+    `connect_attempts` above 1 retries a failed CONNECT only — see
+    `connect_tcp`. Liveness checks and discovery probes leave it at 1:
+    their whole job is to report what is reachable right now, and a scan
+    that retried every silent address would take minutes.
     """
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port),
-            timeout=timeout,
-        )
-    except (OSError, asyncio.TimeoutError) as exc:
-        raise TerminalUnavailable(
-            f"cannot connect to {host}:{port}: {exc}",
-            code="unreachable",
-        ) from exc
+    method = str(message.get("method", "?"))
+    reader, writer = await connect_tcp(
+        host, port,
+        method=method,
+        attempts=connect_attempts,
+        # A caller asking for a shorter round trip than the connect budget
+        # (ping asks for 3 s) must not be given a longer connect than it
+        # asked for.
+        connect_timeout=min(CONNECT_TIMEOUT_S, timeout),
+    )
 
     try:
         writer.write(encode_frame(message, leading_delimiter=leading_delimiter))
@@ -182,26 +320,45 @@ async def send_tcp(
         raw = await _read_until_null(reader, timeout=timeout)
         return decode_frame(raw)
     except asyncio.TimeoutError as exc:
+        logger.warning(
+            "[pb %s:%s] %s: no reply within %.1fs", host, port, method, timeout,
+        )
         raise TerminalUnavailable(
             f"timeout talking to {host}:{port}",
             code="timeout",
         ) from exc
     except (OSError, asyncio.IncompleteReadError) as exc:
+        logger.warning(
+            "[pb %s:%s] %s: transport error after connecting: %s: %s",
+            host, port, method, type(exc).__name__, exc,
+        )
         raise TerminalUnavailable(
             f"transport error talking to {host}:{port}: {exc}",
             code="unreachable",
         ) from exc
     except FrameError as exc:
+        logger.warning(
+            "[pb %s:%s] %s: malformed reply: %s", host, port, method, exc,
+        )
         raise TerminalUnavailable(
             f"malformed PB response from {host}:{port}: {exc}",
             code="protocol_error",
         ) from exc
     finally:
-        writer.close()
+        # BOTH halves of the release go inside the guard. `close()` on a
+        # half-dead socket can raise, and raising from `finally` replaces
+        # whatever the caller was about to return — on a terminal that had
+        # just approved a payment that turned an approval into an error for
+        # money which had already moved.
         try:
+            writer.close()
             await writer.wait_closed()
         except Exception:  # noqa: BLE001 — close may double-fault
             pass
+        # Recorded whether or not the release itself went cleanly: from the
+        # terminal's side the connection is gone either way, and this is the
+        # figure every later connect line is measured against.
+        _note_close(host, port)
 
 
 async def send_serial(
@@ -335,12 +492,7 @@ class PrivatBankTerminalAdapter(TerminalAdapter):
             # Probe still useful even without identify — fall through.
             pass
 
-        terminal_id = make_terminal_id(
-            TerminalTransport.network,
-            host,
-            str(port),
-            serial or "",
-        )
+        terminal_id = make_network_terminal_id(host, port, serial)
         bits = [vendor, model] if (vendor or model) else ["PrivatBank POS"]
         label = f"{' '.join(b for b in bits if b)} @ {host}"
         if serial:
@@ -370,6 +522,7 @@ class PrivatBankTerminalAdapter(TerminalAdapter):
     async def _send(
         self, message: dict, *, leading_delimiter: bool = False,
         timeout: float = REQUEST_TIMEOUT_S,
+        connect_attempts: int = 1,
     ) -> dict:
         # USB terminal → serial/COM port; otherwise TCP. Same JSON either way.
         com = getattr(self.descriptor, "com", None)
@@ -382,6 +535,7 @@ class PrivatBankTerminalAdapter(TerminalAdapter):
             host, port, message,
             leading_delimiter=leading_delimiter,
             timeout=timeout,
+            connect_attempts=connect_attempts,
         )
 
     async def ping(self) -> bool:
@@ -417,6 +571,11 @@ class PrivatBankTerminalAdapter(TerminalAdapter):
         the index (the value Purchase actually expects in its
         `merchantId` param) and `merchant_name` is the human label.
         """
+        # A single connect attempt, deliberately. This call runs when the
+        # cashier opens the payment window, so its cost is paid on the way in
+        # on every payment: one attempt answers or refuses in up to 5 s, three
+        # hold the window for up to 14 s. The retry stays on `charge` and
+        # `refund`, where the alternative is a lost sale.
         response = await self._send(
             {"method": "ServiceMessage", "step": 0,
              "params": {"msgType": "getMerchantList"}},
@@ -467,10 +626,13 @@ class PrivatBankTerminalAdapter(TerminalAdapter):
         }
         for k, v in request.extras.items():
             params.setdefault(k, v)
-        # Long timeout — cardholder may take 60s+ on chip+PIN flows.
+        # Long timeout — cardholder may take 60s+ on chip+PIN flows. The
+        # connect inside keeps its own short budget, so a dead terminal is
+        # reported in seconds instead of holding the till for two minutes.
         response = await self._send(
             {"method": "Purchase", "step": 0, "params": params},
             timeout=120.0,
+            connect_attempts=CONNECT_ATTEMPTS,
         )
         return _result_from_purchase(response, transaction_uid=request.transaction_uid)
 
@@ -558,6 +720,7 @@ class PrivatBankTerminalAdapter(TerminalAdapter):
         response = await self._send(
             {"method": "Refund", "step": 0, "params": params},
             timeout=120.0,
+            connect_attempts=CONNECT_ATTEMPTS,
         )
         return _result_from_purchase(response)
 

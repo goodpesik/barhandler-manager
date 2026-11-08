@@ -90,7 +90,16 @@ class StationSettings:
 
     def _save_locked(self) -> None:
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp.write_text(json.dumps({"shops": self._shops}, ensure_ascii=False), encoding="utf-8")
+        # The bytes are forced to the disk before the rename, because the
+        # rename being atomic only says the file is either the old one or
+        # the new one — not that the new one has reached the platter. A
+        # power cut right after can otherwise leave NTFS holding the new
+        # name over a zero-length file, which is the very loss the
+        # temporary file is here to prevent.
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"shops": self._shops}, ensure_ascii=False))
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp, self.path)
 
     def save(self, appid: str, items: object) -> dict:

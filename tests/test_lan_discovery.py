@@ -143,11 +143,51 @@ def test_discover_finds_loopback_terminal(monkeypatch, loopback_terminal: int) -
 
 
 def test_discover_returns_empty_when_subnet_unknown(monkeypatch) -> None:
-    """No default route → empty list, never raises."""
+    """No default route → empty list, never raises.
+
+    Both enumerators are pinned: the sweep reads `_local_subnets`, so
+    leaving it live would have sent this test across the real network
+    of whatever machine runs it.
+    """
     import src.devices.scan as scan
 
     monkeypatch.setattr(scan, "_local_subnet", lambda: None)
+    monkeypatch.setattr(scan, "_local_subnets", lambda: [])
     assert discover_network_terminals() == []
+
+
+def test_discover_finds_a_terminal_slower_than_the_fast_pass(
+    monkeypatch, loopback_terminal: int,
+) -> None:
+    """PET-1304 — a busy terminal can be slow to accept a connection.
+    The sweep must come back for the addresses that stayed silent with
+    more patience, or such a terminal is never discoverable at all."""
+    import ipaddress
+
+    import src.devices.scan as scan
+
+    loop = ipaddress.ip_network("127.0.0.1/32", strict=False)
+    ssi_adapters = scan._terminal_port_adapters()[scan.SSI_TCP_PORT]
+    monkeypatch.setattr(scan, "_local_subnets", lambda: [loop])
+    monkeypatch.setattr(
+        scan, "_terminal_port_adapters", lambda: {loopback_terminal: ssi_adapters},
+    )
+
+    fast_ceiling = 0.3
+    real_probe = scan._probe_tcp
+
+    def refuses_the_fast_pass(host: str, port: int, timeout: float = 0.3) -> bool:
+        if timeout <= fast_ceiling:
+            return False
+        return real_probe(host, port, timeout)
+
+    monkeypatch.setattr(scan, "_probe_tcp", refuses_the_fast_pass)
+
+    descriptors = discover_network_terminals(
+        timeout=fast_ceiling, probe_timeout=2.0, slow_timeout=1.5,
+    )
+    assert len(descriptors) == 1, f"expected 1 terminal, got {descriptors}"
+    assert descriptors[0].serial == "V1E0207420"
 
 
 # ---------------------------------------------------------------------------
@@ -481,3 +521,149 @@ def test_one_terminal_bound_to_all_addresses_is_listed_once() -> None:
     # ...and a terminal that answers ONLY on the loopback stays, which is the
     # whole point of scanning it.
     assert [d.serial for d in kept if d.network.host == "127.0.0.1"] == ["V1E9999999"]
+
+
+def test_remote_discovery_answers_inside_the_server_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PET-1304 — the sweep got a second, patient pass and with it the
+    ability to outlive the window the log server waits in: it gives up
+    after `_SCAN_WAIT_S` and says «diagnostic timeout» while the scan
+    goes on running on the till, and the operator's retry stacks
+    another one on top. The remote command has to come back inside its
+    budget and say that it did not cover everything."""
+    import ipaddress
+    import time
+
+    import src.devices.scan as scan
+    import src.services.diagnostics as diagnostics
+
+    monkeypatch.setattr(
+        scan, "_local_subnets",
+        lambda: [ipaddress.ip_network("192.168.77.0/29")],
+    )
+
+    def nothing_ever_answers(host: str, port: int, timeout: float = 0.3) -> bool:
+        # Every address silent, each connect costing its full timeout —
+        # the worst case the budget exists for.
+        time.sleep(timeout)
+        return False
+
+    monkeypatch.setattr(scan, "_probe_tcp", nothing_ever_answers)
+    monkeypatch.setattr(diagnostics, "_SCAN_BUDGET_S", 3)
+
+    started = time.monotonic()
+    result = asyncio.run(diagnostics.run_diagnostic("terminal_discover", {}))
+    elapsed = time.monotonic() - started
+
+    assert result["ok"] is True
+    assert elapsed < 3, f"answered after {elapsed:.1f}s, budget was 3s"
+    # And it says so, instead of reporting a clean "no terminals here".
+    assert result.get("partial") is True
+    assert "second patient pass" in result["note"]
+
+
+def test_a_probe_that_overruns_cannot_push_the_sweep_past_its_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PET-1304 — the budget was only checked BEFORE a probe started,
+    and a handshake is up to 7.5 s of its own timeouts: one probe begun
+    with 2 s left landed the whole sweep outside the window the server
+    waits in, and the result reached nobody. Each probe is bounded by
+    what is left of the budget."""
+    import ipaddress
+    import time
+
+    import src.devices.scan as scan
+
+    class _NeverFinishes:
+        """Listens, answers the connect, then says nothing — a wedged
+        terminal or a NAS on a terminal port."""
+
+        __name__ = "_NeverFinishes"
+
+        @staticmethod
+        async def probe(host: str, port: int):
+            await asyncio.sleep(5)
+            return None
+
+    monkeypatch.setattr(
+        scan, "_local_subnets",
+        lambda: [ipaddress.ip_network("127.0.0.1/32")],
+    )
+    monkeypatch.setattr(
+        scan, "_terminal_port_adapters", lambda: {SSI_TCP_PORT: [_NeverFinishes]},
+    )
+    monkeypatch.setattr(
+        scan, "_probe_tcp", lambda host, port, timeout=0.3: True,
+    )
+    monkeypatch.setattr(scan, "PROBE_CEILING_S", 0.5)
+
+    started = time.monotonic()
+    found = scan.discover_network_terminals(
+        timeout=0.01, probe_timeout=0.05, budget_s=2.0,
+    )
+    elapsed = time.monotonic() - started
+
+    assert found == []
+    assert elapsed < 2.0, f"the sweep took {elapsed:.1f}s against a 2s budget"
+
+
+def test_the_dashboard_scan_button_is_bounded(
+    client, auth_headers: dict, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PET-1304 — the dashboard's sweep gained the same patient second
+    pass, which costs 25–27 s per /24 and some 80 s across four
+    subnets. Unbounded behind an HTTP request it is only as good as the
+    shortest timeout in front of it, and the operator then gets a
+    gateway error instead of the terminals that were found."""
+    import ipaddress
+    import time
+
+    import src.devices.scan as scan
+
+    monkeypatch.setattr(
+        scan, "_local_subnets",
+        lambda: [ipaddress.ip_network("192.168.77.0/29")],
+    )
+    monkeypatch.setattr(scan, "DASHBOARD_SWEEP_BUDGET_S", 3.0)
+
+    def nothing_ever_answers(host: str, port: int, timeout: float = 0.3) -> bool:
+        time.sleep(timeout)
+        return False
+
+    monkeypatch.setattr(scan, "_probe_tcp", nothing_ever_answers)
+
+    started = time.monotonic()
+    response = client.post("/terminal/discover", headers=auth_headers)
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 200
+    assert elapsed < 3.0, f"answered after {elapsed:.1f}s, budget was 3s"
+    # And it says it did not cover everything, rather than passing a cut
+    # short sweep off as «no terminals here».
+    assert response.json().get("partial") is True
+
+
+def test_a_reachable_port_stays_reachable_when_the_close_throws(monkeypatch) -> None:
+    """The connect decides the answer; the release cannot change it.
+
+    Same class as the terminal transports: the close used to run inside the
+    `except OSError`, so a close that raised on a half-dead socket reported a
+    port that had just accepted the connect as closed — and this probe is what
+    decides whether the terminal is discoverable at all.
+    """
+    import socket as socket_module
+
+    from src.devices import scan
+
+    class _ThrowsOnClose:
+        def close(self) -> None:
+            raise OSError("close failed")
+
+    monkeypatch.setattr(
+        socket_module, "create_connection",
+        lambda address, timeout=None: _ThrowsOnClose(),
+    )
+
+    assert scan._probe_tcp("127.0.0.1", 2000) is True
