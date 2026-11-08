@@ -1166,3 +1166,86 @@ def test_a_repeat_of_a_refund_key_is_refused_without_paying_twice(
     assert second.status_code == 409
     assert second.json()["detail"]["code"] == "charge_already_done"
     assert len(calls) == 1
+
+
+def test_a_cable_pulled_before_the_purchase_leaves_the_key_usable(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The transport never connected, so not a byte of the Purchase was
+    written and the money provably did not move. The cashier plugs the cable
+    back in and presses Start again: the same key must reach the terminal
+    instead of being refused as a repeat.
+
+    `unreachable` is NOT on the code allow-list and must not be — a socket
+    that dies mid-Purchase raises it too. What frees the key here is the fact
+    the adapter puts on the exception.
+    """
+    answers: list[str] = []
+
+    async def cable_then_charge(self, request):
+        if len(answers) == 0:
+            answers.append("refused")
+            raise TerminalUnavailable(
+                "cannot connect to 10.0.0.42:3000: refused",
+                code="unreachable",
+                nothing_sent=True,
+            )
+        answers.append("charged")
+        return AcquirerResult(status="ok", rrn="9999999999")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.charge",
+            new=cable_then_charge,
+        ):
+            body = {"amount_kopecks": 24500, "transaction_uid": "pet-card:cable"}
+            first = client.post("/terminal/charge", headers=auth_headers, json=body)
+            second = client.post("/terminal/charge", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 503
+    assert first.json()["detail"]["code"] == "unreachable"
+    assert second.status_code == 200
+    assert answers == ["refused", "charged"]
+
+
+def test_a_refund_whose_request_never_left_leaves_its_key_usable(
+    config: dict, fake_terminal: TerminalDescriptor, auth_headers: dict,
+) -> None:
+    """The same fact, on the refund route: money leaves the shop there as
+    surely as it arrives on the charge, and a refund the terminal never heard
+    of must be repeatable once the cable is back."""
+    answers: list[str] = []
+
+    async def cable_then_refund(self, request):
+        if len(answers) == 0:
+            answers.append("refused")
+            raise TerminalUnavailable(
+                "cannot connect to 10.0.0.42:3000: refused",
+                code="unreachable",
+                nothing_sent=True,
+            )
+        answers.append("refunded")
+        return AcquirerResult(status="ok", rrn="8888888888")
+
+    client = _charging_client(config, fake_terminal, auth_headers)
+    try:
+        with patch(
+            "src.services.terminals.ssi.SSITerminalAdapter.refund",
+            new=cable_then_refund,
+        ):
+            body = {
+                "amount_kopecks": 24500,
+                "rrn": "9999999999",
+                "transaction_uid": "pet-refund:cable",
+            }
+            first = client.post("/terminal/refund", headers=auth_headers, json=body)
+            second = client.post("/terminal/refund", headers=auth_headers, json=body)
+    finally:
+        client.__exit__(None, None, None)
+
+    assert first.status_code == 503
+    assert second.status_code == 200
+    assert answers == ["refused", "refunded"]

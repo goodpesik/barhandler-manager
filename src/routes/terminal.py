@@ -308,23 +308,44 @@ def _free_claim_if_nothing_was_sent(
     the cashier could not retry the same payment at all after fixing it. Every
     other failure keeps its key — a timeout or a broken connection does not say
     whether the money moved, and a repeat under that key must not charge again.
+
+    TWO WAYS A FAILURE CAN SAY NOTHING WAS SENT, and nothing else counts:
+
+    * its code is one of the few that are raised while the parameters are
+      still being assembled (`NOTHING_WAS_SENT_CODES`);
+    * the adapter says so on the exception itself — the transport never
+      connected, and no frame that could move money had gone out before it
+      tried. A pulled cable arrives this way: the code is `unreachable`, which
+      is not and must not be on the list, because the same code is raised by a
+      socket that died mid-`Purchase`.
+
+    THE DEFAULT IS TO KEEP. The fact is read as true only when it is exactly
+    `True`: an adapter that does not set it, an older adapter that has never
+    heard of it, anything uncertain — all keep the key, which costs a manual
+    check. Read the other way round it would cost a second charge.
     """
     if key is None:
         return
     code = getattr(exc, "code", None)
-    if code not in NOTHING_WAS_SENT_CODES:
+    code_says_so = code in NOTHING_WAS_SENT_CODES
+    adapter_says_so = getattr(exc, "nothing_sent", False) is True
+    if not code_says_so and not adapter_says_so:
         _log.warning(
-            "[%s] key=...%s stays claimed: the terminal failed with %s, which "
-            "does not say whether the money moved, so a repeat of this key "
-            "will be refused instead of charging again",
+            "[%s] key=...%s stays claimed: the terminal failed with %s and "
+            "nothing says the request never left, so the money may have "
+            "moved; a repeat of this key will be refused instead of charging "
+            "again",
             operation, key[-8:], code,
         )
         return
     _claims(request).release(key)
     _log.info(
         "[%s] key=...%s is free again: refused with %s before anything was "
-        "put to the card",
+        "put to the card (%s)",
         operation, key[-8:], code,
+        "a refusal raised before the request was built" if code_says_so
+        else "the transport never connected, so not a byte of the request "
+             "was written",
     )
 
 

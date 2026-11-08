@@ -24,12 +24,13 @@ from src.models.terminal import (
     TerminalRegistration,
     TerminalTransport,
 )
-from src.services.terminals.base import TerminalUnavailable
+from src.services.terminals.base import MoneyFrameTrace, TerminalUnavailable
 from src.services.terminals.ssi import (
     SSITerminalAdapter,
     STX_PREFIX,
     decode_frame,
     encode_frame,
+    send_tcp,
 )
 
 
@@ -817,3 +818,104 @@ async def test_a_failing_close_does_not_lose_the_ssi_result(monkeypatch) -> None
 
     assert response == reply
     assert writer.closed == 1
+
+
+# ---------------------------------------------------------------------
+# PET-1304 — did a byte of the request ever leave this machine?
+# ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_refused_connection_says_the_request_never_left() -> None:
+    """Nothing was written because there was no socket to write to: the port
+    is shut. This is the fact the route frees the operation's key on, and the
+    code alone cannot carry it — `unreachable` is raised by a dying socket
+    too."""
+    server = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    server.close()
+    await server.wait_closed()
+
+    with pytest.raises(TerminalUnavailable) as raised:
+        await send_tcp("127.0.0.1", port, {"method": "PingDevice"}, timeout=2.0)
+    assert raised.value.code == "unreachable"
+    assert raised.value.nothing_sent is True
+
+
+@pytest.mark.asyncio
+async def test_a_connection_that_dies_after_the_write_says_nothing_of_the_kind() -> None:
+    """The socket was there, the frame went to it, and the other end hung up.
+    A partial write is a send: the money may have moved, and this failure must
+    not read as "nothing was sent"."""
+    async def hang_up(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        writer.close()
+
+    server = await asyncio.start_server(hang_up, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        with pytest.raises(TerminalUnavailable) as raised:
+            await send_tcp("127.0.0.1", port, {"method": "PingDevice"}, timeout=2.0)
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert raised.value.nothing_sent is False
+
+
+@pytest.mark.asyncio
+async def test_a_refused_connection_after_the_purchase_went_out_keeps_the_key(
+    monkeypatch,
+) -> None:
+    """The cable is pulled BETWEEN the two steps of a Purchase. The connect
+    for step 2 wrote no byte, and the transport says so — but step 1 is
+    already with the terminal and the card has been read. The operation's
+    answer must be that the money may have moved."""
+    async def scripted(self, message, **_kwargs):
+        method = message.get("method")
+        if method == "Purchase" and message.get("step") == "1":
+            return {"method": "Purchase", **_OK_ACK}
+        if method == "GetStatus":
+            return {"method": "GetStatus", "status": "S08", **_OK_ACK}
+        if method in ("GetResultByUid", "GetLastResult"):
+            return {
+                "method": method,
+                "error": False, "errorCode": "", "errorDescription": "",
+                "params": {"transactionResult": "FIRST_STEP_COMPLETED"},
+            }
+        if method == "Purchase" and message.get("step") == "2":
+            raise TerminalUnavailable(
+                "cannot connect to 127.0.0.1:3000: refused",
+                code="unreachable",
+                nothing_sent=True,
+            )
+        raise AssertionError(f"unexpected method {method}")
+
+    monkeypatch.setattr(SSITerminalAdapter, "_send", scripted)
+    adapter = SSITerminalAdapter(_registration(3000))
+
+    with pytest.raises(TerminalUnavailable) as raised:
+        await adapter.charge(ChargeRequest(
+            amount_kopecks=24500, transaction_uid="pet-card:between-steps",
+        ))
+    assert raised.value.code == "unreachable"
+    assert raised.value.nothing_sent is False
+
+
+@pytest.mark.asyncio
+async def test_a_money_frame_that_failed_without_saying_counts_as_sent() -> None:
+    """The send of a money-moving frame failed and said nothing about the
+    bytes: a socket that died is not a socket that was never opened. From
+    then on the operation keeps its key, whatever a later connect says about
+    its own bytes."""
+    trace = MoneyFrameTrace()
+
+    async def died_after_the_write(message: dict) -> dict:
+        raise TerminalUnavailable("socket died mid-frame", code="unreachable")
+
+    with pytest.raises(TerminalUnavailable):
+        await trace.send(died_after_the_write, {"method": "Purchase", "step": "1"})
+
+    refused_later = TerminalUnavailable(
+        "cannot connect", code="unreachable", nothing_sent=True,
+    )
+    trace.seal(refused_later)
+    assert refused_later.nothing_sent is False
