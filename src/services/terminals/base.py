@@ -50,6 +50,27 @@ class TerminalUnavailable(RuntimeError):
 #: Written as the list of what IS safe, never as a list of what is not: a code
 #: added later and forgotten by this list keeps its key, which costs a manual
 #: retry; the other way round it would cost a second charge.
+#:
+#: THE CODES THAT LOOK AS IF THEY BELONG HERE AND DO NOT, each checked at its
+#: raise site. A refused cable is the commonest card failure and a cashier who
+#: fixes it has to put the payment through by hand instead of pressing Start
+#: again; it stays that way, because none of these can be told apart by its
+#: code from the same code raised once the card had been read:
+#:
+#: * `unreachable` — `ssi.send_tcp` raises it both for a connection that was
+#:   refused and for a socket that died AFTER the frame was written, and the
+#:   same function carries `Purchase` step 2, the step that moves the money.
+#: * `timeout` — the same function on a read that never came, and `_wait_idle`
+#:   while waiting for step 2 to finish.
+#: * `protocol_error` — a malformed frame, including the reply to a `Purchase`.
+#: * every code taken from the terminal's own reply (`charge_rejected`,
+#:   `charge_step2_rejected`, `result_fetch_failed`, the raw SSI `eNN`, the
+#:   BPOS / Oschad / PosAPI result codes) — the terminal answered a command we
+#:   had already sent it.
+#:
+#: Telling a refused connection apart from a broken one is a flag the
+#: transport would have to pass up through the adapter, which is not this
+#: change.
 NOTHING_WAS_SENT_CODES: frozenset[str] = frozenset({
     "not_configured",
     "missing_merchant",

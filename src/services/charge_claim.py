@@ -22,8 +22,10 @@ the three states it met:
   running it, the process is new) or the terminal failed in a way that does
   not say whether the money moved. Both mean: do not charge again, the bank's
   own records settle it.
-* `done` — the terminal answered. The answer is kept beside the key, so a
-  repeat is answered from it instead of taking the money twice.
+* `done` — the terminal answered, and the answer says what became of the
+  money. It is kept beside the key, so a repeat is answered from it instead
+  of taking the money twice. An answer that does NOT say — see
+  `says_what_happened` — does not finish a claim; it leaves it `unresolved`.
 
 WHAT THIS DOES NOT CLAIM TO DO. The file belongs to one machine. Two tills
 each running their own manager against one terminal share no state here, and
@@ -63,6 +65,11 @@ STATE_DONE = "done"
 CODE_IN_FLIGHT = "charge_in_flight"
 CODE_UNRESOLVED = "charge_unresolved"
 CODE_ALREADY_DONE = "charge_already_done"
+
+#: `AcquirerResult.status` values, as the adapters write them.
+STATUS_OK = "ok"
+STATUS_CANCELLED = "cancelled"
+STATUS_DECLINED = "declined"
 
 _REFUSAL_CODE = {
     STATE_IN_FLIGHT: CODE_IN_FLIGHT,
@@ -116,6 +123,93 @@ def usable_key(key: Optional[str]) -> Optional[str]:
     return trimmed
 
 
+#: Transaction outcomes that NAME a refusal: the card, the terminal or the
+#: bank said no, and no money was taken. `declined` on its own does not mean
+#: that — see `says_what_happened`.
+NAMED_DECLINE_RESULTS: frozenset[str] = frozenset({
+    "DECLINED",
+    "DECLINED_ONLINE",
+    "DECLINED_OFFLINE",
+    "REJECTED",
+})
+
+
+def says_what_happened(result: Optional[dict]) -> bool:
+    """Does this answer positively say what became of the money?
+
+    Only an answer that does may finish a claim. The adapters map every
+    transaction outcome they do not recognise onto `declined` — an empty
+    `transactionResult`, `FIRST_STEP_COMPLETED` read back after the second
+    step was already sent, an enum this build has never seen, a reply of an
+    unexpected shape. All of those are indistinguishable here from a card the
+    bank refused, and the difference is a charge: settled as `done` the key is
+    let go, and the cashier can put another card through for money that may
+    already have moved.
+
+    So the rule is written the permissive way round — what IS known:
+
+    * `ok` — the money moved.
+    * `cancelled` — the operation was cancelled before authorisation.
+    * `declined` AND the refusal is named: a `response_code` (the host
+      answered with one), an `error_code` (the terminal's own verdict on the
+      transaction, SSI E10/E11/E16/E17 among them), or a transaction result
+      that is one of the decline values the adapters are known to produce.
+
+    Everything else is not an answer but the absence of one, and leaves the
+    claim unresolved.
+    """
+    if not isinstance(result, dict):
+        return False
+    status = result.get("status")
+    if status in (STATUS_OK, STATUS_CANCELLED):
+        return True
+    if status != STATUS_DECLINED:
+        return False
+    if result.get("response_code") or result.get("error_code"):
+        return True
+    raw = result.get("raw_transaction_result")
+    return isinstance(raw, str) and raw.strip().upper() in NAMED_DECLINE_RESULTS
+
+
+#: The only fields of a terminal's answer kept beside a settled key.
+#:
+#: The claim file lives on the shop's disk for a day, so it holds exactly what
+#: the till reads back when it recovers an answer it lost, and nothing else:
+#: `status` decides whether this was a payment, the seven after it are the
+#: acquiring block the till puts on the receipt, and `error_message` is the
+#: terminal's own wording shown when a refusal has no text of its own.
+#:
+#: Deliberately NOT kept: `vendor_data` (the whole reply from the terminal),
+#: `terminal_receipt` (the cardholder's slip), `invoice_num`, `response_code`,
+#: `raw_transaction_result`, `error_code`, `error_details`, `payment_date`,
+#: `pos_entry_mode` and the fiscal fields. Nothing on the till reads any of
+#: them back, and a field nobody reads is only a day of card data at rest.
+KEPT_RESULT_FIELDS: tuple[str, ...] = (
+    "status",
+    "transaction_uid",
+    "rrn",
+    "auth_code",
+    "cardmask",
+    "paysys",
+    "bank_name",
+    "terminal_id",
+    "error_message",
+)
+
+
+def kept_result(result: Optional[dict]) -> Optional[dict]:
+    """The part of an answer that is worth keeping for a day.
+
+    Takes an already JSON-shaped dump (dates as strings): the file is written
+    with `json.dumps`, and a `datetime` in here used to make it unwritable —
+    and then the claim lived in memory only, which is the guarantee gone with
+    nobody told.
+    """
+    if not isinstance(result, dict):
+        return None
+    return {k: result[k] for k in KEPT_RESULT_FIELDS if k in result}
+
+
 class ChargeClaims:
     """The keys of the card operations this station has started."""
 
@@ -160,7 +254,28 @@ class ChargeClaims:
                     "charge-claims could not be understood and is started afresh",
                 )
                 parsed = {}
-            for key, row in (parsed.get("claims") or {}).items():
+            # Valid JSON that is not an object at all (`null`, `[]`, `"x"`):
+            # the same thing as a torn file, and it must not stop the manager
+            # starting. A station that will not boot takes its till with it,
+            # which is worse than the repeat this file guards against.
+            if not isinstance(parsed, dict):
+                logger.error(
+                    "charge-claims holds %s where an object was expected and is "
+                    "read as no claims at all; a repeat of a key started before "
+                    "this restart will not be recognised",
+                    type(parsed).__name__,
+                )
+                parsed = {}
+            claims = parsed.get("claims")
+            if not isinstance(claims, dict):
+                if claims is not None:
+                    logger.error(
+                        "charge-claims: `claims` holds %s where an object was "
+                        "expected and is read as no claims at all",
+                        type(claims).__name__,
+                    )
+                claims = {}
+            for key, row in claims.items():
                 if not self._is_row(key, row):
                     continue
                 if row["state"] == STATE_IN_FLIGHT:
@@ -191,17 +306,42 @@ class ChargeClaims:
         )
 
     def _prune_locked(self) -> None:
-        """Drop what is too old to be a repeat of anything, and cap the rest."""
+        """Drop what is too old to be a repeat of anything, and cap the rest.
+
+        A KEY THAT IS NOT SETTLED IS NEVER DROPPED, by age or by the cap. Only
+        a settled key has been answered for; `in_flight` and `unresolved` both
+        mean the money may have moved and nobody has established whether it
+        did, and a dropped key of that kind is re-admitted — the repeat it
+        exists to refuse goes to the terminal instead. So the retention and
+        the cap are counted over settled keys only (found by review: with the
+        cap lowered, an in-flight key was dropped and charged again).
+        """
         cutoff = time.time() - self.retention_s
-        for key in [k for k, row in self._claims.items() if row["at"] < cutoff]:
+        settled = [
+            (k, row) for k, row in self._claims.items()
+            if row["state"] == STATE_DONE
+        ]
+        for key, row in settled:
+            if row["at"] < cutoff:
+                del self._claims[key]
+        over = len(self._claims) - self.limit
+        if over <= 0:
+            return
+        # Oldest first — the newest keys are the ones a repeat can still
+        # arrive for.
+        droppable = sorted(
+            ((k, row) for k, row in self._claims.items() if row["state"] == STATE_DONE),
+            key=lambda kv: kv[1]["at"],
+        )
+        for key, _ in droppable[:over]:
             del self._claims[key]
         if len(self._claims) > self.limit:
-            # Oldest first — the newest keys are the ones a repeat can still
-            # arrive for.
-            for key, _ in sorted(
-                self._claims.items(), key=lambda kv: kv[1]["at"],
-            )[: len(self._claims) - self.limit]:
-                del self._claims[key]
+            logger.warning(
+                "charge-claims holds %s key(s) over a cap of %s and they are "
+                "all unsettled operations, which are never dropped: every one "
+                "of them was started and never answered for",
+                len(self._claims) - self.limit, self.limit,
+            )
 
     def _save_locked(self) -> None:
         """Write the file whole, through a temporary beside it.
@@ -211,19 +351,31 @@ class ChargeClaims:
         """
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(
-            json.dumps({"claims": self._claims}, ensure_ascii=False),
+            # `default`: ONE row json cannot take must not make the whole file
+            # unwritable. That is how this failed — a settled answer carried a
+            # `datetime`, every save from then on raised, and the file stayed
+            # at the first claim while the guard quietly became memory-only.
+            # The rows are built from `kept_result` and are plain strings, so
+            # this should never fire; it is here so that it cannot spread.
+            json.dumps({"claims": self._claims}, ensure_ascii=False, default=str),
             encoding="utf-8",
         )
         os.replace(tmp, self.path)
 
     def _write_locked(self, what: str) -> None:
-        """Persist, or say out loud that this claim lives in memory only."""
+        """Persist, or say out loud that this claim lives in memory only.
+
+        AT ERROR LEVEL, and that is the point. A claim that is not on disk is
+        the whole guarantee gone the moment the process stops — exactly the
+        hole the key exists to close — and it must not read like a note.
+        """
         try:
             self._save_locked()
         except Exception as exc:  # noqa: BLE001 — see the module docstring
-            logger.warning(
+            logger.error(
                 "charge-claims: %s was not written to disk and is held in "
-                "memory only, so it will not survive a restart: %s",
+                "memory only, so a restart loses it and a repeat of its key "
+                "could charge the card a second time: %s",
                 what, exc,
             )
 
@@ -255,6 +407,11 @@ class ChargeClaims:
                     "state": state,
                     "operation": held.get("operation"),
                     "terminal_id": held.get("terminal_id"),
+                    # What the claimed operation was for. The till takes the
+                    # stored answer as its own only when the operation, the
+                    # terminal and the amount all match what it is asking for
+                    # now — otherwise it would record somebody else's payment.
+                    "amount": held.get("amount"),
                 }
                 if held.get("result") is not None:
                     refusal["result"] = held["result"]

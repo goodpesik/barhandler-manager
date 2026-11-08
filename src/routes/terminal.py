@@ -30,7 +30,14 @@ from src.models.terminal import (
     TerminalRegistrationRequest,
 )
 from src.services import work_journal
-from src.services.charge_claim import ChargeClaims, usable_key
+from src.services.charge_claim import (
+    STATE_DONE,
+    STATE_UNRESOLVED,
+    ChargeClaims,
+    kept_result,
+    says_what_happened,
+    usable_key,
+)
 from src.services.terminals.base import NOTHING_WAS_SENT_CODES, TerminalUnavailable
 
 # Same channel the charge route already logs on, so the line shape the
@@ -239,12 +246,56 @@ def _claim_operation(
     raise HTTPException(status_code=409, detail=refusal)
 
 
-def _settle_claim(request: Request, key: Optional[str], result) -> None:
-    """The terminal answered — the key is finished, and the answer stays with
-    it so a repeat is answered from it instead of charging again."""
+def _settle_claim(
+    request: Request,
+    key: Optional[str],
+    result,
+    *,
+    operation: str,
+    terminal_id: str,
+    amount_kopecks: int,
+) -> Optional[str]:
+    """Finish the key if the terminal said what happened — and not otherwise.
+
+    Answers the claim's state for the caller to carry back, so the till knows
+    whether its key is spent or still in doubt. None when no key was sent.
+
+    AN ANSWER THAT DOES NOT SAY WHAT HAPPENED DOES NOT FINISH ANYTHING. The
+    adapters turn every outcome they do not recognise into `declined` — a
+    timeout, an empty transaction result, a first step read back as if it were
+    the last. Settling those as `done` lets the key go, and the cashier can
+    then put a second card through for money that may already have moved. So
+    the claim is left as it stands and the `finally` below writes it
+    `unresolved`: the repeat is refused and named, which costs a manual check.
+    """
     if key is None:
-        return
-    _claims(request).settle(key, result.model_dump() if result is not None else None)
+        return None
+    # `mode="json"` and nothing else: the terminal fills `payment_date` with a
+    # datetime whenever it reports a transaction time, and a datetime in here
+    # made the claim file unwritable from that moment on (found by review).
+    answered = result.model_dump(mode="json") if result is not None else None
+    if not says_what_happened(answered):
+        _log.error(
+            "[%s] terminal=%s key=...%s amount=%s the answer does not say what "
+            "happened to the money (status=%s result=%s code=%s): the operation "
+            "is left unresolved, and a repeat of this key will be refused "
+            "instead of being sent to the terminal again",
+            operation, terminal_id, key[-8:], amount_kopecks,
+            (answered or {}).get("status"),
+            (answered or {}).get("raw_transaction_result"),
+            (answered or {}).get("error_code"),
+        )
+        return STATE_UNRESOLVED
+    kept = kept_result(answered)
+    _claims(request).settle(key, kept)
+    _log.info(
+        "[%s] terminal=%s key=...%s amount=%s settled as %s (rrn=%s auth=%s); "
+        "a repeat of this key is answered from it",
+        operation, terminal_id, key[-8:], amount_kopecks,
+        (kept or {}).get("status"), (kept or {}).get("rrn"),
+        (kept or {}).get("auth_code"),
+    )
+    return STATE_DONE
 
 
 def _free_claim_if_nothing_was_sent(
@@ -664,8 +715,20 @@ async def charge(
             )
         log.info("[charge] terminal=%s result=%s", used_id, result.model_dump_json())
         operation.done(result)
-        _settle_claim(request, key, result)
-        return {"terminal_id": used_id, "result": result.model_dump()}
+        claim_state = _settle_claim(
+            request, key, result,
+            operation="charge",
+            terminal_id=used_id,
+            amount_kopecks=payload.amount_kopecks,
+        )
+        # The till reads this to decide whether its key is spent: an answer
+        # that does not say what happened leaves the key in doubt, and the
+        # till must keep it rather than mint a new one for the next press.
+        return {
+            "terminal_id": used_id,
+            "result": result.model_dump(),
+            "claim_state": claim_state,
+        }
     finally:
         # Nothing answered and nothing was recorded: a cancelled request (the
         # cashier's browser closed mid-payment) or an HTTPException raised
@@ -731,8 +794,17 @@ async def refund(
             )
         log.info("[refund] terminal=%s result=%s", used_id, result.model_dump_json())
         operation.done(result)
-        _settle_claim(request, key, result)
-        return {"terminal_id": used_id, "result": result.model_dump()}
+        claim_state = _settle_claim(
+            request, key, result,
+            operation="refund",
+            terminal_id=used_id,
+            amount_kopecks=payload.amount_kopecks,
+        )
+        return {
+            "terminal_id": used_id,
+            "result": result.model_dump(),
+            "claim_state": claim_state,
+        }
     finally:
         # Nothing answered and nothing was recorded: a cancelled request (the
         # cashier's browser closed mid-payment) or an HTTPException raised

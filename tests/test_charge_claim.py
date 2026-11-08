@@ -19,6 +19,8 @@ from src.services.charge_claim import (
     STATE_IN_FLIGHT,
     STATE_UNRESOLVED,
     ChargeClaims,
+    kept_result,
+    says_what_happened,
 )
 
 
@@ -95,14 +97,16 @@ def test_a_settled_key_answers_the_repeat_with_what_the_terminal_said(
     assert refusal["result"]["rrn"] == "9999999999"
 
 
-def test_a_claim_too_old_to_be_a_repeat_stops_standing_in_the_way(
+def test_a_settled_claim_too_old_to_be_a_repeat_stops_standing_in_the_way(
     tmp_path: Path,
 ) -> None:
-    """A key is remembered for as long as a repeat of it can arrive, and no
-    longer: a guard that never lets go of a key would be its own defect, and
-    the file would grow without end."""
+    """A SETTLED key is remembered for as long as a repeat of it can arrive,
+    and no longer: a guard that never lets go would be its own defect, and the
+    file would grow without end. An unsettled one is a different matter — see
+    below."""
     claims = _store(tmp_path, retention_s=1)
     claims.begin("k-4", operation="charge", terminal_id="abc", amount_kopecks=100)
+    claims.settle("k-4", {"status": "ok"})
     # Age the claim rather than waiting out the retention — the test says
     # «older than the window», which is what the store decides on.
     claims._claims["k-4"]["at"] = time.time() - 5
@@ -139,3 +143,117 @@ def test_an_answer_does_not_become_unfinished_afterwards(tmp_path: Path) -> None
     )
     assert refusal is not None
     assert refusal["code"] == CODE_ALREADY_DONE
+
+
+def test_an_answer_that_could_not_be_stored_does_not_block_the_next_claim(
+    tmp_path: Path,
+) -> None:
+    """A row json cannot take must not take the file with it.
+
+    This is how the guard failed: a settled answer carried a value json could
+    not write, every save from then on raised, and the claim of the NEXT card
+    operation never reached the disk — so a restart lost it and the repeat it
+    was taken for would have charged the card again.
+    """
+    claims = _store(tmp_path)
+    claims.begin("k-7", operation="charge", terminal_id="abc", amount_kopecks=100)
+    claims.settle("k-7", {"status": "ok", "rrn": object()})
+
+    claims.begin("k-8", operation="charge", terminal_id="abc", amount_kopecks=100)
+
+    on_disk = json.loads((tmp_path / "charge-claims.json").read_text(encoding="utf-8"))
+    assert "k-8" in on_disk["claims"]
+    assert on_disk["claims"]["k-8"]["state"] == STATE_IN_FLIGHT
+
+
+def test_a_claim_file_that_is_not_an_object_does_not_stop_the_manager(
+    tmp_path: Path,
+) -> None:
+    """A station that will not start takes its till with it, which is worse
+    than losing the record of the keys. Valid JSON that is not an object is
+    read as no claims at all."""
+    for content in ("null", "[]", '"x"', '{"claims": []}'):
+        (tmp_path / "charge-claims.json").write_text(content, encoding="utf-8")
+        claims = _store(tmp_path)
+        claims.load()
+        assert claims.count == 0
+
+
+def test_an_unsettled_key_is_never_dropped_to_make_room(tmp_path: Path) -> None:
+    """Dropping a key that was started and never answered for re-admits it,
+    and the repeat goes to the terminal: the money may already have moved.
+    Only a key the terminal answered for may be pruned."""
+    claims = _store(tmp_path, limit=1)
+    claims.begin("k-9", operation="charge", terminal_id="abc", amount_kopecks=100)
+    claims.begin("k-10", operation="charge", terminal_id="abc", amount_kopecks=100)
+
+    refusal = claims.begin(
+        "k-9", operation="charge", terminal_id="abc", amount_kopecks=100,
+    )
+    assert refusal is not None
+    assert refusal["state"] == STATE_IN_FLIGHT
+
+
+def test_an_unsettled_key_is_never_dropped_for_being_old(tmp_path: Path) -> None:
+    """The same rule by age: a day passing does not establish what happened to
+    the money, and the answer is still only on the terminal."""
+    claims = _store(tmp_path, retention_s=1)
+    claims.begin("k-11", operation="charge", terminal_id="abc", amount_kopecks=100)
+    claims._claims["k-11"]["at"] = time.time() - 5
+
+    refusal = claims.begin(
+        "k-11", operation="charge", terminal_id="abc", amount_kopecks=100,
+    )
+    assert refusal is not None
+    assert refusal["state"] == STATE_IN_FLIGHT
+
+
+def test_only_an_answer_that_names_the_outcome_may_finish_a_claim() -> None:
+    """The adapters map everything they do not recognise onto `declined`, so
+    `declined` alone cannot mean "nothing was taken". A named refusal may
+    finish the claim; an unnamed one is the absence of an answer."""
+    assert says_what_happened({"status": "ok"})
+    assert says_what_happened({"status": "cancelled"})
+    assert says_what_happened({"status": "declined", "response_code": "05"})
+    assert says_what_happened({"status": "declined", "error_code": "E11"})
+    assert says_what_happened(
+        {"status": "declined", "raw_transaction_result": "DECLINED_ONLINE"},
+    )
+
+    # The money may have moved and nothing here says so.
+    assert not says_what_happened({"status": "declined"})
+    assert not says_what_happened(
+        {"status": "declined", "raw_transaction_result": "FIRST_STEP_COMPLETED"},
+    )
+    assert not says_what_happened(
+        {"status": "declined", "raw_transaction_result": "SOMETHING_NEW"},
+    )
+    assert not says_what_happened({"status": "pending"})
+    assert not says_what_happened(None)
+
+
+def test_a_settled_answer_keeps_what_the_till_reads_and_nothing_else(
+    tmp_path: Path,
+) -> None:
+    """The file sits on the shop's disk for a day. It holds the acquiring
+    block the till puts on the receipt, and not the terminal's whole reply."""
+    claims = _store(tmp_path)
+    claims.begin("k-12", operation="charge", terminal_id="abc", amount_kopecks=100)
+    claims.settle("k-12", kept_result({
+        "status": "ok",
+        "rrn": "9999999999",
+        "auth_code": "123456",
+        "cardmask": "444455******1111",
+        "payment_date": "2026-11-08T10:00:00",
+        "terminal_receipt": "the cardholder slip",
+        "invoice_num": "000123",
+        "vendor_data": {"pan": "4444551111111111"},
+    }))
+
+    stored = json.loads(
+        (tmp_path / "charge-claims.json").read_text(encoding="utf-8"),
+    )["claims"]["k-12"]["result"]
+    assert stored["rrn"] == "9999999999"
+    assert stored["auth_code"] == "123456"
+    for gone in ("payment_date", "terminal_receipt", "invoice_num", "vendor_data"):
+        assert gone not in stored
