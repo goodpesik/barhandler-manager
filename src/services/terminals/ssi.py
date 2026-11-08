@@ -130,8 +130,11 @@ async def send_tcp(host: str, port: int, message: dict, timeout: float = REQUEST
         )
     except (OSError, asyncio.TimeoutError) as exc:
         logger.warning(
-            "[ssi %s:%s] connect failed for %s, nothing of the request was "
-            "written: %s", host, port, method, exc,
+            "[ssi %s:%s] connect failed for %s: the connection was never "
+            "opened, so no byte of THIS request was written. Whether a frame "
+            "that can move money went out earlier in the same operation is "
+            "decided by the operation's own record, not here: %s",
+            host, port, method, exc,
         )
         # PET-1304 — the one failure of this function that can say no byte of
         # the request left this machine: there was no socket to write it to.

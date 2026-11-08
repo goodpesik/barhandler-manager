@@ -134,6 +134,36 @@ NAMED_DECLINE_RESULTS: frozenset[str] = frozenset({
 })
 
 
+#: Codes that mean «approved», across every vocabulary in this tree: SSI and
+#: PrivatBank `0000`, PosAPI `00`, Oschadbank `000`, BPOS `0`. A code that
+#: means approval never names a refusal. It arrives beside a status that is
+#: not an approval — SSI `IN_PROGRESS` with `responseCode "0000"`, PosAPI
+#: `responseCode "00"` with `approved` false — and read as a verdict it
+#: settles the claim on an answer that said the opposite of a refusal.
+APPROVAL_CODES: frozenset[str] = frozenset({"0", "00", "000", "0000"})
+
+
+def _names_a_refusal(marker: object, raw: object) -> bool:
+    """Does this code say the operation was refused?
+
+    Not when it means approval (`APPROVAL_CODES`), and not when it is nothing
+    but the transaction result copied over: the bridge adapters (PosAPI, BPOS,
+    Oschadbank) put their status value into `response_code`,
+    `raw_transaction_result` and `error_code` alike, and their vocabularies
+    are provisional, so one value standing in three fields is one piece of
+    information — the raw result, which is judged on its own against
+    `NAMED_DECLINE_RESULTS`. A status value this build does not recognise is
+    not a verdict, and counted as one it frees the key of an operation whose
+    outcome nobody established.
+    """
+    if not isinstance(marker, str):
+        return False
+    code = marker.strip()
+    if not code or code in APPROVAL_CODES:
+        return False
+    return not (isinstance(raw, str) and code.casefold() == raw.strip().casefold())
+
+
 def says_what_happened(result: Optional[dict]) -> bool:
     """Does this answer positively say what became of the money?
 
@@ -150,10 +180,13 @@ def says_what_happened(result: Optional[dict]) -> bool:
 
     * `ok` — the money moved.
     * `cancelled` — the operation was cancelled before authorisation.
-    * `declined` AND the refusal is named: a `response_code` (the host
-      answered with one), an `error_code` (the terminal's own verdict on the
-      transaction, SSI E10/E11/E16/E17 among them), or a transaction result
-      that is one of the decline values the adapters are known to produce.
+    * `declined` AND a transaction result that is one of the decline values
+      the adapters are known to produce.
+    * `declined` AND a `response_code` (the host answered with one) or an
+      `error_code` (the terminal's own verdict on the transaction, SSI
+      E10/E11/E16/E17 among them) that names a refusal — see
+      `_names_a_refusal`: neither the vocabulary's own approval code nor a
+      copy of a transaction result this build does not recognise.
 
     Everything else is not an answer but the absence of one, and leaves the
     claim unresolved.
@@ -165,10 +198,13 @@ def says_what_happened(result: Optional[dict]) -> bool:
         return True
     if status != STATUS_DECLINED:
         return False
-    if result.get("response_code") or result.get("error_code"):
-        return True
     raw = result.get("raw_transaction_result")
-    return isinstance(raw, str) and raw.strip().upper() in NAMED_DECLINE_RESULTS
+    if isinstance(raw, str) and raw.strip().upper() in NAMED_DECLINE_RESULTS:
+        return True
+    return (
+        _names_a_refusal(result.get("response_code"), raw)
+        or _names_a_refusal(result.get("error_code"), raw)
+    )
 
 
 #: The only fields of a terminal's answer kept beside a settled key.
@@ -405,12 +441,16 @@ class ChargeClaims:
                     "code": _REFUSAL_CODE[state],
                     "message": _REFUSAL_MESSAGE[state],
                     "state": state,
+                    # WHICH OPERATION THE ANSWER BELONGS TO. The key names one
+                    # sale on one till, so it is what the till matches on
+                    # before it takes a stored answer as its own; the
+                    # operation, the terminal and the amount are checked
+                    # beside it. Without the key, an answer could be taken by
+                    # a different sale that happens to agree on all three —
+                    # the payment of one customer recorded against another.
+                    "key": key,
                     "operation": held.get("operation"),
                     "terminal_id": held.get("terminal_id"),
-                    # What the claimed operation was for. The till takes the
-                    # stored answer as its own only when the operation, the
-                    # terminal and the amount all match what it is asking for
-                    # now — otherwise it would record somebody else's payment.
                     "amount": held.get("amount"),
                 }
                 if held.get("result") is not None:

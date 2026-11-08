@@ -16,11 +16,13 @@ from pathlib import Path
 from src.services.charge_claim import (
     CODE_ALREADY_DONE,
     CODE_UNRESOLVED,
+    KEY_MAX_LEN,
     STATE_IN_FLIGHT,
     STATE_UNRESOLVED,
     ChargeClaims,
     kept_result,
     says_what_happened,
+    usable_key,
 )
 
 
@@ -257,3 +259,71 @@ def test_a_settled_answer_keeps_what_the_till_reads_and_nothing_else(
     assert stored["auth_code"] == "123456"
     for gone in ("payment_date", "terminal_receipt", "invoice_num", "vendor_data"):
         assert gone not in stored
+
+
+def test_a_code_that_means_approval_does_not_name_a_refusal() -> None:
+    """An approval code beside a status that is not an approval says the
+    opposite of a refusal, and read as one it frees the key of an operation
+    whose outcome nobody established.
+
+    SSI reports `IN_PROGRESS` with `responseCode "0000"`; PosAPI answers
+    `responseCode "00"` while `approved` is false or missing.
+    """
+    assert not says_what_happened({
+        "status": "declined",
+        "raw_transaction_result": "IN_PROGRESS",
+        "response_code": "0000",
+    })
+    assert not says_what_happened({
+        "status": "declined",
+        "raw_transaction_result": "00",
+        "response_code": "00",
+        "error_code": "00",
+    })
+
+
+def test_a_status_value_copied_into_an_error_field_does_not_name_a_refusal(
+) -> None:
+    """The bridge adapters put one value into `raw_transaction_result`,
+    `response_code` and `error_code` alike, and their vocabularies are
+    provisional: BPOS `result "2"` and Oschadbank `rc "999"` are values this
+    build does not recognise. One value in three fields is one piece of
+    information, and that information is the raw result — which these are not
+    a decline value of.
+    """
+    assert not says_what_happened({
+        "status": "declined",
+        "raw_transaction_result": "2",
+        "error_code": "2",
+    })
+    assert not says_what_happened({
+        "status": "declined",
+        "raw_transaction_result": "999",
+        "response_code": "999",
+        "error_code": "999",
+    })
+
+    # And the markers that are NOT a copy still name the refusal: the
+    # terminal's own verdict (SSI E11, no transaction result at all) and a
+    # host response code beside a different transaction result (PrivatBank's
+    # `trnStatus` 2 with `responseCode` 0510).
+    assert says_what_happened({"status": "declined", "error_code": "E11"})
+    assert says_what_happened({
+        "status": "declined",
+        "raw_transaction_result": "2",
+        "response_code": "0510",
+        "error_code": "0510",
+    })
+
+
+def test_a_key_longer_than_the_bound_is_not_claimed() -> None:
+    """The till's key is a uuid. The bound is what keeps a caller from
+    writing an arbitrarily large field into a file that lives on the shop's
+    disk for a day; past it the key is not ours and is not claimed at all,
+    so the charge goes through exactly as one with no key does.
+    """
+    assert usable_key("x" * KEY_MAX_LEN) == "x" * KEY_MAX_LEN
+    assert usable_key("x" * (KEY_MAX_LEN + 1)) is None
+    assert usable_key("  " + "x" * KEY_MAX_LEN + "  ") == "x" * KEY_MAX_LEN
+    assert usable_key("   ") is None
+    assert usable_key(None) is None

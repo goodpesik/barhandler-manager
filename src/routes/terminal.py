@@ -277,13 +277,15 @@ def _settle_claim(
     if not says_what_happened(answered):
         _log.error(
             "[%s] terminal=%s key=...%s amount=%s the answer does not say what "
-            "happened to the money (status=%s result=%s code=%s): the operation "
-            "is left unresolved, and a repeat of this key will be refused "
-            "instead of being sent to the terminal again",
+            "happened to the money (status=%s result=%s error_code=%s "
+            "response_code=%s): the operation is left unresolved, and a repeat "
+            "of this key will be refused instead of being sent to the terminal "
+            "again",
             operation, terminal_id, key[-8:], amount_kopecks,
             (answered or {}).get("status"),
             (answered or {}).get("raw_transaction_result"),
             (answered or {}).get("error_code"),
+            (answered or {}).get("response_code"),
         )
         return STATE_UNRESOLVED
     kept = kept_result(answered)
