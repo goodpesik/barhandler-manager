@@ -38,10 +38,13 @@ class PosApiTerminalEmulator(BankEmulator):
             return {"function": "GET_INFO", "responseCode": "00",
                     "model": self.model, "serial": self.serial}
         if fn == "GET_MERCHANTS":
-            return {"function": "GET_MERCHANTS", "responseCode": "00", "merchants": [{
-                "merchantId": self.merchant_id, "terminalId": self.terminal_id,
-                "name": self.merchant_name,
-            }]}
+            return {"function": "GET_MERCHANTS", "responseCode": "00", "merchants": [
+                {
+                    "merchantId": m.merchant_id, "terminalId": m.terminal_id,
+                    "name": m.merchant_name,
+                }
+                for m in self.merchants
+            ]}
         if fn == "ABORT":
             self.interrupt_current()
             return {"function": "ABORT", "responseCode": "00"}
@@ -71,6 +74,6 @@ class PosApiTerminalEmulator(BankEmulator):
                 "rrn": f"{random.randint(0, 999999999999):012d}",
                 "authCode": f"{random.randint(0, 999999):06d}",
                 "pan": "**1234", "cardScheme": "Visa", "bankName": "EMULATOR BANK",
-                "terminalId": self.terminal_id,
+                "terminalId": self.merchants[0].terminal_id,
                 "invoiceNumber": f"{random.randint(0, 999999):06d}",
                 "reference": ref}
