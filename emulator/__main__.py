@@ -2,7 +2,6 @@
 
     python -m emulator                    # pick a bank from a menu
     python -m emulator --kind raif_pos    # start straight on one bank
-    python -m emulator --merchants 2      # report two merchants, not one
     python -m emulator --host 0.0.0.0     # listen on all interfaces
 
 Pick which bank/terminal to emulate at startup. While idle you can switch to
@@ -228,12 +227,6 @@ def main() -> None:
                         help="name of the first merchant")
     parser.add_argument("--terminal-id", default=DEFAULT_TERMINAL_ID,
                         help="terminal id of the first merchant")
-    parser.add_argument("--merchants", type=int, choices=list(MERCHANT_COUNT_CHOICES),
-                        default=None,
-                        help="how many merchants the terminal reports; the "
-                             "second one is derived from the first. Without "
-                             "this flag the startup menu asks, and a start "
-                             "with --kind uses 1")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -251,11 +244,11 @@ def main() -> None:
         console.print("[dim]Нічого не вибрано — вихід.[/]")
         return
 
-    # The flag wins; a start with `--kind` uses one merchant, and any other
-    # start asks at the startup menu.
-    merchant_count: Optional[int] = args.merchants
-    if merchant_count is None:
-        merchant_count = 1 if args.kind else _select_merchant_count(current=1)
+    # A start with `--kind` skips the menus and uses one merchant; the idle
+    # menu switches the count later.
+    merchant_count: Optional[int] = (
+        1 if args.kind else _select_merchant_count(current=1)
+    )
     if merchant_count is None:
         console.print("[dim]Нічого не вибрано — вихід.[/]")
         return

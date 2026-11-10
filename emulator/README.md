@@ -168,7 +168,9 @@ so their emulators do not pretend to have one: an unknown command is refused,
 never answered with a quiet "success".
 
 **Merchants (1 or 2).** The emulated terminal reports either one merchant or
-two; one is the default. The second is derived from the first: the trailing
+two. The startup menu asks how many; the idle menu switches the count and
+rebuilds the listener on the same port. A start with `--kind` uses one
+merchant. The second is derived from the first: the trailing
 number of `--merchant-id` and of `--terminal-id` steps up by one, and
 `--merchant-name` gets its position appended. Every protocol reports the whole
 list in its merchant-list response (`GetMerchantListDetailed`,
@@ -206,9 +208,7 @@ python -m emulator --kind raif_pos    # or start straight on one bank
 Options: `--kind {mono_pos,generic_ssi,privat_pos,raif_pos,pumb_pos,
 pivdenny_pos,sense_pos,oschad_pos}`, `--host`, `--port` (override the bank's
 default port), `--manager-port` (default 9999), `--merchant-id`,
-`--merchant-name`, `--terminal-id` (all three name the **first** merchant),
-`--merchants {1,2}` (how many merchants the terminal reports — without this
-flag the startup menu asks, and a start with `--kind` uses 1).
+`--merchant-name`, `--terminal-id` (all three name the **first** merchant).
 
 **Switching banks:** at the idle menu choose **🔀 Змінити термінал** — the old
 listener is torn down and the new protocol comes up on its own port. To leave
