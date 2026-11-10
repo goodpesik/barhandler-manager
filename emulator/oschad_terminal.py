@@ -42,8 +42,11 @@ class OschadTerminalEmulator(BankEmulator):
         if op == "info":
             return {"op": "info", "rc": "000", "model": self.model, "sn": self.serial}
         if op == "merchants":
+            # No `tid` here: the Oschad merchant entry carries the merchant id
+            # and the name, and the manager keys stored merchant nicknames on
+            # (merchant id, terminal id).
             return {"op": "merchants", "rc": "000", "merchants": [
-                {"mid": m.merchant_id, "tid": m.terminal_id, "name": m.merchant_name}
+                {"mid": m.merchant_id, "name": m.merchant_name}
                 for m in self.merchants
             ]}
         if op == "abort":

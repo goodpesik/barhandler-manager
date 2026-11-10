@@ -40,11 +40,11 @@ class BposTerminalEmulator(BankEmulator):
         if cmd == "90":
             return {"cmd": "90", "result": "0", "model": self.model, "sn": self.serial}
         if cmd == "80":
+            # No terminal id here: the BPOS merchant entry carries the
+            # merchant id and the name, and the manager keys stored merchant
+            # nicknames on (merchant id, terminal id).
             return {"cmd": "80", "result": "0", "merchants": [
-                {
-                    "merchantId": m.merchant_id, "terminalId": m.terminal_id,
-                    "name": m.merchant_name,
-                }
+                {"merchantId": m.merchant_id, "name": m.merchant_name}
                 for m in self.merchants
             ]}
         if cmd == "9":

@@ -232,8 +232,8 @@ def main() -> None:
                         default=None,
                         help="how many merchants the terminal reports; the "
                              "second one is derived from the first. Without "
-                             "this flag the startup menu asks, and a "
-                             "non-interactive start uses one")
+                             "this flag the startup menu asks, and a start "
+                             "with --kind uses 1")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -251,8 +251,8 @@ def main() -> None:
         console.print("[dim]Нічого не вибрано — вихід.[/]")
         return
 
-    # The flag wins; otherwise the menu asks, and a start that skipped the
-    # menu (`--kind`) keeps the single merchant it has always reported.
+    # The flag wins; a start with `--kind` uses one merchant, and any other
+    # start asks at the startup menu.
     merchant_count: Optional[int] = args.merchants
     if merchant_count is None:
         merchant_count = 1 if args.kind else _select_merchant_count(current=1)

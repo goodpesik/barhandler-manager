@@ -207,7 +207,7 @@ Options: `--kind {mono_pos,generic_ssi,privat_pos,raif_pos,pumb_pos,
 pivdenny_pos,sense_pos,oschad_pos}`, `--host`, `--port` (override the bank's
 default port), `--manager-port` (default 9999), `--merchant-id`,
 `--merchant-name`, `--terminal-id` (all three name the **first** merchant),
-`--merchants {1,2}` (how many merchants the terminal reports — without the
+`--merchants {1,2}` (how many merchants the terminal reports — without this
 flag the startup menu asks, and a start with `--kind` uses 1).
 
 **Switching banks:** at the idle menu choose **🔀 Змінити термінал** — the old
