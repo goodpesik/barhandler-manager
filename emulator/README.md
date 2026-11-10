@@ -167,6 +167,15 @@ no refund in the manager either (`base.refund` answers `refund_unsupported`),
 so their emulators do not pretend to have one: an unknown command is refused,
 never answered with a quiet "success".
 
+**Merchants (1 or 2).** The emulated terminal reports either one merchant or
+two; one is the default. The second is derived from the first: the trailing
+number of `--merchant-id` and of `--terminal-id` steps up by one, and
+`--merchant-name` gets its position appended. Every protocol reports the whole
+list in its merchant-list response (`GetMerchantListDetailed`,
+`ServiceMessage getMerchantList`, `GET_MERCHANTS`, cmd `80`, `merchants`);
+PrivatBank keys that response by the merchant's index, the other four carry the
+merchant id. Operations run for the first merchant.
+
 | Bank(s) | Protocol | Default port | `kind` |
 |---|---|---|---|
 | Monobank | SSI ECR JSON (STX/LEN/LRC) | 3000 | `mono_pos` |
@@ -197,11 +206,17 @@ python -m emulator --kind raif_pos    # or start straight on one bank
 Options: `--kind {mono_pos,generic_ssi,privat_pos,raif_pos,pumb_pos,
 pivdenny_pos,sense_pos,oschad_pos}`, `--host`, `--port` (override the bank's
 default port), `--manager-port` (default 9999), `--merchant-id`,
-`--merchant-name`, `--terminal-id`.
+`--merchant-name`, `--terminal-id` (all three name the **first** merchant),
+`--merchants {1,2}` (how many merchants the terminal reports — without the
+flag the startup menu asks, and a start with `--kind` uses 1).
 
 **Switching banks:** at the idle menu choose **🔀 Змінити термінал** — the old
 listener is torn down and the new protocol comes up on its own port. To leave
 the "waiting for transactions" state back to that menu, press **Ctrl-C**.
+
+**Merchants:** at the idle menu choose **🏪 Змінити кількість мерчантів** (1 or
+2) — the listener is restarted with the new merchant list on the same port. The
+banner lists every merchant with its `MID` and `TID`.
 
 ## Point the manager at it
 

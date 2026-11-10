@@ -84,11 +84,14 @@ class SSITerminalEmulator(BankEmulator):
                 "currentApp": {"packageName": self.package},
             }}
         if method == "GetMerchantListDetailed":
-            return {"error": False, "params": {"merchantList": [{
-                "merchantId": self.merchant_id,
-                "terminalId": self.terminal_id,
-                "merchantName": self.merchant_name,
-            }]}}
+            return {"error": False, "params": {"merchantList": [
+                {
+                    "merchantId": m.merchant_id,
+                    "terminalId": m.terminal_id,
+                    "merchantName": m.merchant_name,
+                }
+                for m in self.merchants
+            ]}}
         if method == "Purchase":
             return self._purchase(request)
         if method == "GetStatus":
@@ -190,8 +193,8 @@ class SSITerminalEmulator(BankEmulator):
                 "pan": "************1234",
                 "binName": "Visa",
                 "bankName": "EMULATOR BANK",
-                "terminalId": self.terminal_id,
-                "merchantId": self.merchant_id,
+                "terminalId": self.merchants[0].terminal_id,
+                "merchantId": self.merchants[0].merchant_id,
                 "responseCode": "00",
                 "posEntryMode": "07",
                 "invoiceNum": f"{random.randint(0, 999999):06d}",
@@ -207,10 +210,11 @@ class SSITerminalEmulator(BankEmulator):
         }}
 
     def _receipt(self) -> str:
+        merchant = self.merchants[0]
         return (
             "      EMULATOR BANK\n"
-            f"  {self.merchant_name}\n"
-            f"  TID {self.terminal_id}  MID {self.merchant_id}\n"
+            f"  {merchant.merchant_name}\n"
+            f"  TID {merchant.terminal_id}  MID {merchant.merchant_id}\n"
             "  ОПЛАТА (емулятор)\n"
             "  ============================\n"
             "  СПЛАЧЕНО — тестова транзакція\n"

@@ -42,9 +42,10 @@ class OschadTerminalEmulator(BankEmulator):
         if op == "info":
             return {"op": "info", "rc": "000", "model": self.model, "sn": self.serial}
         if op == "merchants":
-            return {"op": "merchants", "rc": "000", "merchants": [{
-                "mid": self.merchant_id, "name": self.merchant_name,
-            }]}
+            return {"op": "merchants", "rc": "000", "merchants": [
+                {"mid": m.merchant_id, "tid": m.terminal_id, "name": m.merchant_name}
+                for m in self.merchants
+            ]}
         if op == "abort":
             self.interrupt_current()
             return {"op": "abort", "rc": "000"}
@@ -70,5 +71,5 @@ class OschadTerminalEmulator(BankEmulator):
                 "rrn": f"{random.randint(0, 999999999999):012d}",
                 "auth": f"{random.randint(0, 999999):06d}",
                 "pan": "**9999", "scheme": "Visa", "bankName": "Oschadbank",
-                "tid": self.terminal_id,
+                "tid": self.merchants[0].terminal_id,
                 "invoice": f"{random.randint(0, 999999):06d}"}
