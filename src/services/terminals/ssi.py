@@ -471,9 +471,28 @@ class SSITerminalAdapter(TerminalAdapter):
         # actually authorise the transaction. Without step:2 the operator
         # sees the card read, then "decline" — the bank never sees the
         # auth request because we never sent it.
-        first = await self.get_last_result(
-            transaction_uid=request.transaction_uid,
-        )
+        # S08 by itself means "send step:2". On some Mono firmware the
+        # first-step lookup by uid answers E21 ("operation with this UID
+        # not found") while the terminal sits in S08 — the uid is only
+        # recorded once the operation completes. That lookup must not
+        # abort the charge: the card is already read and the terminal
+        # would stay parked in S08. Outside S08 the lookup decides.
+        if idle_status == "S08":
+            try:
+                first: Optional[AcquirerResult] = await self._fetch_result(
+                    request.transaction_uid, stage="first-step",
+                )
+            except TerminalUnavailable as exc:
+                logger.warning(
+                    "[%s] first-step result lookup failed in S08 "
+                    "(code=%s), sending step:2 anyway",
+                    self.descriptor.id, exc.code,
+                )
+                first = None
+        else:
+            first = await self.get_last_result(
+                transaction_uid=request.transaction_uid,
+            )
         needs_step_two = (
             idle_status == "S08"
             or (first.raw_transaction_result == "FIRST_STEP_COMPLETED")
@@ -487,7 +506,8 @@ class SSITerminalAdapter(TerminalAdapter):
 
         logger.info(
             "[%s] first step done (raw=%s), sending step:2 for authorisation",
-            self.descriptor.id, first.raw_transaction_result,
+            self.descriptor.id,
+            first.raw_transaction_result if first is not None else None,
         )
         ack2 = await wire.send(
             self._send, {"method": "Purchase", "step": "2", "params": params},
@@ -507,8 +527,8 @@ class SSITerminalAdapter(TerminalAdapter):
             "[%s] step:2 idle reached (status=%s), fetching final result",
             self.descriptor.id, idle2,
         )
-        result = await self.get_last_result(
-            transaction_uid=request.transaction_uid,
+        result = await self._fetch_result(
+            request.transaction_uid, stage="final",
         )
         logger.info(
             "[%s] charge final: status=%s raw=%s rrn=%s auth=%s",
@@ -706,8 +726,8 @@ class SSITerminalAdapter(TerminalAdapter):
                 f"{operation} left the terminal waiting for a second step",
                 code="refund_incomplete",
             )
-        result = await self.get_last_result(
-            transaction_uid=request.transaction_uid,
+        result = await self._fetch_result(
+            request.transaction_uid, stage=f"{operation} final",
         )
         logger.info(
             "[%s] %s final: status=%s raw=%s rrn=%s auth=%s",
@@ -776,6 +796,25 @@ class SSITerminalAdapter(TerminalAdapter):
                 "[%s] cancel/Interrupt failed (likely already idle)",
                 self.descriptor.id,
             )
+
+    async def _fetch_result(
+        self, transaction_uid: Optional[str], *, stage: str,
+    ) -> AcquirerResult:
+        """Result of the operation that has just finished on this
+        terminal. Asks by uid first; when the terminal answers E21
+        (no operation with that uid), falls back to GetLastResult,
+        which right after our own operation is that same operation."""
+        try:
+            return await self.get_last_result(transaction_uid=transaction_uid)
+        except TerminalUnavailable as exc:
+            if not transaction_uid or exc.code != "e21":
+                raise
+            logger.warning(
+                "[%s] %s GetResultByUid answered E21 for uid …%s, "
+                "falling back to GetLastResult",
+                self.descriptor.id, stage, transaction_uid[-6:],
+            )
+            return await self.get_last_result()
 
     async def get_last_result(
         self, transaction_uid: Optional[str] = None,
