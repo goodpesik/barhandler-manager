@@ -20,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 
+from src.devices import win_queue
 from src.devices.printer import PrinterUnavailable
 from src.devices.registry import UnknownPrinter
 from src.models.printer import (
@@ -169,6 +170,30 @@ def _discovery_warnings() -> list[dict]:
 def _printer_detail(exc: PrinterUnavailable) -> dict:
     """The same 503 body as /print/*, so the frontend reads one shape."""
     return {"code": getattr(exc, "code", "unavailable"), "message": str(exc)}
+
+
+async def _test_print_answer(device, job_ref, answer: dict) -> dict:
+    """`answer` with status «printed», or «queued_not_printed» for a spooler
+    job that is still in the Windows queue after the bounded wait.
+
+    Win32Raw returns once the spooler has ACCEPTED the job; an offline or
+    blocked queue keeps it and nothing comes out.
+    """
+    queue = getattr(device, "spool_queue_name", None)
+    if queue:
+        stuck = await win_queue.wait_until_left(queue, job_ref)
+        if stuck is not None:
+            problem = stuck.problem()
+            reason = (
+                problem[1] if problem
+                else f"{queue}: the job is still in the Windows print queue "
+                     f"after {win_queue.DRAIN_WAIT_S:.0f}s"
+            )
+            return {
+                **answer, "status": "queued_not_printed", "reason": reason,
+                "queue": stuck.as_dict(),
+            }
+    return {"status": "printed", **answer}
 
 @router.post("/discover")
 async def discover(request: Request) -> dict:
@@ -408,16 +433,15 @@ async def test_print(printer_id: str, request: Request) -> dict:
             esc._raw(blob)
 
         try:
-            await device.enqueue(_tspl_job, action="test-print")
+            job_ref = await device.enqueue(_tspl_job, action="test-print")
         except PrinterUnavailable as exc:
             raise HTTPException(status_code=503, detail=_printer_detail(exc))
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc))
-        return {
-            "status": "printed",
+        return await _test_print_answer(device, job_ref, {
             "printer_id": printer_id,
             "protocol": protocol.value if hasattr(protocol, "value") else protocol,
-        }
+        })
 
     chars = reg.chars_per_line
 
@@ -463,7 +487,7 @@ async def test_print(printer_id: str, request: Request) -> dict:
         esc.cut()
 
     try:
-        await device.enqueue(_job, action="test-print")
+        job_ref = await device.enqueue(_job, action="test-print")
     except PrinterUnavailable as exc:
         # BH-183 — keep the code, as /print/* does: a plain-string detail
         # left the test print showing a generic failure for paper, cover or
@@ -471,9 +495,8 @@ async def test_print(printer_id: str, request: Request) -> dict:
         raise HTTPException(status_code=503, detail=_printer_detail(exc))
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc))
-    return {
-        "status": "printed",
+    return await _test_print_answer(device, job_ref, {
         "printer_id": printer_id,
         "render_mode": reg.render_mode,
         "code_page": reg.code_page,
-    }
+    })
