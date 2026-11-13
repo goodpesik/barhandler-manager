@@ -285,11 +285,12 @@ def test_a_job_that_left_a_healthy_queue_is_printed(client, auth_headers, monkey
     assert r.json()["status"] == "printed"
 
 
-def test_a_printed_job_kept_in_the_queue_counts_as_gone(client, auth_headers, monkeypatch):
-    # "Keep printed documents": EnumJobs still lists our job, marked printed.
+@pytest.mark.parametrize("job_status", [_JOB_PRINTED, 0x100, 0x1000])  # PRINTED, DELETED, COMPLETE
+def test_a_printed_job_kept_in_the_queue_counts_as_gone(client, auth_headers, monkeypatch, job_status):
+    # "Keep printed documents": EnumJobs still lists our job, marked done.
     r, _ = _spooler_test_print(
         client, auth_headers, monkeypatch,
-        _fake_win32print(queued_jobs=(7,), job_status=_JOB_PRINTED),
+        _fake_win32print(queued_jobs=(7,), job_status=job_status),
     )
 
     assert r.status_code == 200

@@ -177,8 +177,9 @@ async def wait_until_left(name: str, job_id: Optional[int]) -> Optional[QueueSta
     """Wait (bounded) for the sent job to leave the queue.
 
     Returns None when the job left the queue, or when the spooler cannot be
-    asked or the job id is unknown (the old behaviour: report printed). Returns the queue's state when
-    the job is still queued after DRAIN_WAIT_S.
+    asked or the job id is unknown (the old behaviour: report printed).
+    Returns the queue's state when the job is still queued after
+    DRAIN_WAIT_S.
     """
     if job_id is None:
         logger.info("spool job on %r: job id not available, reported as sent", name)
