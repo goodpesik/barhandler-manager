@@ -160,7 +160,11 @@ _WORK_OFFLINE = 0x400
 _PAUSED = 0x1
 
 
-def _fake_win32print(*, status=0, attributes=0, queued_jobs=()):
+_OFFLINE = 0x80
+_JOB_PRINTED = 0x80
+
+
+def _fake_win32print(*, status=0, attributes=0, queued_jobs=(), job_status=0):
     """win32print stand-in for one queue «XP-58» on USB001."""
     fake = types.ModuleType("win32print")
     fake.PRINTER_ENUM_LOCAL = 2
@@ -173,7 +177,7 @@ def _fake_win32print(*, status=0, attributes=0, queued_jobs=()):
         "Status": status, "Attributes": attributes, "cJobs": len(queued_jobs),
     }
     fake.EnumJobs = lambda handle, first, count, level: [
-        {"JobId": job_id} for job_id in queued_jobs
+        {"JobId": job_id, "Status": job_status} for job_id in queued_jobs
     ]
     return fake
 
@@ -181,13 +185,14 @@ def _fake_win32print(*, status=0, attributes=0, queued_jobs=()):
 class _JobSpooler(Dummy):
     """Win32Raw stand-in with the full escpos API; sets `current_job` on open."""
 
-    def __init__(self):
+    def __init__(self, job_id=7):
         super().__init__()
         self.events: list[str] = []
+        self.job_id = job_id
 
     def open(self, job_name="python-escpos", raise_not_found=True):
         self.events.append("open")
-        self.current_job = 7
+        self.current_job = self.job_id
 
     def _raw(self, data):
         self.events.append("print")
@@ -196,7 +201,7 @@ class _JobSpooler(Dummy):
         self.events.append("close")
 
 
-def _spooler_test_print(client, auth_headers, monkeypatch, win32print):
+def _spooler_test_print(client, auth_headers, monkeypatch, win32print, job_id=7):
     from src.devices import scan, win_queue
 
     monkeypatch.setitem(sys.modules, "win32print", win32print)
@@ -214,7 +219,7 @@ def _spooler_test_print(client, auth_headers, monkeypatch, win32print):
     )
     assert r.status_code == 200, r.text
 
-    spooler = _JobSpooler()
+    spooler = _JobSpooler(job_id)
     holder: dict = {}
 
     async def _device(_pid):
@@ -238,6 +243,7 @@ def _spooler_test_print(client, auth_headers, monkeypatch, win32print):
     [
         ({"attributes": _WORK_OFFLINE}, "queue_offline"),
         ({"status": _PAUSED}, "queue_paused"),
+        ({"status": _OFFLINE}, "queue_offline"),
     ],
 )
 def test_a_queue_that_cannot_print_is_refused_before_anything_is_sent(
@@ -277,6 +283,59 @@ def test_a_job_that_left_a_healthy_queue_is_printed(client, auth_headers, monkey
 
     assert r.status_code == 200
     assert r.json()["status"] == "printed"
+
+
+def test_a_printed_job_kept_in_the_queue_counts_as_gone(client, auth_headers, monkeypatch):
+    # "Keep printed documents": EnumJobs still lists our job, marked printed.
+    r, _ = _spooler_test_print(
+        client, auth_headers, monkeypatch,
+        _fake_win32print(queued_jobs=(7,), job_status=_JOB_PRINTED),
+    )
+
+    assert r.status_code == 200
+    assert r.json()["status"] == "printed"
+
+
+def test_an_unknown_job_id_is_printed_without_waiting(client, auth_headers, monkeypatch):
+    fake = _fake_win32print(queued_jobs=(5,))
+    asked: list = []
+    fake.EnumJobs = lambda *args: asked.append(args) or [{"JobId": 5, "Status": 0}]
+
+    r, _ = _spooler_test_print(client, auth_headers, monkeypatch, fake, job_id=None)
+
+    assert r.status_code == 200
+    assert r.json()["status"] == "printed"
+    assert asked == []
+
+
+def test_a_receipt_on_an_offline_flagged_queue_makes_no_queue_read_and_is_sent(monkeypatch):
+    fake = _fake_win32print(status=_OFFLINE)
+    asked: list = []
+    fake.OpenPrinter = lambda name: asked.append(name) or object()
+    monkeypatch.setitem(sys.modules, "win32print", fake)
+
+    async def body():
+        dev = PrinterDevice("spool", {
+            "enabled": True, "paper_width": 58, "render_mode": "native",
+            "code_page": None, "connection": "windows_spooler",
+            "printer_name": "XP-58",
+        })
+        spooler = _JobSpooler()
+        dev._printer = spooler
+        dev._worker_task = asyncio.create_task(dev._worker())
+
+        async def job(printer):
+            printer._raw(b"RECEIPT")
+
+        await dev.enqueue(job)
+        snapshot = list(spooler.events)   # before disconnect
+        await dev.disconnect()
+        return snapshot
+
+    events = asyncio.run(asyncio.wait_for(body(), timeout=5))
+
+    assert events == ["open", "print", "close"]
+    assert asked == []
 
 
 def test_discovery_shows_each_queue_port_driver_status_and_jobs(monkeypatch):

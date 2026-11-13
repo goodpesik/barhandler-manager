@@ -260,11 +260,14 @@ class PrinterDevice:
             return None
         return self._config.get("printer_name") or None
 
-    def _spool_queue_refusal(self) -> Optional[PrinterUnavailable]:
-        """Refusal for a queue that cannot print; None when it can or is unreadable.
+    def spool_queue_refusal(self) -> Optional[PrinterUnavailable]:
+        """Refusal for a test print on a queue that cannot print; None otherwise.
 
         Win32Raw accepts a job into an offline, paused or failed queue without
-        complaint, so the spooler's own state is read first.
+        complaint, so the test print reads the spooler's own state first.
+        Receipts and other jobs never read it: some Windows USB drivers raise
+        a spurious offline flag while printing works. None when the device is
+        not a spooler or the queue cannot be read.
         """
         state = win_queue.read_queue(self.spool_queue_name or "")
         if state is None:
@@ -956,11 +959,7 @@ class PrinterDevice:
                 # BH-168 — саме опитування теж іде в потік: це два запити до
                 # заліза (`paper_status`, `is_online`), кожен із власним
                 # шансом зависнути.
-                if spooler:
-                    refusal = await self._io(self._spool_queue_refusal)
-                    if refusal is not None:
-                        raise refusal
-                else:
+                if not spooler:
                     status = await self._io(self.check_status)
                     if status["supported"]:
                         if status["paper"] == "empty":

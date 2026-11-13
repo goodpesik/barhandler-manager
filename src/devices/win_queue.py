@@ -49,9 +49,11 @@ _STATUS_NAMES = {
 }
 _ATTRIBUTE_WORK_OFFLINE = 0x00000400
 
-# Flags that mean the queue cannot print, in the order they are reported, each
-# with the error code the admin app receives. The paper and cover codes are the
-# ones the app already shows for the ESC/POS real-time status.
+# Allow-list of the queue states that block printing, in the order they are
+# reported, each with the error code the admin app receives. The paper and cover
+# codes are the ones the app already shows for the ESC/POS real-time status.
+# Toner and output-bin states are not listed: they do not apply to thermal
+# receipt printers.
 _BLOCKING = (
     ({"offline", "not_available", "work_offline"}, "queue_offline", "the queue is offline"),
     ({"paused"}, "queue_paused", "the queue is paused"),
@@ -59,7 +61,7 @@ _BLOCKING = (
     ({"door_open"}, "cover_open", "the spooler reports the cover open"),
     (
         {"error", "paper_jam", "paper_problem", "user_intervention",
-         "output_bin_full", "no_toner", "pending_deletion", "server_unknown"},
+         "pending_deletion", "server_unknown"},
         "queue_error",
         "the queue is in error",
     ),
@@ -140,8 +142,13 @@ def read_queue(name: str) -> Optional[QueueState]:
         return None
 
 
-def _job_present(name: str, job_id: Optional[int]) -> Optional[bool]:
-    """Is `job_id` still in the queue (any job, when the id is unknown)?"""
+# winspool.h JOB_STATUS_* bits of a job that has already finished: with
+# "Keep printed documents" on, EnumJobs still lists it.
+_JOB_DONE = 0x00000080 | 0x00000100 | 0x00001000  # PRINTED | DELETED | COMPLETE
+
+
+def _job_present(name: str, job_id: int) -> Optional[bool]:
+    """Is `job_id` still waiting in the queue? A finished job counts as gone."""
     w = _win32print()
     if w is None or not name:
         return None
@@ -154,9 +161,10 @@ def _job_present(name: str, job_id: Optional[int]) -> Optional[bool]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("spooler jobs of %r could not be read: %s", name, exc)
         return None
-    if job_id is None:
-        return len(jobs) > 0
-    return any(job.get("JobId") == job_id for job in jobs)
+    return any(
+        job.get("JobId") == job_id and not int(job.get("Status") or 0) & _JOB_DONE
+        for job in jobs
+    )
 
 
 # How long a test print waits for its job to leave the queue. A healthy USB
@@ -169,9 +177,12 @@ async def wait_until_left(name: str, job_id: Optional[int]) -> Optional[QueueSta
     """Wait (bounded) for the sent job to leave the queue.
 
     Returns None when the job left the queue, or when the spooler cannot be
-    asked (the old behaviour: report printed). Returns the queue's state when
+    asked or the job id is unknown (the old behaviour: report printed). Returns the queue's state when
     the job is still queued after DRAIN_WAIT_S.
     """
+    if job_id is None:
+        logger.info("spool job on %r: job id not available, reported as sent", name)
+        return None
     loop = asyncio.get_running_loop()
     deadline = loop.time() + DRAIN_WAIT_S
     while True:
