@@ -919,3 +919,77 @@ async def test_a_money_frame_that_failed_without_saying_counts_as_sent() -> None
     )
     trace.seal(refused_later)
     assert refused_later.nothing_sent is False
+
+
+_E21_NOT_FOUND = {
+    "error": True,
+    "errorCode": "E21",
+    "errorDescription": "",
+    "params": {"errorDetails": "Operation with this UID not found"},
+}
+
+
+def _two_step_terminal(sent: list, *, first_status: str, uid_answers: list):
+    """Scripted terminal: GetStatus answers `first_status` until step:2 is
+    sent, then S00. GetResultByUid pops `uid_answers` in order;
+    GetLastResult returns an approved final result."""
+    async def scripted(self, message, **_kwargs):
+        sent.append(message)
+        method = message.get("method")
+        if method == "Purchase":
+            return {"method": "Purchase", **_OK_ACK, "params": {}}
+        if method == "GetStatus":
+            step_two_sent = any(
+                m.get("method") == "Purchase" and m.get("step") == "2"
+                for m in sent
+            )
+            status = "S00" if step_two_sent else first_status
+            return {"method": "GetStatus", "status": status, **_OK_ACK}
+        if method == "GetResultByUid":
+            return {"method": method, **uid_answers.pop(0)}
+        if method == "GetLastResult":
+            return _approved("GetLastResult")
+        if method == "GetLastReceipt":
+            return {"method": method, **_OK_ACK, "params": {}}
+        raise AssertionError(f"unexpected method {method}")
+    return scripted
+
+
+@pytest.mark.asyncio
+async def test_s08_with_unknown_uid_still_sends_step_two(monkeypatch) -> None:
+    """Field case on a Mono SSI terminal: after step:1 the terminal parks in
+    S08 and GetResultByUid answers E21 for the uid. Step:2 must still go out,
+    and the final result (also E21 by uid) comes from GetLastResult."""
+    sent: list = []
+    monkeypatch.setattr(SSITerminalAdapter, "_send", _two_step_terminal(
+        sent, first_status="S08",
+        uid_answers=[dict(_E21_NOT_FOUND), dict(_E21_NOT_FOUND)],
+    ))
+    adapter = SSITerminalAdapter(_registration(3000))
+
+    result = await adapter.charge(ChargeRequest(
+        amount_kopecks=24500, transaction_uid="pet-card:s08-e21",
+    ))
+
+    steps = [m.get("step") for m in sent if m.get("method") == "Purchase"]
+    assert steps == ["1", "2"]
+    assert result.status == "ok"
+
+
+@pytest.mark.asyncio
+async def test_outside_s08_a_failed_result_lookup_still_raises(monkeypatch) -> None:
+    """When the terminal returns to S00 the uid lookup is the outcome: an
+    E21 there is not swallowed and no step:2 is sent."""
+    sent: list = []
+    monkeypatch.setattr(SSITerminalAdapter, "_send", _two_step_terminal(
+        sent, first_status="S00", uid_answers=[dict(_E21_NOT_FOUND)],
+    ))
+    adapter = SSITerminalAdapter(_registration(3000))
+
+    with pytest.raises(TerminalUnavailable) as raised:
+        await adapter.charge(ChargeRequest(
+            amount_kopecks=24500, transaction_uid="pet-card:s00-e21",
+        ))
+
+    assert raised.value.code == "e21"
+    assert [m.get("step") for m in sent if m.get("method") == "Purchase"] == ["1"]
