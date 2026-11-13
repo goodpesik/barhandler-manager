@@ -133,3 +133,62 @@ async def test_tail_log_still_accepts_its_own_argument(monkeypatch, tmp_path):
     r = await diagnostics.run_diagnostic("tail_log", {"n": 2})
     assert r["ok"] is True
     assert r["output"] == "b\nc"
+
+
+def _windows_rename(monkeypatch):
+    """os.rename with Windows semantics: refuse while another handle is open."""
+    import os
+
+    real = os.rename
+
+    def rename(src, dst):
+        target = os.path.realpath(src)
+        for fd in os.listdir("/proc/self/fd"):
+            try:
+                if os.path.realpath(f"/proc/self/fd/{fd}") == target:
+                    raise PermissionError(32, "The process cannot access the file", src)
+            except OSError as exc:
+                if isinstance(exc, PermissionError):
+                    raise
+        real(src, dst)
+
+    monkeypatch.setattr(os, "rename", rename)
+
+
+@pytest.mark.skipif(not Path("/proc/self/fd").exists(), reason="needs /proc")
+def test_rotation_succeeds_while_the_stdio_stand_in_is_open(monkeypatch, tmp_path):
+    import logging.handlers
+
+    import main
+    import src.config
+
+    monkeypatch.setattr(src.config, "APP_DIR", tmp_path)
+    stand_in = main._open_fallback_stream()
+    _windows_rename(monkeypatch)
+    errors = []
+    handler = logging.handlers.RotatingFileHandler(
+        tmp_path / "bhm.log", maxBytes=200, backupCount=2, encoding="utf-8",
+    )
+    monkeypatch.setattr(handler, "handleError", lambda record: errors.append(record))
+    log = logging.getLogger("rotation-test")
+    log.addHandler(handler)
+    log.propagate = False
+    try:
+        for i in range(20):
+            log.warning("record %d with some padding to reach the limit", i)
+    finally:
+        log.removeHandler(handler)
+        handler.close()
+        stand_in.close()
+
+    assert errors == []
+    assert (tmp_path / "bhm.log.1").exists()
+
+
+def test_a_library_handler_on_the_stdio_stand_in_is_detached(monkeypatch):
+    import main
+
+    stand_in = io.StringIO()
+    monkeypatch.setattr(main, "_FALLBACK_STREAM", stand_in)
+    assert main._writes_to_fallback(logging.StreamHandler(stand_in)) is True
+    assert main._writes_to_fallback(logging.StreamHandler(io.StringIO())) is False

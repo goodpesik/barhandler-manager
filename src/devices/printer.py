@@ -23,6 +23,7 @@ from src.services.bitmap_render import dots_for, image_to_gs_v_0, render_paragra
 from src.services.tspl_render import image_to_tspl_bitmap
 from src.services.encoding import encode_ua_cp866
 from src.services import work_journal
+from src.devices import win_queue
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +252,33 @@ class PrinterDevice:
 
     def is_connected(self) -> bool:
         return self._printer is not None
+
+    @property
+    def spool_queue_name(self) -> Optional[str]:
+        """The Windows queue this device prints to; None for other transports."""
+        if not self._is_spooler():
+            return None
+        return self._config.get("printer_name") or None
+
+    def spool_queue_refusal(self) -> Optional[PrinterUnavailable]:
+        """Refusal for a test print on a queue that cannot print; None otherwise.
+
+        Win32Raw accepts a job into an offline, paused or failed queue without
+        complaint, so the test print reads the spooler's own state first.
+        Receipts and other jobs never read it: some Windows USB drivers raise
+        a spurious offline flag while printing works. None when the device is
+        not a spooler or the queue cannot be read.
+        """
+        state = win_queue.read_queue(self.spool_queue_name or "")
+        if state is None:
+            return None
+        problem = state.problem()
+        if problem is None:
+            logger.info("[%s] spooler queue ready: %s", self.name, state.describe())
+            return None
+        code, reason = problem
+        logger.warning("[%s] spooler queue refused (%s): %s", self.name, code, state.describe())
+        return PrinterUnavailable(reason, code=code)
 
     def _io(self, fn, *args) -> asyncio.Future:
         """Виконати `fn` у потоці ЦЬОГО пристрою (BH-168), по черзі з рештою."""
@@ -630,11 +658,14 @@ class PrinterDevice:
                 with suppress(Exception):
                     del printer.__dict__["_raw"]
 
-    def _flush_blocking(self, printer, chunks: list, spooler: bool) -> None:
+    def _flush_blocking(self, printer, chunks: list, spooler: bool) -> Optional[int]:
         """Записати зібрані куски в залізо. Виконується В ПОТОЦІ (BH-168).
 
         Замка немає й не треба: усе, що торкається ручки, іде в потоці
         пристрою по черзі (див. `_executor`).
+
+        Returns the spooler job id (Win32Raw sets it on open) so the caller
+        can check whether the job left the queue; None for other transports.
         """
         if spooler:
             # Windows-спулер: один документ на весь чек, інакше кожен
@@ -643,6 +674,7 @@ class PrinterDevice:
         try:
             for chunk in chunks:
                 printer._raw(chunk)
+            return getattr(printer, "current_job", None) if spooler else None
         finally:
             if spooler:
                 with suppress(Exception):
@@ -1007,12 +1039,12 @@ class PrinterDevice:
                 # спиняв цикл подій, а разом із ним оплату карткою, власні
                 # таймаути й `GET /busy`, яке питають інсталятори.
                 flush = self._io(self._flush_blocking, printer, chunks, spooler)
-                await asyncio.shield(flush)
+                job_ref = await asyncio.shield(flush)
                 # PET-1087 — the paper is out: the row says so, whether or not
                 # anybody is still waiting for the answer.
                 work_journal.record_printer(self.name, action, work_journal.STATUS_OK)
                 if not done.done():
-                    done.set_result(None)
+                    done.set_result(job_ref)
             except OSError as exc:
                 # Socket-level failure → the physical connection is gone.
                 # Clear the handle so health() reports "unavailable" and
