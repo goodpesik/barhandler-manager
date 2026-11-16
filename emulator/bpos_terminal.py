@@ -40,9 +40,13 @@ class BposTerminalEmulator(BankEmulator):
         if cmd == "90":
             return {"cmd": "90", "result": "0", "model": self.model, "sn": self.serial}
         if cmd == "80":
-            return {"cmd": "80", "result": "0", "merchants": [{
-                "merchantId": self.merchant_id, "name": self.merchant_name,
-            }]}
+            # No terminal id here: the BPOS merchant entry carries the
+            # merchant id and the name, and the manager keys stored merchant
+            # nicknames on (merchant id, terminal id).
+            return {"cmd": "80", "result": "0", "merchants": [
+                {"merchantId": m.merchant_id, "name": m.merchant_name}
+                for m in self.merchants
+            ]}
         if cmd == "9":
             self.interrupt_current()
             return {"cmd": "9", "result": "0"}
@@ -68,7 +72,7 @@ class BposTerminalEmulator(BankEmulator):
                 "rrn": f"{random.randint(0, 999999999999):012d}",
                 "authCode": f"{random.randint(0, 999999):06d}",
                 "pan": "**5678", "cardName": "MasterCard", "bankName": "EMULATOR BANK",
-                "terminalId": self.terminal_id,
+                "terminalId": self.merchants[0].terminal_id,
                 "invoice": f"{random.randint(0, 999999):06d}"}
 
 

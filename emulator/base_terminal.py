@@ -26,7 +26,7 @@ import queue
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 
 #: Що саме підтверджує оператор. BH-177: доти було лише «Оплата», і
@@ -38,6 +38,65 @@ KIND_LABELS = {
     "void": "СКАСУВАННЯ оплати",
     "partial_void": "ЧАСТКОВЕ скасування",
 }
+
+
+#: Merchant counts the emulated terminal can be started with.
+MERCHANT_COUNT_CHOICES = (1, 2)
+
+DEFAULT_MERCHANT_ID = "00000012345"
+DEFAULT_MERCHANT_NAME = "EMULATOR MERCHANT"
+DEFAULT_TERMINAL_ID = "EMU00001"
+
+
+@dataclass(frozen=True)
+class Merchant:
+    """One merchant configured on the emulated terminal. A real terminal can
+    carry more than one, and every protocol reports them as a list."""
+
+    merchant_id: str
+    merchant_name: str
+    terminal_id: str
+
+
+def _step_id(value: str, position: int) -> str:
+    """`value` with its trailing number moved up by `position - 1`."""
+    digits = len(value) - len(value.rstrip("0123456789"))
+    if digits == 0:
+        return f"{value}-{position}"
+    head, tail = value[:-digits], value[-digits:]
+    return f"{head}{int(tail) + position - 1:0{digits}d}"
+
+
+def build_merchants(
+    count: int = 1,
+    *,
+    merchant_id: str = DEFAULT_MERCHANT_ID,
+    merchant_name: str = DEFAULT_MERCHANT_NAME,
+    terminal_id: str = DEFAULT_TERMINAL_ID,
+) -> list["Merchant"]:
+    """The merchant list the emulated terminal reports.
+
+    The first entry is the one named by `merchant_id` / `merchant_name` /
+    `terminal_id`. Every further entry is derived from it: the trailing
+    number of the id and of the terminal id steps up and the name carries
+    its position, so the entries are told apart by every field.
+    """
+    if count not in MERCHANT_COUNT_CHOICES:
+        raise ValueError(
+            f"merchant count must be one of {MERCHANT_COUNT_CHOICES}, got {count!r}",
+        )
+    merchants = [Merchant(
+        merchant_id=merchant_id,
+        merchant_name=merchant_name,
+        terminal_id=terminal_id,
+    )]
+    for position in range(2, count + 1):
+        merchants.append(Merchant(
+            merchant_id=_step_id(merchant_id, position),
+            merchant_name=f"{merchant_name} {position}",
+            terminal_id=_step_id(terminal_id, position),
+        ))
+    return merchants
 
 
 @dataclass
@@ -69,17 +128,24 @@ class BankEmulator(ABC):
         self,
         *,
         decisions: "queue.Queue[Pending]",
-        merchant_id: str = "00000012345",
-        merchant_name: str = "EMULATOR MERCHANT",
-        terminal_id: str = "EMU00001",
+        merchant_id: str = DEFAULT_MERCHANT_ID,
+        merchant_name: str = DEFAULT_MERCHANT_NAME,
+        terminal_id: str = DEFAULT_TERMINAL_ID,
+        merchant_count: int = 1,
+        merchants: Optional[Sequence[Merchant]] = None,
         model: str = "BARHANDLER EMULATOR",
         serial: str = "EMU-0001",
         on_traffic: Optional[Callable[[str, dict], None]] = None,
     ) -> None:
         self.decisions = decisions
-        self.merchant_id = merchant_id
-        self.merchant_name = merchant_name
-        self.terminal_id = terminal_id
+        self.merchants: list[Merchant] = (
+            list(merchants) if merchants else build_merchants(
+                merchant_count,
+                merchant_id=merchant_id,
+                merchant_name=merchant_name,
+                terminal_id=terminal_id,
+            )
+        )
         self.model = model
         self.serial = serial
         self.on_traffic = on_traffic or (lambda direction, msg: None)

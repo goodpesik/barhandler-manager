@@ -28,7 +28,16 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from .base_terminal import BankEmulator, EmulatorServer, Pending
+from .base_terminal import (
+    DEFAULT_MERCHANT_ID,
+    DEFAULT_MERCHANT_NAME,
+    DEFAULT_TERMINAL_ID,
+    MERCHANT_COUNT_CHOICES,
+    BankEmulator,
+    EmulatorServer,
+    Merchant,
+    Pending,
+)
 from .bpos_terminal import BposTerminalEmulator
 from .oschad_terminal import OschadTerminalEmulator
 from .posapi_terminal import PosApiTerminalEmulator
@@ -46,6 +55,9 @@ MENU_STYLE = Style([
 ])
 
 API_KEY = "bf11b47b-e139-4f03-8e02-9c2e692f91b8"  # manager DEFAULT_API_KEY
+
+#: Menu labels for how many merchants the emulated terminal carries.
+MERCHANT_COUNT_LABELS = {1: "1 мерчант", 2: "2 мерчанти"}
 
 
 @dataclass(frozen=True)
@@ -110,7 +122,25 @@ def _select_bank(current: Optional[Bank] = None) -> Optional[Bank]:
     return BANKS_BY_KEY.get(answer) if answer else None
 
 
-def _banner(bank: Bank, host: str, port: int, manager_port: int) -> None:
+def _select_merchant_count(current: Optional[int] = None) -> Optional[int]:
+    choices = [
+        Choice(
+            title=f"{'● ' if count == current else '  '}{MERCHANT_COUNT_LABELS[count]}",
+            value=count,
+        )
+        for count in MERCHANT_COUNT_CHOICES
+    ]
+    return questionary.select(
+        "Скільки мерчантів на терміналі?",
+        choices=choices, style=MENU_STYLE, qmark="🏪",
+        instruction="(↑/↓, Enter)",
+    ).ask()
+
+
+def _banner(
+    bank: Bank, host: str, port: int, manager_port: int,
+    merchants: list[Merchant],
+) -> None:
     register = (
         f"curl -X POST http://127.0.0.1:{manager_port}/terminal/register-manual \\\n"
         f'  -H "X-Api-Key: {API_KEY}" -H "Content-Type: application/json" \\\n'
@@ -121,6 +151,14 @@ def _banner(bank: Bank, host: str, port: int, manager_port: int) -> None:
     body.append(f"protocol {bank.protocol}\n\n", style="dim")
     body.append("Listening on  ", style="dim")
     body.append(f"{host}:{port}\n\n", style="bold green")
+    body.append(f"Мерчантів: {len(merchants)}\n", style="dim")
+    for index, merchant in enumerate(merchants):
+        body.append(
+            f"  {index + 1}. {merchant.merchant_name}  "
+            f"MID {merchant.merchant_id}  TID {merchant.terminal_id}\n",
+            style="white",
+        )
+    body.append("\n")
     body.append("Register it in the manager (once):\n", style="dim")
     body.append(register + "\n\n", style="yellow")
     body.append("Wire traffic → ", style="dim")
@@ -183,9 +221,12 @@ def main() -> None:
     parser.add_argument("--kind", choices=list(BANKS_BY_KEY), default=None,
                         help="start straight on this bank instead of the menu")
     parser.add_argument("--manager-port", type=int, default=9999)
-    parser.add_argument("--merchant-id", default="00000012345")
-    parser.add_argument("--merchant-name", default="EMULATOR MERCHANT")
-    parser.add_argument("--terminal-id", default="EMU00001")
+    parser.add_argument("--merchant-id", default=DEFAULT_MERCHANT_ID,
+                        help="id of the first merchant")
+    parser.add_argument("--merchant-name", default=DEFAULT_MERCHANT_NAME,
+                        help="name of the first merchant")
+    parser.add_argument("--terminal-id", default=DEFAULT_TERMINAL_ID,
+                        help="terminal id of the first merchant")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -203,11 +244,21 @@ def main() -> None:
         console.print("[dim]Нічого не вибрано — вихід.[/]")
         return
 
+    # A start with `--kind` skips the menus and uses one merchant; the idle
+    # menu switches the count later.
+    merchant_count: Optional[int] = (
+        1 if args.kind else _select_merchant_count(current=1)
+    )
+    if merchant_count is None:
+        console.print("[dim]Нічого не вибрано — вихід.[/]")
+        return
+
     server: Optional[EmulatorServer] = None
     running_bank: Optional[Bank] = None
+    running_merchants: Optional[int] = None
     try:
         while True:
-            if selected is not running_bank:
+            if selected is not running_bank or merchant_count != running_merchants:
                 if server is not None:
                     server.stop()
                 emulator = selected.build(
@@ -215,19 +266,27 @@ def main() -> None:
                     merchant_id=args.merchant_id,
                     merchant_name=args.merchant_name,
                     terminal_id=args.terminal_id,
+                    merchant_count=merchant_count,
                     on_traffic=on_traffic,
                 )
                 port = args.port or selected.port
                 server = EmulatorServer(args.host, port, emulator)
                 server.start()
                 running_bank = selected
-                _banner(selected, args.host, port, args.manager_port)
+                running_merchants = merchant_count
+                _banner(selected, args.host, port, args.manager_port,
+                        emulator.merchants)
 
             action = questionary.select(
                 "Режим очікування:",
                 choices=[
                     Choice(title="⏳  Чекати на транзакції", value="wait"),
                     Choice(title="🔀  Змінити термінал", value="switch"),
+                    Choice(
+                        title="🏪  Змінити кількість мерчантів  "
+                              f"({MERCHANT_COUNT_LABELS[merchant_count]})",
+                        value="merchants",
+                    ),
                     Choice(title="⏻   Вихід", value="quit"),
                 ],
                 style=MENU_STYLE, qmark="›", instruction="(↑/↓, Enter)",
@@ -239,6 +298,10 @@ def main() -> None:
                 picked = _select_bank(current=running_bank)
                 if picked is not None:
                     selected = picked
+            elif action == "merchants":
+                picked_count = _select_merchant_count(current=merchant_count)
+                if picked_count is not None:
+                    merchant_count = picked_count
             else:  # quit or Esc/Ctrl-C on the menu
                 break
     except (KeyboardInterrupt, EOFError):

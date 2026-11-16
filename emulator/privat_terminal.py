@@ -68,7 +68,10 @@ class PrivatTerminalEmulator(BankEmulator):
             }}
         if msg_type == "getMerchantList":
             # index-based dict, per PB spec §6.4
-            return {"error": False, "params": {"0": self.merchant_name}}
+            return {"error": False, "params": {
+                str(index): merchant.merchant_name
+                for index, merchant in enumerate(self.merchants)
+            }}
         if msg_type == "interrupt":
             self.interrupt_current()
             return {"error": False, "params": {"interruptTransmitted": True}}
@@ -138,7 +141,7 @@ class PrivatTerminalEmulator(BankEmulator):
             "pan": "**1234",
             "paymentSystem": "Visa",
             "bankAcquirer": "EMULATOR BANK",
-            "terminalId": self.terminal_id,
+            "terminalId": self.merchants[0].terminal_id,
             "posEntryMode": "07",
             "invoiceNumber": f"{random.randint(0, 999999):06d}",
         }}

@@ -12,10 +12,20 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
+from typing import Optional
 
 import pytest
 
-from emulator.base_terminal import EmulatorServer, Pending
+from emulator.base_terminal import (
+    DEFAULT_MERCHANT_ID,
+    DEFAULT_MERCHANT_NAME,
+    DEFAULT_TERMINAL_ID,
+    EmulatorServer,
+    Merchant,
+    Pending,
+    _step_id,
+    build_merchants,
+)
 from emulator.bpos_terminal import BposTerminalEmulator
 from emulator.oschad_terminal import OschadTerminalEmulator
 from emulator.posapi_terminal import PosApiTerminalEmulator
@@ -55,6 +65,35 @@ def _reg(host: str, port: int, kind: TerminalKind) -> TerminalRegistration:
         ),
         kind=kind, default_merchant_id="M1",
     )
+
+
+def _wire_merchant_ids(name: str, merchants: list[Merchant]) -> list[str]:
+    """How each protocol addresses a merchant in its requests.
+
+    PrivatBank names the merchant's INDEX in getMerchantList (spec 6.4);
+    every other protocol carries the merchant id itself.
+    """
+    if name == "privat":
+        return [str(index) for index in range(len(merchants))]
+    return [m.merchant_id for m in merchants]
+
+
+#: Protocols whose merchant-list entry carries a terminal id of its own. The
+#: other three answer with the merchant id and the name only, so their
+#: adapters have no terminal id to report.
+PROTOCOLS_WITH_WIRE_TERMINAL_ID = frozenset({"ssi", "posapi"})
+
+
+def _wire_terminal_ids(name: str, merchants: list[Merchant]) -> list[Optional[str]]:
+    """The terminal id each protocol reports per merchant-list entry.
+
+    SSI (`GetMerchantListDetailed`) and PosAPI (`GET_MERCHANTS`) carry one per
+    entry; BPOS (cmd `80`), Oschad (`merchants`) and PrivatBank
+    (`getMerchantList`) carry none, so the adapter reports None.
+    """
+    if name in PROTOCOLS_WITH_WIRE_TERMINAL_ID:
+        return [m.terminal_id for m in merchants]
+    return [None] * len(merchants)
 
 
 def _auto_operator(decisions: "queue.Queue[Pending]", decision: str) -> threading.Event:
@@ -132,10 +171,10 @@ REFUND_CASES = [
 ]
 
 
-def _run(server_emu, body, decision=None):
+def _run(server_emu, body, decision=None, merchant_count=1):
     """Підняти емулятор, виконати корутину проти нього, прибрати за собою."""
     decisions: "queue.Queue[Pending]" = queue.Queue()
-    emulator = server_emu(decisions=decisions)
+    emulator = server_emu(decisions=decisions, merchant_count=merchant_count)
     server = EmulatorServer("127.0.0.1", 0, emulator)
     server.start()
     stop = _auto_operator(decisions, decision) if decision else None
@@ -315,3 +354,95 @@ def test_privat_receipt_lookup_does_not_ask_the_operator_to_approve_money():
     assert response["error"] is False
     assert response["params"]["invoiceNumber"] == "000777"
     assert decisions.empty(), "у оператора спитали про довідку як про оплату"
+
+
+# ---------- two merchants on one terminal ----------
+
+
+def test_the_derived_second_merchant_is_distinct_from_the_first():
+    """One merchant stays exactly what it has always been, and the second is
+    told apart by every field an operation can be addressed by."""
+    one = build_merchants(1)
+    two = build_merchants(2)
+
+    assert len(one) == 1
+    assert two[0] == one[0]
+    assert two[1].merchant_id != two[0].merchant_id
+    assert two[1].terminal_id != two[0].terminal_id
+    assert two[1].merchant_name != two[0].merchant_name
+
+
+@pytest.mark.parametrize("count", [1, 2], ids=["one", "two"])
+@pytest.mark.parametrize("name,emu_cls,adapter_cls,kind", CASES,
+                         ids=[c[0] for c in CASES])
+def test_adapter_lists_every_merchant_the_terminal_has(
+    name, emu_cls, adapter_cls, kind, count,
+):
+    """`list_merchants` feeds the payment window's merchant select, so each
+    emulator has to report all of them in the shape its own adapter parses."""
+    expected = build_merchants(count)
+
+    async def body(port):
+        adapter = adapter_cls(_reg("127.0.0.1", port, kind))
+        return await adapter.list_merchants()
+
+    merchants, _ = _run(emu_cls, body, merchant_count=count)
+
+    assert [m.merchant_id for m in merchants] == _wire_merchant_ids(name, expected)
+    assert [m.merchant_name for m in merchants] == [m.merchant_name for m in expected]
+    # A terminal id reported for the wrong entry is worse than none: the
+    # manager keys a stored merchant nickname on (merchant id, terminal id).
+    assert [m.terminal_id for m in merchants] == _wire_terminal_ids(name, expected)
+
+
+def test_one_merchant_keeps_the_documented_default_values():
+    """The single-merchant terminal is what the README and the register `curl`
+    describe, so the three defaults are pinned by value."""
+    one = build_merchants(1)
+
+    assert len(one) == 1
+    assert one[0].merchant_id == "00000012345"
+    assert one[0].merchant_name == "EMULATOR MERCHANT"
+    assert one[0].terminal_id == "EMU00001"
+    # And the module constants are the same values the emulator is started with.
+    assert DEFAULT_MERCHANT_ID == "00000012345"
+    assert DEFAULT_MERCHANT_NAME == "EMULATOR MERCHANT"
+    assert DEFAULT_TERMINAL_ID == "EMU00001"
+
+
+@pytest.mark.parametrize("value,position,expected", [
+    # Leading zeros are part of the id width a terminal reports.
+    ("00000012345", 2, "00000012346"),
+    ("EMU00001", 2, "EMU00002"),
+    # A carry needs one more digit than the value had.
+    ("9", 2, "10"),
+    ("99", 2, "100"),
+    ("EMU99", 2, "EMU100"),
+    # No trailing digits to step: the position is appended instead.
+    ("abc", 2, "abc-2"),
+    # Position 1 is the first merchant, which keeps its id as given.
+    ("00000012345", 1, "00000012345"),
+    ("EMU00001", 1, "EMU00001"),
+])
+def test_step_id_moves_the_trailing_number_and_keeps_its_width(
+    value, position, expected,
+):
+    assert _step_id(value, position) == expected
+
+
+@pytest.mark.parametrize("value", ["00000012345", "9", "99", "abc"])
+def test_step_id_does_not_collide_with_the_value_it_steps_from(value):
+    """Two merchants addressed by the same id are one merchant."""
+    assert _step_id(value, 2) != value
+
+
+def test_the_second_merchant_is_derived_from_custom_ids_without_collision():
+    """Custom `--merchant-id` / `--terminal-id` with no trailing number still
+    produce a second merchant told apart by every field."""
+    two = build_merchants(
+        2, merchant_id="abc", merchant_name="SHOP", terminal_id="tid",
+    )
+
+    assert [m.merchant_id for m in two] == ["abc", "abc-2"]
+    assert [m.terminal_id for m in two] == ["tid", "tid-2"]
+    assert [m.merchant_name for m in two] == ["SHOP", "SHOP 2"]

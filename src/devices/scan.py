@@ -22,6 +22,7 @@ from typing import Optional
 import usb.core
 import usb.util
 
+from src.devices import win_queue
 from src.models.printer import (
     NetworkAddress,
     PrinterDescriptor,
@@ -995,11 +996,22 @@ def discover_windows_printers() -> list[PrinterDescriptor]:
             name = entry[2]
             if not name:
                 continue
+            state = win_queue.read_queue(name)
+            address = WindowsSpoolerAddress(printer_name=name)
+            if state is not None:
+                logger.info("Windows spooler queue found: %s", state.describe())
+                address = WindowsSpoolerAddress(
+                    printer_name=name,
+                    port_name=state.port,
+                    driver_name=state.driver,
+                    status_flags=state.flags,
+                    jobs=state.jobs,
+                )
             found.append(PrinterDescriptor(
                 id=make_id(PrinterTransport.windows_spooler, name),
                 transport=PrinterTransport.windows_spooler,
                 label=name,
-                windows=WindowsSpoolerAddress(printer_name=name),
+                windows=address,
             ))
     except Exception as exc:  # noqa: BLE001
         logger.warning("Windows printer enumeration failed: %s", exc)

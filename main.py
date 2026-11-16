@@ -13,28 +13,43 @@
 # і не встигала.
 import sys as _sys
 
-if _sys.stdout is None or _sys.stderr is None:
-    # Знайдено ревʼю: голий `open()` тут — гірша вада, ніж та, яку він лікує.
-    # Тека даних може бути незаписуваною (антивірус тримає файл, диск повний,
-    # том лише на читання), і тоді виняток летить на самому верху модуля,
-    # ДО будь-якої обробки помилок. У windowed-збірці це абсолютна тиша:
-    # ні консолі, ні діалогу, ні лога — застосунок просто не стартує.
-    #
-    # Тому: пробуємо файл, не вийшло — беремо /dev/null. Логування без
-    # консолі ми все одно не втрачаємо (є ротаційний файловий хендлер), а
-    # головне — жоден бібліотечний `StreamHandler` не отримає None.
+# The stream that stands in for a missing stdout/stderr, or None. It is a file
+# of its own, never bhm.log: the rotating handler renames bhm.log to bhm.log.1,
+# and on Windows that rename fails (WinError 32) while a second handle on the
+# file is open, after which every record became a traceback.
+_FALLBACK_STREAM = None
+FALLBACK_LOG_NAME = "bhm.stderr.log"
+
+
+def _open_fallback_stream():
+    """Open the stand-in for a missing stdout/stderr.
+
+    A bare `open()` here would be worse than the defect it treats: the data
+    folder may be unwritable (an antivirus holds the file, the disk is full,
+    the volume is read-only), and the exception would fly at the very top of
+    the module, before any error handling. In a windowed build that is total
+    silence: no console, no dialog, no log, the app just does not start. So:
+    try the file, otherwise /dev/null. Logging is not lost either way (the
+    rotating file handler writes bhm.log), and no library StreamHandler gets
+    None.
+    """
     try:
         from src.config import APP_DIR as _APP_DIR
 
-        _devlog = open(_APP_DIR / "bhm.log", "a", encoding="utf-8")
-    except Exception:  # noqa: BLE001 — старт важливіший за цей файл
+        return open(_APP_DIR / FALLBACK_LOG_NAME, "a", encoding="utf-8")
+    except Exception:  # noqa: BLE001 — starting matters more than this file
         import os as _os
 
-        _devlog = open(_os.devnull, "w", encoding="utf-8")
+        return open(_os.devnull, "w", encoding="utf-8")
+
+
+if _sys.stdout is None or _sys.stderr is None:
+    _devlog = _open_fallback_stream()
     if _sys.stdout is None:
         _sys.stdout = _devlog
     if _sys.stderr is None:
         _sys.stderr = _devlog
+    _FALLBACK_STREAM = _devlog
 
 import logging
 import logging.handlers
@@ -115,6 +130,15 @@ def _is_dead_stream(handler: logging.StreamHandler) -> bool:
     return not callable(getattr(stream, "write", None))
 
 
+def _writes_to_fallback(handler: logging.Handler) -> bool:
+    return (
+        _FALLBACK_STREAM is not None
+        and isinstance(handler, logging.StreamHandler)
+        and not isinstance(handler, logging.FileHandler)
+        and getattr(handler, "stream", None) is _FALLBACK_STREAM
+    )
+
+
 def _configure_logging(cfg: dict) -> None:
     """Bind every logger (ours + uvicorn + fastapi) to a rotating file
     so a busy week of receipts doesn't fill the disk.
@@ -161,6 +185,11 @@ def _configure_logging(cfg: dict) -> None:
         if isinstance(existing, logging.handlers.RotatingFileHandler):
             root.removeHandler(existing)
         elif isinstance(existing, logging.StreamHandler) and _is_dead_stream(existing):
+            root.removeHandler(existing)
+        elif _writes_to_fallback(existing):
+            # A library's basicConfig() handler bound to the stand-in stream:
+            # it would copy every record, without a timestamp, into
+            # bhm.stderr.log. bhm.log already has them.
             root.removeHandler(existing)
     root.addHandler(handler)
 
