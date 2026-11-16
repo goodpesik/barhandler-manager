@@ -616,6 +616,22 @@ async def _cmd_terminal_discover(args: dict) -> dict:
         return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
 
+async def _cmd_spooler_queues(args: dict) -> dict:
+    """Read-only: every Windows print queue with port, driver, status, jobs."""
+    from src.devices import win_queue
+
+    try:
+        queues = await asyncio.to_thread(win_queue.list_queues)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+    if queues is None:
+        return {"ok": False, "error": "win32print is not available (not Windows)"}
+    return {
+        "ok": True,
+        "queues": [{"name": q.name, **q.as_dict()} for q in queues],
+    }
+
+
 _DIAGNOSTICS: dict[str, Callable[..., Awaitable[dict]]] = {
     "usb_probe": _cmd_usb_probe,
     "list_interfaces": _cmd_list_interfaces,
@@ -628,6 +644,7 @@ _DIAGNOSTICS: dict[str, Callable[..., Awaitable[dict]]] = {
     "tail_log": _cmd_tail_log,
     "list_terminals": _cmd_list_terminals,
     "dump_config": _cmd_dump_config,
+    "spooler_queues": _cmd_spooler_queues,
 }
 
 # Команди, яким потрібен конфіг менеджера — його передає make_callback().

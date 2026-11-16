@@ -79,6 +79,12 @@ class WindowsSpoolerAddress(BaseModel):
     """A named printer in the Windows print spooler (win32print)."""
 
     printer_name: str
+    # Queue details read at discovery (GetPrinter level 2), so support can see
+    # which queue sits on which port. A snapshot, not live state.
+    port_name: Optional[str] = None
+    driver_name: Optional[str] = None
+    status_flags: Optional[list[str]] = None
+    jobs: Optional[int] = None
 
 
 class PrinterDescriptor(BaseModel):
