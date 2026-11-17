@@ -112,7 +112,12 @@ async def test_a_failed_pass_does_not_stop_the_keeper(monkeypatch, tmp_path) -> 
         extract_keeper.keep_extraction_alive(str(tmp_path), every=0, check=0.01),
     )
     try:
-        await asyncio.sleep(0.1)
+        # Wait for the pass after the failed one, bounded so a dead keeper fails fast.
+        async def _second_pass():
+            while len(calls) < 2 and not task.done():
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(_second_pass(), timeout=5)
         assert not task.done(), "the keeper died on one bad pass"
         assert len(calls) >= 2
 
