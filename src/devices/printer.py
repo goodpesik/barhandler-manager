@@ -76,6 +76,11 @@ _CONNECT_TIMEOUT_S = 10.0
 # скінчиться; ми лише перестаємо на нього чекати.
 _CLOSE_WAIT_S = 5.0
 
+# How long a queue-checked job waits for the spooler's queue state. A spooler
+# that does not answer within this time is treated like an unreadable queue:
+# the job is sent and a warning is logged.
+_QUEUE_READ_TIMEOUT_S = 3.0
+
 
 def _settle_from(source: asyncio.Future, target: asyncio.Future) -> None:
     """Коли `source` завершиться — віддати його результат у `target`."""
@@ -112,6 +117,14 @@ class PrintRenderError(PrinterUnavailable):
 
     def __init__(self, message: str) -> None:
         super().__init__(message, code="render_failed")
+
+
+# Jobs that read the Windows queue state before they are sent and are refused
+# (PrinterUnavailable with the queue code) when the queue cannot print.
+# Receipt, fiscal, text, lines, kitchen and drawer jobs are sent without the
+# read: some Windows USB drivers raise a spurious offline flag while printing
+# works.
+QUEUE_CHECKED_ACTIONS = frozenset({"test-print", "label"})
 
 
 class PrinterDevice:
@@ -261,20 +274,18 @@ class PrinterDevice:
         return self._config.get("printer_name") or None
 
     def spool_queue_refusal(self) -> Optional[PrinterUnavailable]:
-        """Refusal for a test print on a queue that cannot print; None otherwise.
+        """Refusal for a job on a queue that cannot print; None otherwise.
 
         Win32Raw accepts a job into an offline, paused or failed queue without
-        complaint, so the test print reads the spooler's own state first.
-        Receipts and other jobs never read it: some Windows USB drivers raise
-        a spurious offline flag while printing works. None when the device is
-        not a spooler or the queue cannot be read.
+        complaint, so jobs whose action is in QUEUE_CHECKED_ACTIONS read the
+        spooler's own state first. None when the device is not a spooler or
+        the queue cannot be read (read_queue logs that at warning level).
         """
         state = win_queue.read_queue(self.spool_queue_name or "")
         if state is None:
             return None
         problem = state.problem()
         if problem is None:
-            logger.info("[%s] spooler queue ready: %s", self.name, state.describe())
             return None
         code, reason = problem
         logger.warning("[%s] spooler queue refused (%s): %s", self.name, code, state.describe())
@@ -575,7 +586,9 @@ class PrinterDevice:
 
         `job` is `async def fn(printer): ...` — it receives the live
         python-escpos printer instance and is free to issue any commands.
-        Raises PrinterUnavailable if the device isn't connected.
+        Raises PrinterUnavailable if the device isn't connected, or, for an
+        action in QUEUE_CHECKED_ACTIONS, if its Windows queue cannot print —
+        both before the job reaches the worker.
 
         PET-1087 — the journal row is written by the WORKER, not here. The
         first version recorded the outcome around this `await`, and review
@@ -591,6 +604,22 @@ class PrinterDevice:
                 self.name, action, work_journal.STATUS_FAILED, "printer is not connected",
             )
             raise PrinterUnavailable(f"{self.name} printer is not connected")
+        if action in QUEUE_CHECKED_ACTIONS and self.spool_queue_name:
+            try:
+                refusal = await asyncio.wait_for(
+                    asyncio.to_thread(self.spool_queue_refusal), _QUEUE_READ_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[%s] spooler queue state not read within %.1f s; sending the job",
+                    self.name, _QUEUE_READ_TIMEOUT_S,
+                )
+                refusal = None
+            if refusal is not None:
+                work_journal.record_printer(
+                    self.name, action, work_journal.STATUS_FAILED, str(refusal),
+                )
+                raise refusal
         loop = asyncio.get_running_loop()
         done: asyncio.Future = loop.create_future()
         await self._queue.put((job, done, action))
