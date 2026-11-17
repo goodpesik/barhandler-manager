@@ -365,10 +365,44 @@ def test_a_label_is_printed_when_the_queue_cannot_be_read(client, auth_headers, 
     assert "print" in spooler.events
 
 
-def test_only_test_print_and_label_read_the_queue_before_sending():
-    from src.devices.printer import QUEUE_CHECKED_ACTIONS
+def test_a_label_is_sent_when_the_queue_read_never_returns(monkeypatch):
+    import threading
 
-    assert QUEUE_CHECKED_ACTIONS == {"test-print", "label"}
+    from src.devices import printer as printer_module
+    from src.devices import win_queue
+
+    release = threading.Event()
+
+    def _hung_read(name):
+        release.wait()
+        return None
+
+    monkeypatch.setattr(win_queue, "read_queue", _hung_read)
+    monkeypatch.setattr(printer_module, "_QUEUE_READ_TIMEOUT_S", 0.2)
+
+    async def body():
+        dev = PrinterDevice("spool", {
+            "enabled": True, "paper_width": 58, "render_mode": "native",
+            "code_page": None, "connection": "windows_spooler",
+            "printer_name": "XP-58",
+        })
+        spooler = _JobSpooler()
+        dev._printer = spooler
+        dev._worker_task = asyncio.create_task(dev._worker())
+
+        async def job(printer):
+            printer._raw(b"LABEL")
+
+        try:
+            await dev.enqueue(job, action="label")
+            return list(spooler.events)
+        finally:
+            release.set()   # let the stuck read thread end so the loop can close
+            await dev.disconnect()
+
+    events = asyncio.run(asyncio.wait_for(body(), timeout=3))
+
+    assert "print" in events
 
 
 def test_a_receipt_on_an_offline_flagged_queue_makes_no_queue_read_and_is_sent(monkeypatch):
