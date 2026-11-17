@@ -186,13 +186,13 @@ server:
 | `/devices/register` | POST | Зареєструвати принтер (роль / псевдонім / ширина паперу). |
 | `/devices/register-usb-manual` | POST | Зареєструвати USB-принтер за VID/PID/ендпоінтами (коли скан не бачить). |
 | `/devices/{id}` | DELETE | Видалити з реєстру. |
-| `/devices/{id}/test-print` | POST | Демо-чек. |
+| `/devices/{id}/test-print` | POST | Демо-чек. Принтер через спулер Windows: черга, яка не може друкувати (офлайн, «Використовувати принтер автономно», пауза, помилка, немає паперу, відкрита кришка), — 503 з кодом `queue_offline` / `queue_paused` / `queue_error` / `out_of_paper` / `cover_open`, завдання не надсилається. Стан черги не прочитано — друк виконується. |
 | `/print/receipt` | POST | Нефіскальний чек. |
 | `/print/fiscal` | POST | Фіскальний чек (Вчасно-стиль) з QR-кодом. |
 | `/print/text` | POST | Сирий текст (вихід Checkbox `/text`). |
 | `/print/lines` | POST | Структуровані рядки з форматуванням. |
 | `/print/kitchen` | POST | Кухонна квитанція. |
-| `/print/label` | POST | Лейбл — base64 PNG, автомасштаб, без відрізу. |
+| `/print/label` | POST | Лейбл — base64 PNG, автомасштаб, без відрізу. Черга спулера Windows перевіряється так само, як для `/devices/{id}/test-print`. |
 | `/drawer/open` | POST | Імпульс на грошову скриньку. |
 | `/terminal/discover` | POST | Скан LAN для POS-терміналів. |
 | `/terminal/register` | POST | Зареєструвати термінал. |
@@ -411,13 +411,13 @@ Paper width, drawer pin, code page — configured through the web app UI and sto
 | `/devices/register` | POST | Register a printer (role / nickname / paper width). |
 | `/devices/register-usb-manual` | POST | Register a USB printer by VID/PID/endpoints (when the scan can't see it). |
 | `/devices/{id}` | DELETE | Unregister a printer. |
-| `/devices/{id}/test-print` | POST | Demo receipt. |
+| `/devices/{id}/test-print` | POST | Demo receipt. Windows spooler printer: a queue that cannot print (offline, «Use Printer Offline», paused, error, paper out, cover open) → 503 with code `queue_offline` / `queue_paused` / `queue_error` / `out_of_paper` / `cover_open`; the job is not sent. Queue state not readable → the job is sent. |
 | `/print/receipt` | POST | Non-fiscal receipt. |
 | `/print/fiscal` | POST | Fiscal receipt (Vchasno layout) with QR code. |
 | `/print/text` | POST | Raw pre-formatted text (Checkbox `/text` output). |
 | `/print/lines` | POST | Structured lines with per-line formatting. |
 | `/print/kitchen` | POST | Kitchen ticket. |
-| `/print/label` | POST | Label — base64 PNG, auto-scaled, no cut. |
+| `/print/label` | POST | Label — base64 PNG, auto-scaled, no cut. The Windows spooler queue is checked as for `/devices/{id}/test-print`. |
 | `/drawer/open` | POST | Pulse the cash drawer. |
 | `/terminal/discover` | POST | LAN scan for POS terminals. |
 | `/terminal/register` | POST | Register a terminal. |

@@ -201,7 +201,11 @@ class _JobSpooler(Dummy):
         self.events.append("close")
 
 
-def _spooler_test_print(client, auth_headers, monkeypatch, win32print, job_id=7):
+def _spooler_test_print(
+    client, auth_headers, monkeypatch, win32print, job_id=7, kind="receipt", send=None,
+):
+    """Register «XP-58» as a spooler printer of `kind` and run `send(desc_id)`
+    (default: its test print)."""
     from src.devices import scan, win_queue
 
     monkeypatch.setitem(sys.modules, "win32print", win32print)
@@ -215,7 +219,7 @@ def _spooler_test_print(client, auth_headers, monkeypatch, win32print, job_id=7)
     client.post("/devices/discover", headers=auth_headers)
     r = client.post(
         "/devices/register", headers=auth_headers,
-        json={"id": desc.id, "kind": "receipt", "paper_width": 58, "render_mode": "native"},
+        json={"id": desc.id, "kind": kind, "paper_width": 58, "render_mode": "native"},
     )
     assert r.status_code == 200, r.text
 
@@ -235,7 +239,9 @@ def _spooler_test_print(client, auth_headers, monkeypatch, win32print, job_id=7)
         return holder["dev"]
 
     monkeypatch.setattr(client.app.state.registry, "get_device", _device)
-    return client.post(f"/devices/{desc.id}/test-print", headers=auth_headers), spooler
+    if send is None:
+        return client.post(f"/devices/{desc.id}/test-print", headers=auth_headers), spooler
+    return send(desc.id), spooler
 
 
 @pytest.mark.parametrize(
@@ -307,6 +313,62 @@ def test_an_unknown_job_id_is_printed_without_waiting(client, auth_headers, monk
     assert r.status_code == 200
     assert r.json()["status"] == "printed"
     assert asked == []
+
+
+def _label_print(client, auth_headers):
+    import base64
+    import io
+
+    from PIL import Image
+
+    png = io.BytesIO()
+    Image.new("RGB", (40, 20), "white").save(png, format="PNG")
+    body = {"image_base64": base64.b64encode(png.getvalue()).decode()}
+    return lambda pid: client.post(
+        f"/print/label?printer_id={pid}", headers=auth_headers, json=body,
+    )
+
+
+@pytest.mark.parametrize(
+    ("queue", "code"),
+    [
+        ({"attributes": _WORK_OFFLINE}, "queue_offline"),
+        ({"status": _PAUSED}, "queue_paused"),
+    ],
+)
+def test_a_label_on_a_queue_that_cannot_print_is_refused_before_anything_is_sent(
+    client, auth_headers, monkeypatch, queue, code,
+):
+    r, spooler = _spooler_test_print(
+        client, auth_headers, monkeypatch, _fake_win32print(**queue),
+        kind="label", send=_label_print(client, auth_headers),
+    )
+
+    assert r.status_code == 503
+    assert r.json()["detail"]["code"] == code
+    assert spooler.events == []
+
+
+def test_a_label_is_printed_when_the_queue_cannot_be_read(client, auth_headers, monkeypatch):
+    fake = _fake_win32print(attributes=_WORK_OFFLINE)
+
+    def _refuse(name):
+        raise OSError("spooler unavailable")
+
+    fake.OpenPrinter = _refuse
+    r, spooler = _spooler_test_print(
+        client, auth_headers, monkeypatch, fake,
+        kind="label", send=_label_print(client, auth_headers),
+    )
+
+    assert r.status_code == 200, r.text
+    assert "print" in spooler.events
+
+
+def test_only_test_print_and_label_read_the_queue_before_sending():
+    from src.devices.printer import QUEUE_CHECKED_ACTIONS
+
+    assert QUEUE_CHECKED_ACTIONS == {"test-print", "label"}
 
 
 def test_a_receipt_on_an_offline_flagged_queue_makes_no_queue_read_and_is_sent(monkeypatch):

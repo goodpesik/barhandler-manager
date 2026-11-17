@@ -44,6 +44,24 @@ first print to that ID and kept warm afterwards.
 | `POST /print/fiscal[?printer_id=]`  | yes | unified fiscal (Checkbox + Vchasno) — Vchasno-PDF look |
 | `POST /print/text[?printer_id=]`    | yes | raw text (Checkbox `/api/v1/receipts/{id}/text`) |
 | `POST /print/kitchen[?printer_id=]` | yes | kitchen ticket (large item names, no totals) |
+| `POST /print/label[?printer_id=]`   | yes | label image (base64 PNG); Windows spooler queue checked before sending, as for `test-print` |
+
+Windows spooler queue check (`POST /devices/{id}/test-print`, `POST /print/label`):
+the queue state is read before the job is sent. A queue that cannot print is
+refused with HTTP 503 and `detail = {code, message}`; nothing is sent to the
+queue. `message` names the queue and the spooler flags.
+
+| Queue state (spooler flags) | `detail.code` |
+|---|---|
+| `offline`, `not_available`, `work_offline` («Use Printer Offline») | `queue_offline` |
+| `paused` | `queue_paused` |
+| `paper_out` | `out_of_paper` |
+| `door_open` | `cover_open` |
+| `error`, `paper_jam`, `paper_problem`, `user_intervention`, `pending_deletion`, `server_unknown` | `queue_error` |
+
+When the queue state cannot be read (spooler call fails), the job is sent and a
+warning is logged. `/print/receipt`, `/print/fiscal`, `/print/text`,
+`/print/lines`, `/print/kitchen` and `/drawer/open` do not read the queue state.
 | `POST /drawer/open[?printer_id=]` | yes | pulse cash drawer |
 | `POST /terminal/charge` | yes | Phase 2 stub (Monobank acquiring) |
 
