@@ -391,10 +391,6 @@ async def test_print(printer_id: str, request: Request) -> dict:
         raise HTTPException(status_code=503, detail=f"printer connect failed: {exc}")
     if not device.is_connected():
         raise HTTPException(status_code=503, detail="printer_unavailable")
-    if getattr(device, "spool_queue_name", None):
-        refusal = await asyncio.to_thread(device.spool_queue_refusal)
-        if refusal is not None:
-            raise HTTPException(status_code=503, detail=_printer_detail(refusal))
 
     # Label printers in TSPL mode silently drop ESC/POS bytes, so the
     # legacy demo below would return 200 with nothing physically on the

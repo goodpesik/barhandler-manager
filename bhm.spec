@@ -69,6 +69,10 @@ hiddenimports += [
     "win32api",
     "win32con",
     "pywintypes",
+    # EnumJobs returns the job's submit time as a pywintypes datetime, which
+    # imports win32timezone at runtime; without it the spooler jobs cannot be
+    # read in the frozen build.
+    "win32timezone",
     # pyserial — serial/COM transport for USB terminals; list_ports has a
     # per-OS backend PyInstaller doesn't auto-detect.
     "serial",
