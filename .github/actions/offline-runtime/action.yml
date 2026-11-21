@@ -1,15 +1,16 @@
-# PET-971 — builds the Petshandler offline runtime for an installer:
-# the offline service (goodpesik/petshandler-offline), the offline build of
-# the app (goodpesik/petshandler-app) and the official Node binary, laid out
-# by scripts/build_offline_runtime.sh into <out>.
+# PET-971 — builds a product's offline runtime for an installer: the offline
+# service (goodpesik/<product>-offline), the offline build of the app
+# (goodpesik/<product>-app) and the official Node binary, laid out by
+# scripts/build_offline_runtime.sh into <out>. Petshandler's repos are the
+# defaults; FC-798 calls it again with FitStudioCRM's.
 #
 # Needs two secrets from the calling job:
 #   OFFLINE_REPO_TOKEN   read access to both private repos
-#   PETSHANDLER_APP_ENV  the app's .env, base64 (the build needs its VITE_* values)
+#   <PRODUCT>_APP_ENV    the app's .env, base64 (the build needs its VITE_* values)
 # The jobs call this only when OFFLINE_REPO_TOKEN is set, so a release without
 # them builds exactly as before, with no offline mode.
 name: offline-runtime
-description: Build the Petshandler offline runtime for the installers
+description: Build a product's offline runtime for the installers
 inputs:
   platform:
     description: win-x64 | darwin-arm64 | darwin-x64
@@ -23,12 +24,20 @@ inputs:
   app-env:
     description: the app's .env, base64
     required: true
+  service-repo:
+    description: the offline service's repository
+    required: false
+    default: goodpesik/petshandler-offline
+  app-repo:
+    description: the app's repository (its offline build is served by the service)
+    required: false
+    default: goodpesik/petshandler-app
   app-ref:
-    description: which ref of petshandler-app to build the offline app from
+    description: which ref of the app to build the offline app from
     required: false
     default: production
   service-ref:
-    description: which ref of petshandler-offline to build
+    description: which ref of the offline service to build
     required: false
     default: main
 runs:
@@ -36,13 +45,13 @@ runs:
   steps:
     - uses: actions/checkout@v4
       with:
-        repository: goodpesik/petshandler-offline
+        repository: ${{ inputs.service-repo }}
         ref: ${{ inputs.service-ref }}
         token: ${{ inputs.token }}
         path: .offline-src/service
     - uses: actions/checkout@v4
       with:
-        repository: goodpesik/petshandler-app
+        repository: ${{ inputs.app-repo }}
         ref: ${{ inputs.app-ref }}
         token: ${{ inputs.token }}
         path: .offline-src/app

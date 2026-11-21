@@ -1,9 +1,13 @@
-"""PET-972 — offline mode of Petshandler: activation, state, switching off.
+"""PET-972 — offline mode: activation, state, switching off.
 
-Petshandler (the online app, signed in as the shop's staff) takes a device
-token from the server and hands it here; this machine then keeps the offline
-service running for that shop. All three calls need the manager's API key,
-like the device routes; none of them returns a secret.
+The online app (signed in as the shop's staff) takes a device token from the
+server and hands it here; this machine then keeps the offline service running
+for that shop. All calls need the manager's API key, like the device routes;
+none of them returns a secret.
+
+FC-798 — every call is for one product's till: `?product=` (or `product` in
+the body), Petshandler when not said, so the Petshandler app and dashboard
+calls work as before. FitStudioCRM's till runs beside it.
 """
 
 from __future__ import annotations
@@ -17,32 +21,52 @@ import re
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from src.services import offline_secrets, offline_state
-from src.services.offline_service import OfflineService
+from src.services.offline_service import DEFAULT_PRODUCT, PRODUCTS, OfflineService
 
 log = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _service(request: Request) -> Optional[OfflineService]:
-    return getattr(request.app.state, "offline_service", None)
+def _product(request: Request, payload: Optional[dict] = None) -> str:
+    """Which product's till the call is for; an unknown one is refused."""
+    product = request.query_params.get("product") or (payload or {}).get("product") or DEFAULT_PRODUCT
+    if product not in PRODUCTS:
+        log.warning("offline: refused a call for unknown product %r", product)
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "offline_unknown_product", "message": "Офлайн-режим для цього продукту не підтримується."},
+        )
+    return product
 
 
-def _offered(request: Request) -> bool:
-    offer = getattr(request.app.state, "offline_offer", None)
+def _service(request: Request, product: str = DEFAULT_PRODUCT) -> Optional[OfflineService]:
+    services = getattr(request.app.state, "offline_services", None)
+    if services is not None:
+        return services.get(product)
+    return getattr(request.app.state, "offline_service", None) if product == DEFAULT_PRODUCT else None
+
+
+def _offered(request: Request, product: str = DEFAULT_PRODUCT) -> bool:
+    offers = getattr(request.app.state, "offline_offers", None)
+    if offers is not None:
+        offer = offers.get(product)
+    else:
+        offer = getattr(request.app.state, "offline_offer", None) if product == DEFAULT_PRODUCT else None
     return bool(offer is not None and offer.offered())
 
 
 @router.get("/status")
 async def status(request: Request) -> dict:
-    svc = _service(request)
+    product = _product(request)
+    svc = _service(request, product)
     result: dict = {
         # A build without the Node runtime cannot run offline mode at all.
         "available": svc is not None,
         # Whether the client app offers offline mode at all (off on
         # Petshandler's production for now). The dashboard shows the mode
         # only when it does, or when it is already on here.
-        "offered": _offered(request),
-        **offline_state.public_status(),
+        "offered": _offered(request, product),
+        **offline_state.public_status(product),
     }
     if svc is not None:
         st = svc.state
@@ -68,7 +92,8 @@ async def sync_now(request: Request) -> dict:
     Answers with what the sync did and the state after it, so the card can
     show the new «as of» and how much is still queued.
     """
-    svc = _service(request)
+    product = _product(request)
+    svc = _service(request, product)
     if svc is None:
         raise HTTPException(
             status_code=409,
@@ -96,7 +121,8 @@ async def sync_now(request: Request) -> dict:
         )
     st = svc.state
     log.info(
-        "offline sync now: %s%s, %s still queued",
+        "offline sync now (%s): %s%s, %s still queued",
+        product,
         ran.get("ran"),
         " (it did not go through)"
         if ran.get("failed")
@@ -120,7 +146,16 @@ async def sync_now(request: Request) -> dict:
 
 @router.post("/activate")
 async def activate(request: Request) -> dict:
-    if _service(request) is None:
+    try:
+        payload = await request.json()
+    except ValueError:
+        payload = None
+    if not isinstance(payload, dict):
+        payload = None
+    # The product is checked by the activation itself; only a known one picks
+    # its supervisor here (an unknown one finds none and is refused below).
+    wanted = str((payload or {}).get("product") or DEFAULT_PRODUCT)
+    if _service(request, wanted) is None and wanted in PRODUCTS:
         raise HTTPException(
             status_code=409,
             detail={
@@ -128,11 +163,7 @@ async def activate(request: Request) -> dict:
                 "message": "Ця версія Девайс менеджера не підтримує офлайн-режим. Оновіть менеджер.",
             },
         )
-    try:
-        payload = await request.json()
-    except ValueError:
-        payload = None
-    if not isinstance(payload, dict):
+    if payload is None:
         raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "Некоректний запит."})
     try:
         public = await asyncio.to_thread(offline_state.activate, payload)
@@ -160,8 +191,9 @@ async def activate(request: Request) -> dict:
 
 @router.post("/deactivate")
 async def deactivate(request: Request) -> dict:
-    svc = _service(request)
-    appid = offline_state.active_appid()
+    product = _product(request)
+    svc = _service(request, product)
+    appid = offline_state.active_appid(product)
     if not appid:
         return {"ok": True}
     # What the service says right now, not what it said a minute ago.
@@ -171,7 +203,7 @@ async def deactivate(request: Request) -> dict:
         # Not running (it never starts without its secrets) or not answering:
         # the queue is read from the local copy, so switching off does not
         # depend on the service it would switch off.
-        queued = await asyncio.to_thread(offline_state.queued_on_disk, appid)
+        queued = await asyncio.to_thread(offline_state.queued_on_disk, appid, product=product)
         log.info("offline switch-off: the service did not answer, queue on disk: %s", queued)
     pending = health.get("fiscalPending") if health else None
     if isinstance(pending, int) and not isinstance(pending, bool):
@@ -181,7 +213,7 @@ async def deactivate(request: Request) -> dict:
         # Not asked, or a service that does not say (an older build): the
         # counts the service keeps in the clear. A copy that cannot be read
         # (or judged) is refused, never taken for «nothing owed».
-        on_disk = await asyncio.to_thread(offline_state.fiscal_owed_on_disk, appid)
+        on_disk = await asyncio.to_thread(offline_state.fiscal_owed_on_disk, appid, product)
         fiscal_pending, fiscal_sessions = on_disk if on_disk is not None else (None, 0)
     try:
         offline_state.check_can_deactivate(
@@ -193,7 +225,7 @@ async def deactivate(request: Request) -> dict:
     # Secrets first: without them the supervisor cannot start the service
     # again in between. If they cannot be removed, nothing else is touched.
     try:
-        appid = await asyncio.to_thread(offline_state.forget)
+        appid = await asyncio.to_thread(offline_state.forget, product)
     except OSError as e:
         log.error("offline switch-off: secrets could not be removed: %s", e)
         raise HTTPException(
@@ -209,7 +241,7 @@ async def deactivate(request: Request) -> dict:
         # The data key is gone with the secrets: the local copy can no longer
         # be read, so it is removed even if the service misbehaved.
         if appid:
-            await asyncio.to_thread(offline_state.remove_data, appid)
+            await asyncio.to_thread(offline_state.remove_data, appid, product)
     return {"ok": True}
 
 
@@ -222,9 +254,10 @@ async def save_local_settings(request: Request) -> dict:
         payload = None
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "Некоректний запит."})
+    product = _product(request, payload)
     try:
         return await asyncio.to_thread(
-            offline_state.save_local_settings, str(payload.get("appid") or ""), payload.get("items"),
+            offline_state.save_local_settings, str(payload.get("appid") or ""), payload.get("items"), product,
         )
     except offline_state.ActivationError as e:
         # Not activated, or for another shop: the app simply has nothing to leave.
@@ -265,9 +298,9 @@ async def save_fiscal_key(request: Request) -> dict:
 
 
 @router.get("/local-settings")
-async def load_local_settings() -> dict:
+async def load_local_settings(request: Request) -> dict:
     """PET-973 — the offline build takes them when it starts."""
-    body = await asyncio.to_thread(offline_state.load_local_settings)
+    body = await asyncio.to_thread(offline_state.load_local_settings, _product(request))
     if body is None:
         raise HTTPException(status_code=404, detail={"code": "no_local_settings", "message": "Немає збережених налаштувань."})
     return body

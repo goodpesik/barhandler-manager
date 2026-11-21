@@ -244,8 +244,11 @@ def test_whatever_stops_the_manager_stops_the_offline_service(path, manager, off
     assert len(offlines) == len(managers), (path, len(managers), len(offlines))
 
 
-def _lifespan(config, monkeypatch, runtime_present: bool):
-    """Run the manager's lifespan once and report what the offline part did."""
+def _lifespan(config, monkeypatch, runtime_present: bool, products=("petshandler",)):
+    """Run the manager's lifespan once and report what the offline part did.
+
+    `products` — whose runtimes the build ships (FC-798); Petshandler's alone
+    unless a test says otherwise."""
     from unittest.mock import patch
 
     from fastapi.testclient import TestClient
@@ -265,13 +268,15 @@ def _lifespan(config, monkeypatch, runtime_present: bool):
     monkeypatch.setattr(offline_service.OfflineService, "stop", stop)
     monkeypatch.setattr(
         offline_service, "node_path",
-        lambda root=None: Path(__file__) if runtime_present else Path("/nonexistent/node"),
+        lambda root=None: Path(__file__)
+        if runtime_present and (root is None or root.name in products) else Path("/nonexistent/node"),
     )
     with patch("src.devices.scan.discover_usb", return_value=[]), \
          patch("src.devices.scan.discover_network", return_value=[]), \
          patch("src.devices.scan.discover_bluetooth", return_value=[]):
         with TestClient(create_app(config)) as c:
             has_service = hasattr(c.app.state, "offline_service")
+            _lifespan.services = dict(getattr(c.app.state, "offline_services", {}))
     return events, has_service
 
 
@@ -844,3 +849,47 @@ def test_status_says_how_many_fiscal_documents_are_unsent(said, shown):
     assert asyncio.run(svc.refresh()) is not None
     assert svc.state.extra["fiscalPending"] == shown
 
+
+
+# ---- FC-798: the FitStudioCRM till ---------------------------------------
+
+
+def test_a_build_with_both_runtimes_supervises_each_product_on_its_own_port(config, monkeypatch):
+    events, has_service = _lifespan(
+        config, monkeypatch, runtime_present=True, products=("petshandler", "fitstudiocrm"),
+    )
+    services = _lifespan.services
+    assert has_service and set(services) == {"petshandler", "fitstudiocrm"}
+    assert (services["petshandler"].port, services["fitstudiocrm"].port) == (9898, 9899)
+    assert events == ["run", "run", "stop", "stop"]
+
+
+def test_a_build_with_the_fit_runtime_alone_leaves_petshandler_alone(config, monkeypatch):
+    events, has_service = _lifespan(config, monkeypatch, runtime_present=True, products=("fitstudiocrm",))
+    assert not has_service and set(_lifespan.services) == {"fitstudiocrm"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answers_as, runs", [("fitstudiocrm-offline", True), ("petshandler-offline", False)])
+async def test_the_fit_supervisor_runs_only_its_own_service(fake, monkeypatch, answers_as, runs):
+    """Started with its config; the Petshandler service answering there is somebody else's program."""
+    make, configs = fake
+    monkeypatch.setenv("FAKE_NAME", answers_as)
+    svc = make(config={"appid": "studio", "deviceToken": "fso_secret", "deviceNumber": 2}, product="fitstudiocrm")
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        if runs:
+            assert await _until(lambda: svc.state.running)
+            assert configs()[-1]["deviceNumber"] == 2
+        else:
+            assert await _until(lambda: svc.state.last_error is not None)
+            assert not svc.state.running and "petshandler-offline" in svc.state.last_error
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+def test_the_fit_supervisor_takes_its_own_port_by_default():
+    assert OfflineService(lambda: None, argv=["n", "m"], expected_version="1", product="fitstudiocrm").port == 9899
+    assert OfflineService(lambda: None, argv=["n", "m"], expected_version="1").port == 9898

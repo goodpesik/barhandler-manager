@@ -42,17 +42,24 @@ log = logging.getLogger(__name__)
 #: A shop's appid and a device id: used in paths.
 # fullmatch everywhere: `$` also matches before a trailing newline.
 _SAFE_ID = re.compile(r"[A-Za-z0-9_.-]{1,64}")
-#: The server the token was issued by: https, /api, and a host on the
-#: product's own list (PRODUCTS[…].api_hosts).
-_API_BASE = re.compile(r"https://([A-Za-z0-9.-]+)/api/?")
+#: The highest till number a shop's computers may take (FC-798).
+MAX_DEVICE_NUMBER = 99
 
 
-def offline_root() -> Path:
-    return APP_DIR / "offline"
+def _api_base_pattern(product: str) -> "re.Pattern[str]":
+    """The server the token was issued by: https, the product's own path
+    (/api for Petshandler) and a host on its list (PRODUCTS[…].api_hosts)."""
+    return re.compile(r"https://([A-Za-z0-9.-]+)" + re.escape(PRODUCTS[product].api_path) + r"/?")
 
 
-def shop_folder(appid: str) -> Path:
-    return offline_root() / appid
+def offline_root(product: str = DEFAULT_PRODUCT) -> Path:
+    """FC-798 — each product's shops in a folder of its own: two tills of
+    different products on one computer never share a marker or a copy."""
+    return APP_DIR / PRODUCTS[product].data_folder
+
+
+def shop_folder(appid: str, product: str = DEFAULT_PRODUCT) -> Path:
+    return offline_root(product) / appid
 
 
 class ActivationError(ValueError):
@@ -63,9 +70,9 @@ def _write_json(path: Path, value: dict) -> None:
     offline_secrets._write_private(path, json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8"))
 
 
-def active_appid() -> Optional[str]:
+def active_appid(product: str = DEFAULT_PRODUCT) -> Optional[str]:
     try:
-        raw = json.loads((offline_root() / "active.json").read_text(encoding="utf-8"))
+        raw = json.loads((offline_root(product) / "active.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     appid = raw.get("appid") if isinstance(raw, dict) else None
@@ -74,10 +81,11 @@ def active_appid() -> Optional[str]:
 
 def activate(payload: dict) -> dict:
     """Store what the online app sent; returns the public part for the answer."""
-    # Which product's till this is (only Petshandler so far, see PRODUCTS).
+    # Which product's till this is (see PRODUCTS); Petshandler when not said.
     product = str(payload.get("product") or DEFAULT_PRODUCT)
     if product not in PRODUCTS:
         raise ActivationError("Офлайн-режим для цього продукту не підтримується.")
+    spec = PRODUCTS[product]
     appid = str(payload.get("appid") or "")
     device_id = str(payload.get("deviceId") or "")
     token = str(payload.get("deviceToken") or "")
@@ -86,14 +94,15 @@ def activate(payload: dict) -> dict:
         raise ActivationError("Некоректний ідентифікатор закладу.")
     if not _SAFE_ID.fullmatch(device_id):
         raise ActivationError("Некоректний ідентифікатор пристрою.")
-    if not token.startswith("pho_"):
+    if not token.startswith(spec.token_prefix):
         raise ActivationError("Некоректний токен пристрою.")
-    api = _API_BASE.fullmatch(api_base)
-    if not api or api.group(1).lower() not in PRODUCTS[product].api_hosts:
+    api = _api_base_pattern(product).fullmatch(api_base)
+    if not api or api.group(1).lower() not in spec.api_hosts:
         raise ActivationError("Некоректна адреса сервера.")
+    device_number = _device_number(payload) if spec.numbered_devices else None
 
-    folder = shop_folder(appid)
-    previous = active_appid()
+    folder = shop_folder(appid, product)
+    previous = active_appid(product)
     if previous and previous != appid:
         # One till, one shop: another shop's data may still hold operations
         # that have not reached its server. Refusing is safer than guessing.
@@ -131,16 +140,36 @@ def activate(payload: dict) -> dict:
         "tokenExpiresAt": payload.get("expiresAt"),
         "activatedAt": datetime.now(timezone.utc).isoformat(),
     }
+    public_keys = ["product", "appid", "deviceId", "shopName", "tokenExpiresAt", "activatedAt"]
+    if device_number is not None:
+        config["deviceNumber"] = device_number
+        public_keys.append("deviceNumber")
     _write_json(folder / "config.json", config)
-    _write_json(offline_root() / "active.json", {"appid": appid})
+    _write_json(offline_root(product) / "active.json", {"appid": appid})
     log.info(
-        "offline mode activated for shop %s, device %s (%s)",
-        appid, device_id, "new token" if previous == appid else "first activation",
+        "offline mode activated for %s shop %s, device %s%s (%s)",
+        product, appid, device_id,
+        f" number {device_number}" if device_number is not None else "",
+        "new token" if previous == appid else "first activation",
     )
-    return {k: config[k] for k in ("product", "appid", "deviceId", "shopName", "tokenExpiresAt", "activatedAt")}
+    return {k: config[k] for k in public_keys}
 
 
-def queued_on_disk(appid: str, timeout: float = 5, quiet: bool = False) -> Optional[int]:
+def _device_number(payload: dict) -> int:
+    """FC-798 — the till's number among the shop's computers (1 when not
+    sent): its receipts are numbered D<n>-0001, so two tills of one shop never
+    print the same number. Chosen by the person who switches the till on."""
+    raw = payload.get("deviceNumber")
+    if raw is None:
+        return 1
+    if isinstance(raw, int) and not isinstance(raw, bool) and 1 <= raw <= MAX_DEVICE_NUMBER:
+        return raw
+    raise ActivationError(f"Номер каси має бути цілим числом від 1 до {MAX_DEVICE_NUMBER}.")
+
+
+def queued_on_disk(
+    appid: str, timeout: float = 5, quiet: bool = False, product: str = DEFAULT_PRODUCT,
+) -> Optional[int]:
     """Operations still waiting for the server, read from the local copy itself.
 
     For when the service is not running and cannot be asked — without its
@@ -151,7 +180,7 @@ def queued_on_disk(appid: str, timeout: float = 5, quiet: bool = False) -> Optio
     `quiet` leaves out the routine lines for callers that poll (the update
     guard asks every few seconds); a copy that cannot be read is always logged.
     """
-    path = shop_folder(appid) / "data" / "offline.sqlite"
+    path = shop_folder(appid, product) / "data" / "offline.sqlite"
     try:
         if not path.exists():
             if not quiet:
@@ -177,7 +206,7 @@ def queued_on_disk(appid: str, timeout: float = 5, quiet: bool = False) -> Optio
     return int(n)
 
 
-def fiscal_owed_on_disk(appid: str) -> Optional[tuple[int, int]]:
+def fiscal_owed_on_disk(appid: str, product: str = DEFAULT_PRODUCT) -> Optional[tuple[int, int]]:
     """What the local copy still owes the tax service: (unsent documents, sessions).
 
     For when the service cannot be asked. Whether a document was sent is
@@ -186,8 +215,13 @@ def fiscal_owed_on_disk(appid: str) -> Optional[tuple[int, int]]:
     of its own, whose key says so without the payload. A copy from a service
     older than that count, with any fiscal document in it, cannot be judged:
     None, like a copy that cannot be read.
+
+    A product without registers of its own (PRODUCTS[…].fiscal) owes the tax
+    service nothing from this computer.
     """
-    path = shop_folder(appid) / "data" / "offline.sqlite"
+    if not PRODUCTS[product].fiscal:
+        return 0, 0
+    path = shop_folder(appid, product) / "data" / "offline.sqlite"
     try:
         if not path.exists():
             return 0, 0
@@ -258,23 +292,23 @@ def check_can_deactivate(
         )
 
 
-def forget() -> Optional[str]:
+def forget(product: str = DEFAULT_PRODUCT) -> Optional[str]:
     """Switch offline mode off: the secrets and the active mark go. Returns the shop."""
-    appid = active_appid()
+    appid = active_appid(product)
     if not appid:
         return None
-    offline_secrets.delete(appid, shop_folder(appid))
+    offline_secrets.delete(appid, shop_folder(appid, product))
     try:
-        (offline_root() / "active.json").unlink()
+        (offline_root(product) / "active.json").unlink()
     except FileNotFoundError:
         pass
     log.info("offline mode switched off for shop %s", appid)
     return appid
 
 
-def remove_data(appid: str) -> None:
+def remove_data(appid: str, product: str = DEFAULT_PRODUCT) -> None:
     """The shop's local copy, once the service that held it has stopped."""
-    folder = shop_folder(appid)
+    folder = shop_folder(appid, product)
     shutil.rmtree(folder, ignore_errors=True)
     if folder.exists():
         log.error("offline data of shop %s could not be removed completely: %s", appid, folder)
@@ -282,9 +316,12 @@ def remove_data(appid: str) -> None:
         log.info("offline data of shop %s removed", appid)
 
 
-def current_config() -> Optional[dict]:
+def current_config(product: str = DEFAULT_PRODUCT) -> Optional[dict]:
     """The full config the service is started with, or None when not activated."""
-    path = os.environ.get("BHM_OFFLINE_CONFIG_FILE")
+    # A developer's full config: BHM_OFFLINE_CONFIG_FILE for Petshandler,
+    # BHM_OFFLINE_CONFIG_FILE_<PRODUCT> for the others.
+    env = "BHM_OFFLINE_CONFIG_FILE" if product == DEFAULT_PRODUCT else f"BHM_OFFLINE_CONFIG_FILE_{product.upper()}"
+    path = os.environ.get(env)
     if path:
         try:
             cfg = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -293,10 +330,10 @@ def current_config() -> Optional[dict]:
             return None
         return cfg if isinstance(cfg, dict) else None
 
-    appid = active_appid()
+    appid = active_appid(product)
     if not appid:
         return None
-    folder = shop_folder(appid)
+    folder = shop_folder(appid, product)
     try:
         stored = json.loads((folder / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
@@ -313,35 +350,47 @@ def current_config() -> Optional[dict]:
     if not kept or not kept.get("deviceToken") or not kept.get("dataKey"):
         log.warning("offline secrets for shop %s are missing: activate again from Petshandler", appid)
         return None
-    return {
+    cfg = {
         "appid": appid,
         "apiBase": stored["apiBase"],
         "deviceId": stored["deviceId"],
         "deviceToken": kept["deviceToken"],
         "dataKey": kept["dataKey"],
         "dataDir": str(folder / "data"),
-        "staticDir": str(runtime_dir(stored.get("product") or DEFAULT_PRODUCT) / "app"),
+        "staticDir": str(runtime_dir(stored.get("product") or product) / "app"),
     }
+    if PRODUCTS[product].numbered_devices:
+        cfg["deviceNumber"] = _stored_device_number(stored)
+    return cfg
 
 
-def public_status() -> dict:
+def _stored_device_number(stored: dict) -> int:
+    """The number kept at activation; 1 for a config written without one."""
+    n = stored.get("deviceNumber")
+    return n if isinstance(n, int) and not isinstance(n, bool) and 1 <= n <= MAX_DEVICE_NUMBER else 1
+
+
+def public_status(product: str = DEFAULT_PRODUCT) -> dict:
     """What the manager shows about activation; never the secrets."""
-    appid = active_appid()
+    appid = active_appid(product)
     if not appid:
         return {"activated": False}
     try:
-        stored = json.loads((shop_folder(appid) / "config.json").read_text(encoding="utf-8"))
+        stored = json.loads((shop_folder(appid, product) / "config.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         stored = {}
-    return {
+    status = {
         "activated": True,
-        "product": stored.get("product") or DEFAULT_PRODUCT,
+        "product": stored.get("product") or product,
         "appid": appid,
         "shopName": stored.get("shopName") or "",
         "deviceId": stored.get("deviceId"),
         "tokenExpiresAt": stored.get("tokenExpiresAt"),
         "activatedAt": stored.get("activatedAt"),
     }
+    if PRODUCTS[product].numbered_devices:
+        status["deviceNumber"] = _stored_device_number(stored)
+    return status
 
 
 # ---- PET-973: the online app's device settings, for the offline build ----
@@ -355,14 +404,14 @@ _LOCAL_URL = re.compile(r"https?://(localhost|127\.0\.0\.1)(:\d{1,5})?/?")
 _VALUE_CHECKS = {"phm.manager.url": _LOCAL_URL}
 
 
-def save_local_settings(appid: str, items: object) -> dict:
+def save_local_settings(appid: str, items: object, product: str = DEFAULT_PRODUCT) -> dict:
     """Keep what the online app sent for the offline build of the same shop.
 
     Which keys go is decided by the app (an allow-list there: device and
     printer settings, language, list views — never the session, the tenant or
     temporary state). Here only the shape is checked.
     """
-    active = active_appid()
+    active = active_appid(product)
     if not active:
         raise ActivationError("Офлайн-режим на цьому компʼютері не увімкнено.")
     if appid != active:
@@ -378,7 +427,7 @@ def save_local_settings(appid: str, items: object) -> dict:
     # it has not applied yet, not «a later time» (the till's clock can jump
     # back). The same settings again keep their id, so an online reload does
     # not undo what was changed offline.
-    previous = load_local_settings()
+    previous = load_local_settings(product)
     same = previous is not None and previous.get("items") == items and isinstance(previous.get("id"), str)
     body = {
         "id": previous["id"] if same else uuid.uuid4().hex,
@@ -388,8 +437,8 @@ def save_local_settings(appid: str, items: object) -> dict:
     raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
     if len(raw) > LOCAL_SETTINGS_MAX_BYTES:
         raise ActivationError("Налаштування завеликі.")
-    offline_secrets._write_private(shop_folder(appid) / "local-settings.json", raw)
-    log.info("offline: %d browser settings kept for shop %s", len(items), appid)
+    offline_secrets._write_private(shop_folder(appid, product) / "local-settings.json", raw)
+    log.info("offline: %d browser settings kept for %s shop %s", len(items), product, appid)
     return {"id": body["id"], "savedAt": body["savedAt"], "count": len(items)}
 
 
@@ -484,13 +533,13 @@ def save_fiscal_key(appid: str, file_name: str, content_base64: str) -> dict:
     return {"path": str(path), "name": name, "bytes": len(data)}
 
 
-def load_local_settings() -> Optional[dict]:
+def load_local_settings(product: str = DEFAULT_PRODUCT) -> Optional[dict]:
     """The active shop's snapshot: {savedAt, items}, or None."""
-    appid = active_appid()
+    appid = active_appid(product)
     if not appid:
         return None
     try:
-        body = json.loads((shop_folder(appid) / "local-settings.json").read_text(encoding="utf-8"))
+        body = json.loads((shop_folder(appid, product) / "local-settings.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     return body if isinstance(body, dict) and isinstance(body.get("items"), dict) else None

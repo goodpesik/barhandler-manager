@@ -85,7 +85,11 @@ def home(tmp_path, monkeypatch):
 
 def _client(config, monkeypatch, service):
     """The app with the given supervisor (None = a build without the runtime)."""
-    monkeypatch.setattr(offline_service, "node_path", lambda root=None: Path(__file__) if service else Path("/no/node"))
+    # Petshandler's runtime only: the FitStudioCRM till (FC-798) has tests of its own.
+    monkeypatch.setattr(
+        offline_service, "node_path",
+        lambda root=None: Path(__file__) if service and (root is None or root.name == "petshandler") else Path("/no/node"),
+    )
     monkeypatch.setattr(offline_service, "OfflineService", lambda *a, **k: service)
     return TestClient(create_app(config))
 
@@ -1054,3 +1058,150 @@ def test_a_service_that_does_not_say_what_it_owes_is_judged_by_the_disk(client_f
     assert c.post("/offline/deactivate", headers=KEY).status_code == 409
     assert offline_state.active_appid() == "bark-01"
 
+
+
+# ---- FC-798: the FitStudioCRM till beside the Petshandler one ------------
+
+FIT = {
+    "product": "fitstudiocrm",
+    "appid": "studio-01",
+    "deviceId": "till-fit-1",
+    "deviceToken": "fso_secret_token_value",
+    "apiBase": "https://api.fitshandler.com",
+    "shopName": "Студія",
+    "expiresAt": "2027-09-30T00:00:00.000Z",
+}
+
+
+@pytest.fixture
+def both_for(config, monkeypatch, home):
+    """The app with both products' runtimes: one fake supervisor per product."""
+    stack = []
+
+    def make(pets, fit):
+        fakes = {"petshandler": pets, "fitstudiocrm": fit}
+        monkeypatch.setattr(offline_service, "node_path", lambda root=None: Path(__file__))
+        monkeypatch.setattr(offline_service, "OfflineService", lambda *a, product="petshandler", **k: fakes[product])
+        for x in (
+            patch("src.devices.scan.discover_usb", return_value=[]),
+            patch("src.devices.scan.discover_network", return_value=[]),
+            patch("src.devices.scan.discover_bluetooth", return_value=[]),
+        ):
+            x.start()
+            stack.append(x)
+        c = TestClient(create_app(config))
+        c.__enter__()
+        stack.append(c)
+        return c
+
+    yield make
+    for x in reversed(stack):
+        if isinstance(x, TestClient):
+            x.__exit__(None, None, None)
+        else:
+            x.stop()
+
+
+def test_both_tills_are_activated_side_by_side_in_folders_of_their_own(both_for, home):
+    c = both_for(FakeService(0), FakeService(0, port=9899))
+    assert c.post("/offline/activate", json=PAYLOAD, headers=KEY).status_code == 200
+    assert c.post("/offline/activate", json=FIT, headers=KEY).status_code == 200
+    assert offline_state.active_appid() == "bark-01"
+    assert offline_state.active_appid("fitstudiocrm") == "studio-01"
+    assert (home / "offline-fitstudiocrm" / "studio-01" / "config.json").exists()
+    assert not (home / "offline" / "studio-01").exists()
+    fit = offline_state.current_config("fitstudiocrm")
+    assert fit["deviceToken"] == "fso_secret_token_value" and fit["apiBase"] == "https://api.fitshandler.com"
+    assert fit["dataDir"] == str(home / "offline-fitstudiocrm" / "studio-01" / "data")
+    assert fit["staticDir"] == str(offline_service.runtime_dir("fitstudiocrm") / "app")
+    # Petshandler's config is exactly what its service always got.
+    assert set(offline_state.current_config()) == {
+        "appid", "apiBase", "deviceId", "deviceToken", "dataKey", "dataDir", "staticDir",
+    }
+    assert offline_state.current_config()["dataKey"] != fit["dataKey"]
+
+
+def test_the_fit_till_gets_its_number_one_when_not_given(both_for):
+    c = both_for(FakeService(0), FakeService(0, port=9899))
+    c.post("/offline/activate", json=FIT, headers=KEY)
+    assert offline_state.current_config("fitstudiocrm")["deviceNumber"] == 1
+    r = c.post("/offline/activate", json={**FIT, "deviceNumber": 3}, headers=KEY)
+    assert r.json()["deviceNumber"] == 3
+    assert offline_state.current_config("fitstudiocrm")["deviceNumber"] == 3
+    assert c.get("/offline/status?product=fitstudiocrm", headers=KEY).json()["deviceNumber"] == 3
+
+
+@pytest.mark.parametrize("bad", [
+    {"deviceNumber": 0},
+    {"deviceNumber": 100},
+    {"deviceNumber": "2"},
+    {"deviceNumber": True},
+    {"deviceToken": "pho_a_petshandler_token"},
+    {"apiBase": "https://api.fitshandler.com/api"},
+    {"apiBase": "https://api.petshandler.com"},
+])
+def test_what_cannot_activate_the_fit_till_is_refused(both_for, bad):
+    c = both_for(FakeService(0), FakeService(0, port=9899))
+    r = c.post("/offline/activate", json={**FIT, **bad}, headers=KEY)
+    assert r.status_code == 400
+    assert offline_state.active_appid("fitstudiocrm") is None
+
+
+def test_the_fit_till_accepts_its_dev_server(both_for):
+    c = both_for(FakeService(0), FakeService(0, port=9899))
+    r = c.post("/offline/activate", json={**FIT, "apiBase": "https://api-dev.fitstudiocrm.com/"}, headers=KEY)
+    assert r.status_code == 200
+
+
+def test_status_and_sync_go_to_the_products_own_service(both_for):
+    pets, fit = FakeService(1), FakeService(5, port=9899, sync_answer={"ran": "synced", "failed": False})
+    c = both_for(pets, fit)
+    c.post("/offline/activate", json=FIT, headers=KEY)
+    body = c.get("/offline/status?product=fitstudiocrm", headers=KEY).json()
+    assert body["activated"] and body["appid"] == "studio-01"
+    assert body["service"]["port"] == 9899 and body["service"]["queued"] == 5
+    assert "fso_" not in json.dumps(body)
+    # Petshandler's status is untouched by the other till.
+    assert c.get("/offline/status", headers=KEY).json()["activated"] is False
+    assert c.post("/offline/sync?product=fitstudiocrm", headers=KEY).status_code == 200
+    assert (fit.synced, pets.synced) == (1, 0)
+
+
+def test_an_unknown_product_is_refused(both_for):
+    c = both_for(FakeService(0), FakeService(0, port=9899))
+    assert c.get("/offline/status?product=other", headers=KEY).status_code == 400
+
+
+def test_switching_the_fit_till_off_leaves_the_petshandler_one(both_for, home):
+    pets, fit = FakeService(0), FakeService(0, port=9899)
+    c = both_for(pets, fit)
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    c.post("/offline/activate", json=FIT, headers=KEY)
+    assert c.post("/offline/deactivate?product=fitstudiocrm", headers=KEY).status_code == 200
+    assert (fit.stopped, pets.stopped) == (1, 0)
+    assert offline_state.active_appid("fitstudiocrm") is None
+    assert not (home / "offline-fitstudiocrm" / "studio-01").exists()
+    assert offline_state.active_appid() == "bark-01"
+    assert offline_state.current_config() is not None
+
+
+def test_the_fit_till_is_not_switched_off_while_its_queue_waits(both_for):
+    fit = FakeService(2, port=9899)
+    c = both_for(FakeService(0), fit)
+    c.post("/offline/activate", json=FIT, headers=KEY)
+    r = c.post("/offline/deactivate?product=fitstudiocrm", headers=KEY)
+    assert r.status_code == 409 and "2" in r.json()["detail"]["message"]
+    assert fit.stopped == 0 and offline_state.active_appid("fitstudiocrm") == "studio-01"
+
+
+def test_an_update_waits_for_the_fit_tills_queue(both_for):
+    c = both_for(FakeService(0), FakeService(6, port=9899))
+    body = c.get("/busy").json()
+    assert body["busy"] is True and "FitStudioCRM" in body["message"] and "6" in body["message"]
+
+
+def test_the_fit_apps_word_on_offline_mode_is_its_own(both_for):
+    c = both_for(FakeService(0), FakeService(0, port=9899))
+    c.get("/devices", headers={**KEY, "X-Offline-Offered": "1", "X-Offline-Product": "fitstudiocrm"})
+    assert c.get("/offline/status?product=fitstudiocrm", headers=KEY).json()["offered"] is True
+    assert c.get("/offline/status", headers=KEY).json()["offered"] is False

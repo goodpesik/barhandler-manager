@@ -128,10 +128,18 @@ def test_both_installers_carry_the_runtime_when_its_secrets_are_set(workflow, wi
     for job in (windows, mac):
         steps = jobs[job]["steps"]
         assert jobs[job]["env"]["OFFLINE_REPO_TOKEN"] == "${{ secrets.OFFLINE_REPO_TOKEN }}"
-        uses = [s for s in steps if s.get("uses") == "./.github/actions/offline-runtime"]
+        runtimes = [s for s in steps if s.get("uses") == "./.github/actions/offline-runtime"]
+        uses = [s for s in runtimes if s.get("name") == "Offline runtime"]
         assert len(uses) == 1, job
         # Only with the secret: a release without it builds as before.
         assert uses[0]["if"] == "${{ env.OFFLINE_REPO_TOKEN != '' }}"
+        # FC-798 — FitStudioCRM's runtime only once its repos exist (a repository
+        # variable), so a release without it builds exactly as before.
+        fit = [s for s in runtimes if s.get("name") == "FitStudioCRM offline runtime"]
+        assert len(fit) == 1 and len(runtimes) == 2, job
+        assert fit[0]["if"] == "${{ env.OFFLINE_REPO_TOKEN != '' && vars.FIT_OFFLINE_ENABLED == 'true' }}"
+        assert fit[0]["with"]["service-repo"] == "goodpesik/fitstudiocrm-offline"
+        assert fit[0]["with"]["out"].endswith("offline-runtime/fitstudiocrm")
     win_steps = jobs[windows]["steps"]
     names = [s.get("name") for s in win_steps]
     assert names.index("Offline runtime") < names.index("Build installer (Inno Setup)")
