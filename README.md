@@ -202,6 +202,11 @@ server:
 | `/terminal/charge` | POST | Провести оплату. |
 | `/terminal/{id}/cancel` | POST | Скасувати поточну операцію. |
 | `/terminal/{id}/last-result` | GET | Результат по UID або останній. |
+| `/offline/status` | GET | Стан офлайн-каси: увімкнення, заклад, сервіс, черга. Параметр `?product=` — `petshandler` (без параметра) або `fitstudiocrm`; невідомий продукт — 400. |
+| `/offline/activate` | POST | Увімкнути офлайн-режим: токен пристрою з онлайн-застосунку, `product` у тілі. Для `fitstudiocrm` — необовʼязковий `deviceNumber` (номер каси, 1–99, без нього 1). |
+| `/offline/sync` | POST | Синхронізувати зараз (`?product=`). |
+| `/offline/deactivate` | POST | Вимкнути офлайн-режим і видалити локальні дані закладу (`?product=`); 409, доки черга не порожня. |
+| `/offline/local-settings` | GET / POST | Налаштування пристроїв онлайн-застосунку для офлайн-збірки (`?product=` або `product` у тілі). |
 
 Повні схеми payload-ів — `docs/INTEGRATION-SPEC.md`.
 
@@ -427,6 +432,11 @@ Paper width, drawer pin, code page — configured through the web app UI and sto
 | `/terminal/charge` | POST | Run a charge. |
 | `/terminal/{id}/cancel` | POST | Cancel the in-flight operation. |
 | `/terminal/{id}/last-result` | GET | Fetch result by UID or last completed. |
+| `/offline/status` | GET | Offline till state: activation, shop, service, queue. `?product=` — `petshandler` (when omitted) or `fitstudiocrm`; an unknown product → 400. |
+| `/offline/activate` | POST | Switch offline mode on: the device token from the online app, `product` in the body. For `fitstudiocrm` — optional `deviceNumber` (till number, 1–99, 1 when omitted). |
+| `/offline/sync` | POST | Synchronise now (`?product=`). |
+| `/offline/deactivate` | POST | Switch offline mode off and remove the shop's local data (`?product=`); 409 while the queue is not empty. |
+| `/offline/local-settings` | GET / POST | The online app's device settings for the offline build (`?product=` or `product` in the body). |
 
 Full payload schemas in `docs/INTEGRATION-SPEC.md`.
 

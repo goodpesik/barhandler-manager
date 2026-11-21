@@ -26,6 +26,9 @@ def preflight(client, origin: str):
         "http://127.0.0.1:9898",
         "http://localhost:9898",
         "https://work.petshandler.com",
+        "https://app.fitstudiocrm.com",
+        "https://app.fitshandler.com",
+        "https://dev.fitshandler.com",
     ],
 )
 def test_our_pages_may_call(client, origin):
@@ -40,6 +43,8 @@ def test_our_pages_may_call(client, origin):
         "http://127.0.0.1.evil.example",
         "https://evil.example",
         "http://127.0.0.2:9898",
+        "https://app.fitshandler.com.evil.example",
+        "http://app.fitshandler.com",
     ],
 )
 def test_other_pages_may_not(client, origin):

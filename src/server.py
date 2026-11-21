@@ -6,6 +6,7 @@ connections happen on the first print to that ID.
 """
 
 import asyncio
+import functools
 from contextlib import asynccontextmanager
 from pathlib import Path
 import logging
@@ -24,7 +25,7 @@ from src.routes import (
 )
 from src.services.busy import BusyTracker, guard_critical
 from src.services.station_settings import StationSettings
-from src.services.offline_offer import OfflineOffer
+from src.services.offline_offer import OfflineOffer, offer_product
 from src.services import work_journal as work_journal_service
 from src.services.charge_claim import ChargeClaims
 from src.services.work_journal import WorkJournal
@@ -68,6 +69,15 @@ def create_app(config: dict) -> FastAPI:
     offline_offer = OfflineOffer(
         path=Path(config["server"].get("offline_offer_path", APP_DIR / "offline-offer.json")),
     )
+    # FC-798 — each product's app says it for its own till (X-Offline-Product);
+    # Petshandler's word stays in the file it always had.
+    from src.services.offline_service import DEFAULT_PRODUCT, PRODUCTS
+
+    offline_offers = {
+        product: offline_offer if product == DEFAULT_PRODUCT
+        else OfflineOffer(path=offline_offer.path.with_name(f"offline-offer-{product}.json"))
+        for product in PRODUCTS
+    }
 
     async def _printer_connect_watcher() -> None:
         """Connect-ONLY watcher — the safe inverse of the old heartbeat. Every
@@ -109,13 +119,15 @@ def create_app(config: dict) -> FastAPI:
         app.state.charge_claims = charge_claims
         app.state.station_settings = station_settings
         app.state.offline_offer = offline_offer
+        app.state.offline_offers = offline_offers
         journal.load()
         # Read before the first charge can arrive: an operation that was in
         # flight when the process last stopped is read back as unresolved, and
         # a repeat of its key is refused rather than charged again.
         charge_claims.load()
         station_settings.load()
-        offline_offer.load()
+        for offer in offline_offers.values():
+            offer.load()
         # The device layer records through the module singleton, so it does not
         # have to be handed the journal down every call path.
         work_journal_service.set_active(journal)
@@ -178,27 +190,35 @@ def create_app(config: dict) -> FastAPI:
 
         uplink_watch = asyncio.create_task(watch(app.state, config))
 
-        # PET-971 — the Petshandler offline service. Only a build that ships
-        # its runtime runs it; everywhere else there is nothing to start.
-        from src.services.offline_service import OfflineService, node_path
+        # PET-971 — the offline services. Only a build that ships a product's
+        # runtime runs its service; everywhere else there is nothing to start.
+        # FC-798 — one supervisor per product (Petshandler, FitStudioCRM),
+        # each on its own port and data folder.
+        from src.services.offline_service import OfflineService, node_path, runtime_dir
         from src.services.offline_state import current_config
 
-        offline = None
-        offline_task = None
-        if node_path().exists():
-            offline = OfflineService(current_config)
-            app.state.offline_service = offline
-            offline_task = asyncio.create_task(offline.run_forever(), name="offline-service")
+        offline_services: dict = {}
+        offline_tasks: list = []
+        for product in PRODUCTS:
+            if not node_path(runtime_dir(product)).exists():
+                continue
+            service = OfflineService(functools.partial(current_config, product), product=product)
+            offline_services[product] = service
+            name = "offline-service" if product == DEFAULT_PRODUCT else f"offline-service-{product}"
+            offline_tasks.append(asyncio.create_task(service.run_forever(), name=name))
+        app.state.offline_services = offline_services
+        if DEFAULT_PRODUCT in offline_services:
+            app.state.offline_service = offline_services[DEFAULT_PRODUCT]
 
         yield
-        if offline is not None:
-            await offline.stop()
-        if offline_task is not None:
-            offline_task.cancel()
-            # Its outcome is read here, at shutdown, not lost to the GC.
-            for outcome in await asyncio.gather(offline_task, return_exceptions=True):
-                if isinstance(outcome, Exception):
-                    logger.warning("offline service task ended with %r", outcome)
+        for service in offline_services.values():
+            await service.stop()
+        for task in offline_tasks:
+            task.cancel()
+        # Their outcomes are read here, at shutdown, not lost to the GC.
+        for outcome in await asyncio.gather(*offline_tasks, return_exceptions=True):
+            if isinstance(outcome, Exception):
+                logger.warning("offline service task ended with %r", outcome)
         uplink_watch.cancel()
         if extract_keeper is not None:
             extract_keeper.cancel()
@@ -234,7 +254,7 @@ def create_app(config: dict) -> FastAPI:
     #  - any Firebase Hosting subdomain (production + preview channels)
     #  - any *.firebaseapp.com fallback URL
     #  - tenant deployments on barhandler.com / petshandler.com /
-    #    fitstudiocrm.com — apex domains AND any subdomain depth
+    #    fitstudiocrm.com / fitshandler.com — apex domains AND any subdomain depth
     #    (biergarten-lviv.barhandler.com, app.fitstudiocrm.com, etc.)
     #  - localhost on any port via http or https (covers dev servers
     #    and Capacitor Android wrappers, which use `https://localhost`)
@@ -253,6 +273,9 @@ def create_app(config: dict) -> FastAPI:
         r"|https://([a-zA-Z0-9-]+\.)*barhandler\.com"
         r"|https://([a-zA-Z0-9-]+\.)*petshandler\.com"
         r"|https://([a-zA-Z0-9-]+\.)*fitstudiocrm\.com"
+        # FC-798 — the Fit admin app moved to fitshandler.com
+        # (app.fitshandler.com); fitstudiocrm.com stays for old links.
+        r"|https://([a-zA-Z0-9-]+\.)*fitshandler\.com"
         r")$"
     )
     # NB: `allow_credentials=True` + `allow_headers=["*"]` is invalid
@@ -347,7 +370,9 @@ def create_app(config: dict) -> FastAPI:
         # or a stray caller must not switch the button on or off.
         if request.headers.get("x-api-key") == api_key:
             try:
-                offline_offer.note(request.headers)
+                offer = offline_offers.get(offer_product(request.headers))
+                if offer is not None:
+                    offer.note(request.headers)
             except Exception:
                 pass
         # Preferred identity — explicit tenant headers from the PWA.

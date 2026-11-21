@@ -51,17 +51,47 @@ class OfflineProduct:
     #: API key is public (it ships in the web apps), so an activation must not
     #: be able to point a shop's data at any other host.
     api_hosts: tuple[str, ...]
+    #: The path part of its server address: Petshandler's API lives under
+    #: /api, FitStudioCRM's at the root of its host.
+    api_path: str = "/api"
+    #: Every offline device token of this product starts with this.
+    token_prefix: str = "pho_"
+    #: The folder in APP_DIR that holds this product's shops (one per shop).
+    data_folder: str = "offline"
+    #: The product's offline service keeps its own fiscal registers
+    #: (Petshandler). A product without them fiscalises after the sync.
+    fiscal: bool = True
+    #: The till's receipts carry its number among the shop's computers
+    #: (D<n>-0001), given at activation.
+    numbered_devices: bool = False
 
 
-#: PET-971 — the products the manager can run an offline service for. Only
-#: Petshandler for now; FitStudio and BarHandler are planned (BarHandler on
-#: Android especially) and join here with their own service, port and
-#: runtime folder, while the supervision stays the same.
+#: PET-971 — the products the manager can run an offline service for. Each
+#: has its own service, port, runtime folder and data folder, so the tills of
+#: two products run side by side on one computer, while the supervision stays
+#: the same. BarHandler (on Android especially) is planned.
 PRODUCTS: dict[str, OfflineProduct] = {
     "petshandler": OfflineProduct(
         service_name="petshandler-offline",
         port=9898,
         api_hosts=("api.petshandler.com", "api-dev.petshandler.com"),
+    ),
+    # FC-798 — the FitStudioCRM till (fitstudiocrm-offline). No registers of
+    # its own: offline sales are fiscalised by the server after the sync.
+    "fitstudiocrm": OfflineProduct(
+        service_name="fitstudiocrm-offline",
+        port=9899,
+        api_hosts=(
+            "api.fitshandler.com",
+            "api-dev.fitshandler.com",
+            "api.fitstudiocrm.com",
+            "api-dev.fitstudiocrm.com",
+        ),
+        api_path="",
+        token_prefix="fso_",
+        data_folder="offline-fitstudiocrm",
+        fiscal=False,
+        numbered_devices=True,
     ),
 }
 DEFAULT_PRODUCT = "petshandler"
@@ -235,19 +265,29 @@ class OfflineService:
         *,
         argv: Optional[list[str]] = None,
         expected_version: Optional[str] = None,
-        port: int = DEFAULT_PORT,
+        port: Optional[int] = None,
         log_path: Optional[Path] = None,
+        product: str = DEFAULT_PRODUCT,
         fetch_health: Callable[[int], Optional[dict]] = _fetch_health,
         post_sync: Callable[[int], Optional[dict]] = _post_sync,
         call_fiscal: Callable[[int, str, str, Optional[bytes]], tuple[int, bytes]] = _call_fiscal,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._load_config = load_config
-        root = runtime_dir()
+        # FC-798 — which product's till this supervises: its service name,
+        # port, runtime and data folder. Petshandler's are the defaults.
+        spec = PRODUCTS[product]
+        self.product = product
+        self._service_name = spec.service_name
+        self._fiscal = spec.fiscal
+        # The other products' lines carry their name, so two tills on one
+        # computer are told apart in the log; Petshandler's stay as they were.
+        self._log = log if product == DEFAULT_PRODUCT else log.getChild(product)
+        root = runtime_dir(product)
         self._argv = argv or [str(node_path(root)), str(service_script(root))]
         self._expected = expected_version if expected_version is not None else shipped_version(root)
-        self._port = port
-        self._log_path = log_path or (APP_DIR / "offline" / "service.log")
+        self._port = port if port is not None else spec.port
+        self._log_path = log_path or (APP_DIR / spec.data_folder / "service.log")
         self._fetch = fetch_health
         self._post_sync = post_sync
         self._call_fiscal = call_fiscal
@@ -281,12 +321,12 @@ class OfflineService:
             except SecretsUnreadable as e:
                 # Not «not activated»: the secrets are there, just not readable
                 # now. Nothing to start with; try again shortly.
-                log.warning("offline service: secrets unreadable, not starting yet: %s", e)
+                self._log.warning("offline service: secrets unreadable, not starting yet: %s", e)
                 await self._sleep(IDLE_EVERY_SEC)
                 continue
             if not cfg:
                 if not told_idle:
-                    log.info("offline service: the shop is not activated, nothing to start")
+                    self._log.info("offline service: the shop is not activated, nothing to start")
                     told_idle = True
                 await self._sleep(IDLE_EVERY_SEC)
                 continue
@@ -365,14 +405,14 @@ class OfflineService:
         if self._stopping:
             return False
         if other is not None:
-            if other.get("name") == SERVICE_NAME and await self._stop_stray(other):
+            if other.get("name") == self._service_name and await self._stop_stray(other):
                 pass
             else:
                 # A different program holds the port: do not start a second
                 # service into it.
                 self._fail(
                     f"port {self._port} is taken by {other.get('name')} {other.get('version')}"
-                    f" (want {SERVICE_NAME} {self._expected})",
+                    f" (want {self._service_name} {self._expected})",
                     started=False,
                 )
                 return False
@@ -424,7 +464,7 @@ class OfflineService:
                     started_at=time.monotonic(),
                 )
                 self._remember(health)
-                log.info(
+                self._log.info(
                     "offline service %s started (pid %s, shop %s)",
                     self._expected, proc.pid, cfg.get("appid"),
                 )
@@ -432,7 +472,7 @@ class OfflineService:
             if health is not None:
                 self._fail(
                     f"answers as {health.get('name')} {health.get('version')},"
-                    f" want {SERVICE_NAME} {self._expected}",
+                    f" want {self._service_name} {self._expected}",
                 )
                 return False
             await self._sleep(0.5)
@@ -448,19 +488,19 @@ class OfflineService:
         if not _orphaned(pid):
             # Another manager (an overlapping update, a second session) may be
             # supervising it right now: killing it would stop a working till.
-            log.warning(
+            self._log.warning(
                 "offline service: %s (pid %s) on the port still has its manager; left alone",
-                SERVICE_NAME, pid,
+                self._service_name, pid,
             )
             return False
-        log.warning(
+        self._log.warning(
             "offline service: a stray %s %s (pid %s) holds the port, stopping it",
-            SERVICE_NAME, health.get("version"), pid,
+            self._service_name, health.get("version"), pid,
         )
         try:
             os.kill(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError) as e:
-            log.warning("offline service: could not stop pid %s: %s", pid, e)
+            self._log.warning("offline service: could not stop pid %s: %s", pid, e)
             return False
         for _ in range(20):
             await self._sleep(0.25)
@@ -491,7 +531,7 @@ class OfflineService:
                     out.flush()
                     written += len(line)
                 except (OSError, ValueError) as e:
-                    log.warning("offline service: log write failed, output dropped from now on: %s", e)
+                    self._log.warning("offline service: log write failed, output dropped from now on: %s", e)
                     try:
                         out.close()
                     except OSError:
@@ -520,10 +560,10 @@ class OfflineService:
             except SecretsUnreadable as e:
                 # A read that fails now says nothing about the activation:
                 # the running service keeps going.
-                log.warning("offline service: secrets unreadable, keeping the running service: %s", e)
+                self._log.warning("offline service: secrets unreadable, keeping the running service: %s", e)
                 now_key = self._cfg_key
             if now_key != self._cfg_key:
-                log.info("offline service: the activation changed, restarting")
+                self._log.info("offline service: the activation changed, restarting")
                 self._failures = 0
                 return
             health = await asyncio.to_thread(self._fetch, self._port)
@@ -532,7 +572,7 @@ class OfflineService:
                 misses = 0
                 started = self.state.started_at or time.monotonic()
                 if self._failures and time.monotonic() - started >= STABLE_AFTER_SEC:
-                    log.info("offline service stable again, restart waits reset")
+                    self._log.info("offline service stable again, restart waits reset")
                     self._failures = 0
                 continue
             misses += 1
@@ -555,11 +595,18 @@ class OfflineService:
             else None,
             "appid": health.get("appid"),
         }
+        if not self._fiscal:
+            # FC-798 — a till without registers of its own says how it sees the
+            # server instead (online / no internet / server down) and whether
+            # its queue stopped until the service is updated.
+            self.state.extra["connection"] = health.get("connection")
+            self.state.extra["needsUpdate"] = health.get("needsUpdate") is True
+            del self.state.extra["fiscalPending"]
 
     def _ours(self, health: Optional[dict]) -> bool:
         return (
             health is not None
-            and health.get("name") == SERVICE_NAME
+            and health.get("name") == self._service_name
             and health.get("version") == self._expected
         )
 
@@ -608,12 +655,12 @@ class OfflineService:
                 proc.kill()
                 await proc.wait()
             except (ProcessLookupError, OSError) as e:
-                log.error("offline service pid %s could not be killed: %s", proc.pid, e)
-        log.warning("offline service did not stop on its own and was terminated")
+                self._log.error("offline service pid %s could not be killed: %s", proc.pid, e)
+        self._log.warning("offline service did not stop on its own and was terminated")
 
     def _next_wait(self) -> float:
         wait = BACKOFF_SEC[min(self._failures, len(BACKOFF_SEC)) - 1] if self._failures else BACKOFF_SEC[0]
-        log.info("offline service: next start in %.0fs (failure %d)", wait, self._failures)
+        self._log.info("offline service: next start in %.0fs (failure %d)", wait, self._failures)
         return wait
 
     def _fail(
@@ -626,7 +673,7 @@ class OfflineService:
             # Shown as «restarts»: only a service that was really started.
             self.state.restarts += 1
         self.state.last_error = why
-        log.log(level, "offline service: %s", why)
+        self._log.log(level, "offline service: %s", why)
 
     def _open_log(self, rotate: bool = False):
         try:
@@ -637,7 +684,7 @@ class OfflineService:
         except OSError as e:
             # The output is then dropped (read and discarded), never mixed
             # into the manager's own log.
-            log.warning("offline service: no log file (%s)", e)
+            self._log.warning("offline service: no log file (%s)", e)
             return None
 
 
