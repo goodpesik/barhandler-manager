@@ -140,6 +140,10 @@ def test_both_installers_carry_the_runtime_when_its_secrets_are_set(workflow, wi
         assert fit[0]["if"] == "${{ env.OFFLINE_REPO_TOKEN != '' && vars.FIT_OFFLINE_ENABLED == 'true' }}"
         assert fit[0]["with"]["service-repo"] == "goodpesik/fitstudiocrm-offline"
         assert fit[0]["with"]["out"].endswith("offline-runtime/fitstudiocrm")
+        # An empty app .env must stop the fit build; Petshandler's step keeps
+        # building as before.
+        assert fit[0]["with"]["app-env-required"] == "true"
+        assert "app-env-required" not in uses[0]["with"]
     win_steps = jobs[windows]["steps"]
     names = [s.get("name") for s in win_steps]
     assert names.index("Offline runtime") < names.index("Build installer (Inno Setup)")
@@ -152,6 +156,26 @@ def test_both_installers_carry_the_runtime_when_its_secrets_are_set(workflow, wi
     assert mac_names.index("Offline runtime") < mac_names.index(sign)
     runtime = next(s for s in mac_steps if s.get("name") == "Offline runtime")
     assert runtime["with"]["out"].startswith("dist/Device Handler.app/Contents/Resources/offline-runtime/")
+
+
+def _app_env_check(app_env: str, required: str | None) -> subprocess.CompletedProcess:
+    action = yaml.safe_load((ROOT / ".github/actions/offline-runtime/action.yml").read_text())
+    step = action["runs"]["steps"][0]
+    assert step["name"] == "Check the app's .env is given"
+    defaults = action["inputs"]["app-env-required"]["default"]
+    env = {**os.environ, "APP_ENV": app_env, "REQUIRED": defaults if required is None else required, "APP_REPO": "goodpesik/x-app"}
+    return subprocess.run(["bash", "-c", step["run"]], capture_output=True, text=True, env=env, timeout=30)
+
+
+def test_an_empty_app_env_fails_a_runtime_that_requires_it():
+    r = _app_env_check("", "true")
+    assert r.returncode != 0
+    assert "::error::" in r.stdout and "goodpesik/x-app" in r.stdout
+
+
+@pytest.mark.parametrize("app_env,required", [("VklURT0x", "true"), ("", None), ("VklURT0x", None)])
+def test_the_app_env_check_lets_the_other_builds_through(app_env, required):
+    assert _app_env_check(app_env, required).returncode == 0
 
 
 def test_the_mac_script_signs_the_nested_node_before_the_app():

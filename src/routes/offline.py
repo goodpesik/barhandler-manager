@@ -120,17 +120,21 @@ async def sync_now(request: Request) -> dict:
             },
         )
     st = svc.state
-    log.info(
-        "offline sync now (%s): %s%s, %s still queued",
-        product,
-        ran.get("ran"),
+    outcome = (
         " (it did not go through)"
         if ran.get("failed")
         else " (the server does not accept this device)"
         if ran.get("needsPairing")
-        else "",
-        st.extra.get("queued"),
+        else ""
     )
+    if product == "petshandler":
+        # Petshandler keeps its original line: logs are searched by it.
+        log.info("offline sync now: %s%s, %s still queued", ran.get("ran"), outcome, st.extra.get("queued"))
+    else:
+        log.info(
+            "offline sync now (%s): %s%s, %s still queued",
+            product, ran.get("ran"), outcome, st.extra.get("queued"),
+        )
     return {
         "ran": ran.get("ran"),
         # PET-1057 — «it did nothing», «it did not go through» and «this

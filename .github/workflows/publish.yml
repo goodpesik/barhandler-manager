@@ -230,6 +230,7 @@ jobs:
           out: offline-runtime/fitstudiocrm
           token: ${{ env.OFFLINE_REPO_TOKEN }}
           app-env: ${{ secrets.FITSTUDIOCRM_APP_ENV }}
+          app-env-required: "true"
           service-repo: goodpesik/fitstudiocrm-offline
           app-repo: goodpesik/fitstudiocrm-app
       - name: Build installer (Inno Setup)
@@ -353,6 +354,7 @@ jobs:
           out: "dist/Device Handler.app/Contents/Resources/offline-runtime/fitstudiocrm"
           token: ${{ env.OFFLINE_REPO_TOKEN }}
           app-env: ${{ secrets.FITSTUDIOCRM_APP_ENV }}
+          app-env-required: "true"
           service-repo: goodpesik/fitstudiocrm-offline
           app-repo: goodpesik/fitstudiocrm-app
       # `xcrun stapler` fetches the ticket over HTTP/3 (UDP 443), and on

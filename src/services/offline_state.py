@@ -146,12 +146,15 @@ def activate(payload: dict) -> dict:
         public_keys.append("deviceNumber")
     _write_json(folder / "config.json", config)
     _write_json(offline_root(product) / "active.json", {"appid": appid})
-    log.info(
-        "offline mode activated for %s shop %s, device %s%s (%s)",
-        product, appid, device_id,
-        f" number {device_number}" if device_number is not None else "",
-        "new token" if previous == appid else "first activation",
-    )
+    how = "new token" if previous == appid else "first activation"
+    if product == "petshandler":
+        # Petshandler keeps its original line: logs are searched by it.
+        log.info("offline mode activated for shop %s, device %s (%s)", appid, device_id, how)
+    else:
+        log.info(
+            "offline mode activated for %s shop %s, device %s number %s (%s)",
+            product, appid, device_id, device_number, how,
+        )
     return {k: config[k] for k in public_keys}
 
 

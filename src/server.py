@@ -254,7 +254,7 @@ def create_app(config: dict) -> FastAPI:
     #  - any Firebase Hosting subdomain (production + preview channels)
     #  - any *.firebaseapp.com fallback URL
     #  - tenant deployments on barhandler.com / petshandler.com /
-    #    fitstudiocrm.com — apex domains AND any subdomain depth
+    #    fitstudiocrm.com / fitshandler.com — apex domains AND any subdomain depth
     #    (biergarten-lviv.barhandler.com, app.fitstudiocrm.com, etc.)
     #  - localhost on any port via http or https (covers dev servers
     #    and Capacitor Android wrappers, which use `https://localhost`)
@@ -273,6 +273,9 @@ def create_app(config: dict) -> FastAPI:
         r"|https://([a-zA-Z0-9-]+\.)*barhandler\.com"
         r"|https://([a-zA-Z0-9-]+\.)*petshandler\.com"
         r"|https://([a-zA-Z0-9-]+\.)*fitstudiocrm\.com"
+        # FC-798 — the Fit admin app moved to fitshandler.com
+        # (app.fitshandler.com); fitstudiocrm.com stays for old links.
+        r"|https://([a-zA-Z0-9-]+\.)*fitshandler\.com"
         r")$"
     )
     # NB: `allow_credentials=True` + `allow_headers=["*"]` is invalid
