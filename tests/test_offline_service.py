@@ -152,6 +152,9 @@ async def test_a_service_that_dies_is_started_again(fake, monkeypatch):
         assert svc.state.restarts >= 1
         # Running again, and why it had to be restarted is still shown.
         assert "exited" in (svc.state.last_error or "")
+        # A start that works is what ends the malfunction: the shop is not
+        # left reading about a till that is serving again.
+        assert svc.state.startup == offline_service.STARTUP_RUNNING
     finally:
         await svc.stop()
         task.cancel()
@@ -929,6 +932,34 @@ async def test_a_start_that_cannot_work_says_failed(fake):
     try:
         assert await _until(lambda: svc.state.startup == offline_service.STARTUP_FAILED)
         assert not svc.state.running and "taken by someone-else" in svc.state.last_error
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_start_that_failed_keeps_saying_so_while_the_manager_retries(fake):
+    """The malfunction is told until the till is really up, not swapped for a
+    spinner every few seconds by the attempts in between."""
+    make, _ = fake
+    # The phase as each attempt found it: the health check is the first thing
+    # an attempt does, so this reads it right after the phase was set.
+    phases = []
+
+    def taken_by_someone_else(port):
+        phases.append(svc.state.startup)
+        return {"name": "someone-else", "version": "9"}
+
+    svc = make(port=_free_port(), fetch_health=taken_by_someone_else)
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: len(phases) >= 3)
+        assert svc.state.startup == offline_service.STARTUP_FAILED
+        # The first attempt is a start under way; every one after the failure
+        # leaves the malfunction standing.
+        assert phases[0] == offline_service.STARTUP_STARTING
+        assert set(phases[1:]) == {offline_service.STARTUP_FAILED}
     finally:
         await svc.stop()
         task.cancel()

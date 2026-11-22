@@ -122,14 +122,16 @@ LOG_MAX_BYTES = 5 * 1024 * 1024
 #: app that has only that word has to call a starting till broken.
 #: Nothing to start: no shop is activated for this product on this computer.
 STARTUP_IDLE = "idle"
-#: Being brought up right now (a fresh activation, a changed till number, a
-#: restart after a failure). It answers /health within START_TIMEOUT_SEC or
-#: the phase becomes `failed`.
+#: Coming up, and nothing has failed since the activation: switched on just
+#: now, or the till number changed. It answers /health within
+#: START_TIMEOUT_SEC or the phase becomes `failed`.
 STARTUP_STARTING = "starting"
 #: Up, on our version, answering /health.
 STARTUP_RUNNING = "running"
-#: The last attempt failed; `last_error` says why. Another attempt follows
-#: after BACKOFF_SEC, which moves the phase back to `starting`.
+#: A start has failed; `last_error` says why. Attempts go on after BACKOFF_SEC
+#: and do NOT take the phase back to `starting`: the shop is told about the
+#: malfunction until the till is really up (`running`), until it is activated
+#: again, or until the mode is switched off (`idle`).
 STARTUP_FAILED = "failed"
 
 
@@ -380,7 +382,20 @@ class OfflineService:
             # Said before the attempt, so the whole of it — the port check, the
             # spawn, the wait for our version on /health — reads as a start
             # under way rather than as a till that is not running.
-            self.state.startup = STARTUP_STARTING
+            if self.state.startup in (STARTUP_IDLE, STARTUP_STARTING, STARTUP_RUNNING):
+                self.state.startup = STARTUP_STARTING
+            else:
+                # A start that has already failed keeps saying so until the
+                # till is really up. The manager goes on retrying either way,
+                # but the shop is not shown the malfunction, then a spinner,
+                # then the malfunction again every few seconds: `failed` is
+                # left only by a start that works, by activating again, or by
+                # switching the mode off. So `starting` means «coming up and
+                # nothing has failed since the activation», and the retry is
+                # said here, or minutes of retrying would read as silence.
+                self._log.info(
+                    "offline service: starting again after a failure; still reported as a failed start"
+                )
             try:
                 started = await self._start(cfg)
                 if started:
@@ -845,9 +860,10 @@ class OfflineService:
         # This is where the phase is set to «broken», for the endings that do
         # come through here: a missing runtime, secrets that cannot be read, a
         # port held by another program, an exit, silence on /health, a
-        # surprise inside an attempt. The next attempt sets it back to
-        # `starting`. Other endings are not failures and are said where they
-        # happen — a switch-off and a shop that is not activated say `idle`,
+        # surprise inside an attempt. It stays said until the till is really
+        # up, or the activation changes, or the mode goes off — the retries in
+        # between leave it alone. Other endings are not failures and are said
+        # where they happen — a switch-off and a shop that is not activated say `idle`,
         # a start that worked says `running` — so a branch that gives up on
         # an attempt has to say what the phase is itself.
         self.state.startup = STARTUP_FAILED
