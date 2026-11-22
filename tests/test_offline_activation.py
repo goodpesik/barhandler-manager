@@ -38,7 +38,7 @@ PAYLOAD = {
 class FakeService:
     """The supervisor, reduced to what the routes and the busy guard use."""
 
-    def __init__(self, queued, running=True, sync_answer=None, port=9898, health=None):
+    def __init__(self, queued, running=True, sync_answer=None, port=9898, health=None, startup=None):
         self.queued = queued
         self.health = health or {}
         self.fiscal_calls = []
@@ -46,11 +46,17 @@ class FakeService:
         self.port = port
         self.stopped = 0
         self.synced = 0
+        self.nudged = 0
         self.sync_answer = sync_answer
         self.state = offline_service.OfflineServiceState(
             running=running,
+            startup=startup or offline_service.STARTUP_RUNNING,
             extra={"queued": queued, "dataAsOf": "2026-10-10T00:05:00.000Z"},
         )
+
+    def activation_changed(self):
+        """FC-829 — start the till for the new activation now."""
+        self.nudged += 1
 
     async def run_forever(self):
         return None
@@ -219,6 +225,38 @@ def test_status_shows_the_shop_and_the_queue_but_no_secret(client_for):
     assert body["activated"] and body["appid"] == "bark-01" and body["shopName"] == "Барк"
     assert body["service"]["queued"] == 3
     assert "pho_" not in json.dumps(body)
+
+
+@pytest.mark.parametrize(
+    "startup",
+    [
+        offline_service.STARTUP_IDLE,
+        offline_service.STARTUP_STARTING,
+        offline_service.STARTUP_RUNNING,
+        offline_service.STARTUP_FAILED,
+    ],
+)
+def test_status_says_how_the_till_stands_beyond_running(client_for, startup):
+    """FC-829 — the online app tells a till coming up from a till that failed."""
+    c = client_for(FakeService(0, running=False, startup=startup))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    assert c.get("/offline/status", headers=KEY).json()["service"]["startup"] == startup
+
+
+def test_switching_on_tells_the_supervisor_to_start_the_till_now(client_for):
+    """FC-829 — the supervisor reads the activation at the top of its loop,
+    which may be a wait away: the button would appear with that delay."""
+    svc = FakeService(0)
+    c = client_for(svc)
+    assert c.post("/offline/activate", json=PAYLOAD, headers=KEY).status_code == 200
+    assert svc.nudged == 1
+
+
+def test_a_refused_activation_does_not_start_anything(client_for):
+    svc = FakeService(0)
+    c = client_for(svc)
+    assert c.post("/offline/activate", json={"appid": "bark-01"}, headers=KEY).status_code == 400
+    assert svc.nudged == 0
 
 
 def test_switching_off_waits_for_the_queue(client_for, home):

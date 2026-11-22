@@ -893,3 +893,123 @@ async def test_the_fit_supervisor_runs_only_its_own_service(fake, monkeypatch, a
 def test_the_fit_supervisor_takes_its_own_port_by_default():
     assert OfflineService(lambda: None, argv=["n", "m"], expected_version="1", product="fitstudiocrm").port == 9899
     assert OfflineService(lambda: None, argv=["n", "m"], expected_version="1").port == 9898
+
+
+# ---- FC-829: a start under way is not a malfunction ----------------------
+
+
+@pytest.mark.asyncio
+async def test_a_till_coming_up_says_starting_until_it_answers(fake, monkeypatch):
+    """The online app shows a start under way, and only then the till."""
+    make, _ = fake
+    # The fake holds its /health back, as the real service does while it
+    # opens its database and loads the local copy.
+    monkeypatch.setenv("FAKE_HEALTH_DELAY", "1")
+    svc = make()
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(
+            lambda: svc.state.startup == offline_service.STARTUP_STARTING and not svc.state.running
+        )
+        assert await _until(lambda: svc.state.running, timeout=15)
+        assert svc.state.startup == offline_service.STARTUP_RUNNING
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_start_that_cannot_work_says_failed(fake):
+    """Another program on the port: the till will not come up by waiting."""
+    make, _ = fake
+    svc = make(port=_free_port(), fetch_health=lambda p: {"name": "someone-else", "version": "9"})
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: svc.state.startup == offline_service.STARTUP_FAILED)
+        assert not svc.state.running and "taken by someone-else" in svc.state.last_error
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_shop_not_activated_has_nothing_starting(fake):
+    make, _ = fake
+    svc = make(config={})
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: svc.state.startup == offline_service.STARTUP_IDLE)
+        await asyncio.sleep(0.3)
+        assert svc.state.startup == offline_service.STARTUP_IDLE
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_switching_offline_mode_off_is_not_a_failed_start(fake):
+    """Switching off takes the secrets with it, as the route does."""
+    make, _ = fake
+    config = {"appid": "shop", "deviceToken": "pho_secret", "dataKey": "k"}
+    svc = make(config=config)
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: svc.state.running)
+        config.clear()
+        await svc.stop_service()
+        assert svc.state.startup == offline_service.STARTUP_IDLE
+        # Not «the till did not start»: nobody asked it to run.
+        assert await _until(lambda: svc.state.startup == offline_service.STARTUP_IDLE)
+        assert svc.state.last_error is None and svc.state.restarts == 0
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_activation_is_a_start_under_way_not_the_old_failure(fake):
+    """What the previous activation failed at is not this one's verdict."""
+    make, _ = fake
+    svc = make(port=_free_port(), fetch_health=lambda p: {"name": "someone-else", "version": "9"})
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: svc.state.startup == offline_service.STARTUP_FAILED)
+        svc.activation_changed()
+        assert svc.state.startup == offline_service.STARTUP_STARTING
+        assert svc.state.last_error is None
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_wait_between_attempts_ends_on_a_fresh_activation():
+    """Switched on during a wait, the till starts now instead of a minute later."""
+    svc = OfflineService(
+        lambda: None, argv=["node", "main.js"], expected_version="1.2.3",
+        sleep=lambda seconds: asyncio.sleep(30),
+    )
+    waiting = asyncio.create_task(svc._wait(30))
+    await asyncio.sleep(0.05)
+    assert not waiting.done()
+    svc.activation_changed()
+    await asyncio.wait_for(waiting, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_a_wait_that_runs_out_leaves_nothing_waiting_behind():
+    """One attempt per wait, not a waiter piling up for the manager's lifetime."""
+    svc = OfflineService(
+        lambda: None, argv=["node", "main.js"], expected_version="1.2.3",
+        sleep=lambda seconds: asyncio.sleep(0),
+    )
+    before = len(asyncio.all_tasks())
+    for _ in range(5):
+        await svc._wait(0)
+    await asyncio.sleep(0.05)
+    assert len(asyncio.all_tasks()) == before

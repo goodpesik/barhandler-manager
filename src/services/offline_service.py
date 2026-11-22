@@ -116,6 +116,22 @@ IDLE_EVERY_SEC = 30.0
 #: The service's own output is kept, capped, for support.
 LOG_MAX_BYTES = 5 * 1024 * 1024
 
+#: How the till's own service stands, beyond «running». `running` alone cannot
+#: tell a start in progress from a start that will never finish: it is false
+#: while the service comes up and false when it has just failed, so an online
+#: app that has only that word has to call a starting till broken.
+#: Nothing to start: no shop is activated for this product on this computer.
+STARTUP_IDLE = "idle"
+#: Being brought up right now (a fresh activation, a changed till number, a
+#: restart after a failure). It answers /health within START_TIMEOUT_SEC or
+#: the phase becomes `failed`.
+STARTUP_STARTING = "starting"
+#: Up, on our version, answering /health.
+STARTUP_RUNNING = "running"
+#: The last attempt failed; `last_error` says why. Another attempt follows
+#: after BACKOFF_SEC, which moves the phase back to `starting`.
+STARTUP_FAILED = "failed"
+
 
 #: The runtime folder's name; the shops' data is in APP_DIR/offline.
 RUNTIME_FOLDER = "offline-runtime"
@@ -253,6 +269,10 @@ class OfflineServiceState:
     restarts: int = 0
     last_error: Optional[str] = None
     started_at: Optional[float] = None
+    #: One of STARTUP_IDLE / STARTUP_STARTING / STARTUP_RUNNING /
+    #: STARTUP_FAILED: what the online app shows while the till is not yet
+    #: there — a start under way or a malfunction.
+    startup: str = STARTUP_IDLE
     extra: dict = field(default_factory=dict)
 
 
@@ -300,6 +320,10 @@ class OfflineService:
         self._pump: Optional[asyncio.Task] = None
         self._stopping = False
         self._failures = 0
+        #: Raised by a fresh activation so a wait between attempts ends there
+        #: and then, instead of leaving the person who has just switched the
+        #: mode on in front of a till that has not even begun to start.
+        self._wake = asyncio.Event()
         self.state = OfflineServiceState()
 
     # ---- public ------------------------------------------------------
@@ -328,22 +352,27 @@ class OfflineService:
                 if not told_idle:
                     self._log.info("offline service: the shop is not activated, nothing to start")
                     told_idle = True
-                await self._sleep(IDLE_EVERY_SEC)
+                self.state.startup = STARTUP_IDLE
+                await self._wait(IDLE_EVERY_SEC)
                 continue
             told_idle = False
             if not self._runtime_ready():
-                await self._sleep(IDLE_EVERY_SEC)
+                await self._wait(IDLE_EVERY_SEC)
                 continue
             self._cfg_key = _config_key(cfg)
             # A switch-off belongs to the service it stopped, not to this one.
             self._stopped_on_purpose = False
+            # Said before the attempt, so the whole of it — the port check, the
+            # spawn, the wait for our version on /health — reads as a start
+            # under way rather than as a till that is not running.
+            self.state.startup = STARTUP_STARTING
             started = await self._start(cfg)
             if started:
                 await self._watch()
             if self._stopping:
                 break
             await self._stop_process()
-            await self._sleep(self._next_wait())
+            await self._wait(self._next_wait())
 
     async def stop(self) -> None:
         """Stop supervising and stop the service (manager shutdown)."""
@@ -354,7 +383,39 @@ class OfflineService:
         """Stop the running service now (switching offline mode off); the loop
         goes on and starts nothing until a shop is activated again."""
         self._stopped_on_purpose = True
+        # Switched off on purpose: there is nothing starting and nothing broken.
+        self.state.startup = STARTUP_IDLE
         await self._stop_process()
+
+    def activation_changed(self) -> None:
+        """A shop has just been activated here, or its till number changed.
+
+        The supervisor reads the activation at the top of its loop, which may
+        be a wait away, so the till takes a moment to come up. Said here, that
+        moment reads as a start under way: the waits begin again from the
+        shortest, the wait running right now ends, and the reason the PREVIOUS
+        activation failed is dropped — kept, it would be shown as the reason
+        this one failed.
+        """
+        self._failures = 0
+        self.state.last_error = None
+        self.state.startup = STARTUP_STARTING
+        self._wake.set()
+
+    async def _wait(self, seconds: float) -> None:
+        """Wait between attempts, or until a fresh activation cuts it short."""
+        self._wake.clear()
+        napping = asyncio.ensure_future(self._sleep(seconds))
+        waking = asyncio.ensure_future(self._wake.wait())
+        try:
+            await asyncio.wait({napping, waking}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            # Whichever lost is dropped here: left running, the sleep would
+            # fire into the next wait and the waiter would pile up one task
+            # per attempt for as long as the manager lives.
+            for task in (napping, waking):
+                if not task.done():
+                    task.cancel()
 
     @property
     def port(self) -> int:
@@ -462,6 +523,7 @@ class OfflineService:
                     # Why it last had to be restarted stays visible.
                     last_error=self.state.last_error,
                     started_at=time.monotonic(),
+                    startup=STARTUP_RUNNING,
                 )
                 self._remember(health)
                 self._log.info(
@@ -565,6 +627,9 @@ class OfflineService:
             if now_key != self._cfg_key:
                 self._log.info("offline service: the activation changed, restarting")
                 self._failures = 0
+                # A till number changed, or access was renewed: the service is
+                # about to be replaced, not failing.
+                self.state.startup = STARTUP_STARTING
                 return
             health = await asyncio.to_thread(self._fetch, self._port)
             if self._ours(health):
@@ -673,6 +738,11 @@ class OfflineService:
             # Shown as «restarts»: only a service that was really started.
             self.state.restarts += 1
         self.state.last_error = why
+        # Every way a start or a run can end badly comes through here, so this
+        # is the one place the phase has to say «broken»: a missing runtime, a
+        # port held by another program, an exit, silence on /health. The next
+        # attempt sets it back to `starting`.
+        self.state.startup = STARTUP_FAILED
         self._log.log(level, "offline service: %s", why)
 
     def _open_log(self, rotate: bool = False):
