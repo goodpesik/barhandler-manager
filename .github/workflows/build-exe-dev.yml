@@ -55,10 +55,11 @@ jobs:
           out: offline-runtime/petshandler
           token: ${{ env.OFFLINE_REPO_TOKEN }}
           app-env: ${{ secrets.PETSHANDLER_APP_ENV }}
-      # FC-798 — the FitStudioCRM offline runtime beside it, once its repos
-      # exist and the repository variable FIT_OFFLINE_ENABLED is 'true'.
+      # FC-798 — the FitStudioCRM offline runtime beside it. On this scratch
+      # branch the FIT_OFFLINE_ENABLED gate is dropped and the offline app is
+      # built from the app's `dev` ref, which carries `build:offline`.
       - name: FitStudioCRM offline runtime
-        if: ${{ env.OFFLINE_REPO_TOKEN != '' && vars.FIT_OFFLINE_ENABLED == 'true' }}
+        if: ${{ env.OFFLINE_REPO_TOKEN != '' }}
         uses: ./.github/actions/offline-runtime
         with:
           platform: win-x64
@@ -68,6 +69,7 @@ jobs:
           app-env-required: "true"
           service-repo: goodpesik/fitstudiocrm-offline
           app-repo: goodpesik/fitstudiocrm-app
+          app-ref: dev
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
@@ -142,7 +144,7 @@ jobs:
           app-env: ${{ secrets.PETSHANDLER_APP_ENV }}
       # FC-798 — the FitStudioCRM offline runtime beside it, signed with the app.
       - name: FitStudioCRM offline runtime
-        if: ${{ env.OFFLINE_REPO_TOKEN != '' && vars.FIT_OFFLINE_ENABLED == 'true' }}
+        if: ${{ env.OFFLINE_REPO_TOKEN != '' }}
         uses: ./.github/actions/offline-runtime
         with:
           platform: ${{ matrix.arch == 'intel' && 'darwin-x64' || 'darwin-arm64' }}
@@ -152,6 +154,7 @@ jobs:
           app-env-required: "true"
           service-repo: goodpesik/fitstudiocrm-offline
           app-repo: goodpesik/fitstudiocrm-app
+          app-ref: dev
       - name: Sign and package
         env:
           MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}
