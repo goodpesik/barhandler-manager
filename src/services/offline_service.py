@@ -324,6 +324,15 @@ class OfflineService:
         #: and then, instead of leaving the person who has just switched the
         #: mode on in front of a till that has not even begun to start.
         self._wake = asyncio.Event()
+        #: Counts the activations the supervisor has been told about, and
+        #: `_attempt` is the one the round of the loop under way belongs to.
+        #: An attempt may take half a minute, and an activation arriving
+        #: inside it replaces the configuration that attempt is working with:
+        #: whatever it ends up saying — it failed, it is running — is about
+        #: something nobody is waiting for any more, and must not be written
+        #: over what the new activation says about itself.
+        self._activation = 0
+        self._attempt = 0
         self.state = OfflineServiceState()
 
     # ---- public ------------------------------------------------------
@@ -340,13 +349,19 @@ class OfflineService:
     async def _loop(self) -> None:
         told_idle = False
         while not self._stopping:
+            # The activation this round of the loop works for. A new one
+            # arriving in the middle of it supersedes this round, and what
+            # this round then says about the till is no longer the answer.
+            self._attempt = self._activation
             try:
                 cfg = self._load_config()
             except SecretsUnreadable as e:
                 # Not «not activated»: the secrets are there, just not readable
-                # now. Nothing to start with; try again shortly.
-                self._log.warning("offline service: secrets unreadable, not starting yet: %s", e)
-                await self._sleep(IDLE_EVERY_SEC)
+                # now. The till cannot be started with them, so this is a
+                # failed start and not an endless one — and the wait ends on a
+                # fresh activation, which may well be what makes them readable.
+                self._fail(f"the saved offline secrets could not be read: {e}", once=True, started=False)
+                await self._wait(IDLE_EVERY_SEC)
                 continue
             if not cfg:
                 if not told_idle:
@@ -366,9 +381,19 @@ class OfflineService:
             # spawn, the wait for our version on /health — reads as a start
             # under way rather than as a till that is not running.
             self.state.startup = STARTUP_STARTING
-            started = await self._start(cfg)
-            if started:
-                await self._watch()
+            try:
+                started = await self._start(cfg)
+                if started:
+                    await self._watch()
+            # Deliberately every exception, and only those: a cancellation is
+            # not one of them (BaseException), so stopping still stops.
+            except Exception as e:  # noqa: BLE001
+                # A surprise anywhere in the attempt (a health check that
+                # itself breaks, a log file that turns into a directory) used
+                # to end the supervisor: the till then stayed dead and the
+                # phase stayed `starting` for good. Said as a failed start
+                # instead, and the next attempt follows as after any failure.
+                self._fail(f"unexpected error while starting or watching: {e}", level=logging.ERROR)
             if self._stopping:
                 break
             await self._stop_process()
@@ -396,15 +421,41 @@ class OfflineService:
         shortest, the wait running right now ends, and the reason the PREVIOUS
         activation failed is dropped — kept, it would be shown as the reason
         this one failed.
+
+        Nothing is said when the till is already serving this very activation
+        — a second click on the same request, or a renewal that produced the
+        same access. There is no start ahead of it, so calling it a start
+        would leave a working till reported as starting for good.
         """
+        if self.state.running and self._is_the_running_activation():
+            self._log.info(
+                "offline service: activated again with what the running till already serves; nothing to start"
+            )
+            return
+        self._activation += 1
         self._failures = 0
         self.state.last_error = None
         self.state.startup = STARTUP_STARTING
         self._wake.set()
 
-    async def _wait(self, seconds: float) -> None:
-        """Wait between attempts, or until a fresh activation cuts it short."""
-        self._wake.clear()
+    def _is_the_running_activation(self) -> bool:
+        """Whether what is activated now is exactly what the running service
+        was started with. Anything else — a different activation, secrets
+        that cannot be read just now — counts as not it, so a start is said
+        to be under way rather than silently skipped."""
+        try:
+            key = _config_key(self._load_config())
+        except SecretsUnreadable as e:
+            self._log.warning("offline service: the activation could not be read, taken as a new one: %s", e)
+            return False
+        return key is not None and key == self._cfg_key
+
+    async def _nap(self, seconds: float) -> None:
+        """Sleep, ending early when a fresh activation is raised. The flag is
+        left standing: only `_wait` consumes it, so a wakeup seen here is
+        still there for the loop that acts on it."""
+        if self._wake.is_set():
+            return
         napping = asyncio.ensure_future(self._sleep(seconds))
         waking = asyncio.ensure_future(self._wake.wait())
         try:
@@ -416,6 +467,16 @@ class OfflineService:
             for task in (napping, waking):
                 if not task.done():
                     task.cancel()
+
+    async def _wait(self, seconds: float) -> None:
+        """Wait between attempts, or until a fresh activation cuts it short."""
+        await self._nap(seconds)
+        # Consumed here and nowhere else, and only once a wait has seen it.
+        # Cleared on the way in, as it was, it would be thrown away whenever
+        # it was raised while the supervisor was busy starting or watching —
+        # and the till would then sit out the whole wait it was meant to cut
+        # short. The loop re-reads the activation the moment this returns.
+        self._wake.clear()
 
     @property
     def port(self) -> int:
@@ -508,6 +569,14 @@ class OfflineService:
         while time.monotonic() < deadline:
             if self._stopping or self._stopped_on_purpose or self._proc is not proc:
                 return False
+            if self._attempt != self._activation:
+                # Activated again while this attempt was still waiting for an
+                # answer. It is starting the service with the configuration of
+                # the activation before, which nobody is waiting for: dropped
+                # here instead of half a minute later, so the loop can start
+                # the till for what is activated now.
+                self._log.info("offline service: the activation changed while starting; this attempt is dropped")
+                return False
             if proc.returncode is not None:
                 self._fail(f"exited on start with code {proc.returncode}")
                 return False
@@ -515,6 +584,14 @@ class OfflineService:
             if self._stopping or self._proc is not proc:
                 return False
             if self._ours(health):
+                if self._attempt != self._activation:
+                    # It came up, but for the activation before this one.
+                    # Called running, it would hide the start the new
+                    # activation is waiting for.
+                    self._log.info(
+                        "offline service: came up for an activation since replaced; starting again for the new one"
+                    )
+                    return False
                 self.state = OfflineServiceState(
                     running=True,
                     pid=proc.pid,
@@ -606,13 +683,20 @@ class OfflineService:
     async def _watch(self) -> None:
         misses = 0
         while not self._stopping:
-            await self._sleep(HEALTH_EVERY_SEC)
+            # Ends early on a fresh activation, so renewing the access on a
+            # running till replaces it now rather than at the next check.
+            await self._nap(HEALTH_EVERY_SEC)
             if self._stopping:
                 return
             proc = self._proc
             if self._stopped_on_purpose:
                 # Switched off from the dashboard or Petshandler: not a failure.
                 self._stopped_on_purpose = False
+                return
+            if self._attempt != self._activation:
+                # The phase and the waits are the new activation's business
+                # (activation_changed), so nothing is said about them here.
+                self._log.info("offline service: activated again, replacing the running service")
                 return
             if proc is None or proc.returncode is not None:
                 self._fail(f"exited with code {proc.returncode if proc else '?'}")
@@ -635,6 +719,14 @@ class OfflineService:
             if self._ours(health):
                 self._remember(health)
                 misses = 0
+                if self.state.running:
+                    # Our own child, up and answering on our version: this is
+                    # the one check that sees that, so nothing may leave a
+                    # serving till reported as starting or broken. Only while
+                    # we still hold it — a service on its way out has already
+                    # said what it is (`idle` on a switch-off) and may answer
+                    # for a moment yet.
+                    self.state.startup = STARTUP_RUNNING
                 started = self.state.started_at or time.monotonic()
                 if self._failures and time.monotonic() - started >= STABLE_AFTER_SEC:
                     self._log.info("offline service stable again, restart waits reset")
@@ -731,6 +823,18 @@ class OfflineService:
     def _fail(
         self, why: str, *, level: int = logging.WARNING, once: bool = False, started: bool = True,
     ) -> None:
+        if self._attempt != self._activation:
+            # An attempt a newer activation has replaced. It has every right
+            # to fail — it was working with a configuration that is gone —
+            # but its verdict is not the new activation's, and written here it
+            # would show the person who has just switched the mode on a
+            # malfunction instead of the start they are waiting for.
+            self._log.log(
+                level,
+                "offline service: %s — from an activation since replaced, left out of the state",
+                why,
+            )
+            return
         if once and self.state.last_error == why:
             return
         self._failures += 1
@@ -738,10 +842,14 @@ class OfflineService:
             # Shown as «restarts»: only a service that was really started.
             self.state.restarts += 1
         self.state.last_error = why
-        # Every way a start or a run can end badly comes through here, so this
-        # is the one place the phase has to say «broken»: a missing runtime, a
-        # port held by another program, an exit, silence on /health. The next
-        # attempt sets it back to `starting`.
+        # This is where the phase is set to «broken», for the endings that do
+        # come through here: a missing runtime, secrets that cannot be read, a
+        # port held by another program, an exit, silence on /health, a
+        # surprise inside an attempt. The next attempt sets it back to
+        # `starting`. Other endings are not failures and are said where they
+        # happen — a switch-off and a shop that is not activated say `idle`,
+        # a start that worked says `running` — so a branch that gives up on
+        # an attempt has to say what the phase is itself.
         self.state.startup = STARTUP_FAILED
         self._log.log(level, "offline service: %s", why)
 

@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from src.services import offline_service
+from src.services.offline_secrets import SecretsUnreadable
 from src.services.offline_service import OfflineService, SERVICE_NAME
 
 FAKE = textwrap.dedent(
@@ -936,13 +937,18 @@ async def test_a_start_that_cannot_work_says_failed(fake):
 
 @pytest.mark.asyncio
 async def test_a_shop_not_activated_has_nothing_starting(fake):
+    """A till that failed and was then switched off is not «still broken»."""
     make, _ = fake
-    svc = make(config={})
+    config = {"appid": "shop", "deviceToken": "pho_secret", "dataKey": "k"}
+    svc = make(config=config, fetch_health=lambda p: {"name": "someone-else", "version": "9"})
     task = asyncio.create_task(svc.run_forever())
     try:
+        # The phase has to be something other than `idle` to begin with, or
+        # the assertion below would hold with nothing ever setting it.
+        assert await _until(lambda: svc.state.startup == offline_service.STARTUP_FAILED)
+        config.clear()
         assert await _until(lambda: svc.state.startup == offline_service.STARTUP_IDLE)
-        await asyncio.sleep(0.3)
-        assert svc.state.startup == offline_service.STARTUP_IDLE
+        assert not svc.state.running
     finally:
         await svc.stop()
         task.cancel()
@@ -961,8 +967,11 @@ async def test_switching_offline_mode_off_is_not_a_failed_start(fake):
         config.clear()
         await svc.stop_service()
         assert svc.state.startup == offline_service.STARTUP_IDLE
-        # Not «the till did not start»: nobody asked it to run.
-        assert await _until(lambda: svc.state.startup == offline_service.STARTUP_IDLE)
+        # Not «the till did not start»: nobody asked it to run. Given time to
+        # go round, the supervisor must find nothing to report either — the
+        # service it was watching is gone, and that is not a failure.
+        await asyncio.sleep(0.3)
+        assert svc.state.startup == offline_service.STARTUP_IDLE
         assert svc.state.last_error is None and svc.state.restarts == 0
     finally:
         await svc.stop()
@@ -1013,3 +1022,124 @@ async def test_a_wait_that_runs_out_leaves_nothing_waiting_behind():
         await svc._wait(0)
     await asyncio.sleep(0.05)
     assert len(asyncio.all_tasks()) == before
+
+
+@pytest.mark.asyncio
+async def test_an_activation_raised_outside_a_wait_is_not_lost():
+    """Switched on while the supervisor was starting or watching, it has to
+    still be there when the next wait begins — or the till sits out the whole
+    wait it was meant to cut short."""
+    svc = OfflineService(
+        lambda: None, argv=["node", "main.js"], expected_version="1.2.3",
+        sleep=lambda seconds: asyncio.sleep(30),
+    )
+    svc.activation_changed()
+    await asyncio.wait_for(svc._wait(30), timeout=1)
+    # And it is spent: the wait after it waits.
+    waiting = asyncio.create_task(svc._wait(30))
+    await asyncio.sleep(0.05)
+    assert not waiting.done()
+    waiting.cancel()
+    await asyncio.gather(waiting, return_exceptions=True)
+
+
+def test_a_failure_of_a_replaced_activation_is_not_the_new_ones_verdict():
+    """The attempt under way when the mode is switched on again fails with the
+    configuration of the activation before: that is not this one's answer."""
+    svc = OfflineService(lambda: None, argv=["node", "main.js"], expected_version="1.2.3")
+    svc._attempt = svc._activation
+    svc.activation_changed()
+    svc._fail("no answer on /health within 30s")
+    assert svc.state.startup == offline_service.STARTUP_STARTING
+    assert svc.state.last_error is None and svc.state.restarts == 0
+
+
+@pytest.mark.asyncio
+async def test_the_same_activation_again_leaves_a_running_till_running(fake):
+    """A second click on «Оновити доступ» must not turn a working till into a
+    spinner; a different activation still says a start is under way."""
+    make, _ = fake
+    config = {"appid": "shop", "deviceToken": "pho_secret", "dataKey": "k"}
+    svc = make(config=config)
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: svc.state.running)
+        svc.state.last_error = "why it was last restarted"
+        svc.activation_changed()
+        assert svc.state.startup == offline_service.STARTUP_RUNNING
+        assert svc.state.last_error == "why it was last restarted"
+        await asyncio.sleep(0.3)
+        assert svc.state.running and svc.state.startup == offline_service.STARTUP_RUNNING
+        # A till number that really changed is a start under way, as before.
+        config["deviceNumber"] = 3
+        svc.activation_changed()
+        assert svc.state.startup == offline_service.STARTUP_STARTING
+        assert svc.state.last_error is None
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_a_till_that_answers_is_reported_running_whatever_was_said_before(fake):
+    """The health check is what sees the service alive, so a serving till
+    cannot be left reported as starting."""
+    make, _ = fake
+    svc = make()
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: svc.state.running)
+        svc.state.startup = offline_service.STARTUP_STARTING
+        assert await _until(lambda: svc.state.startup == offline_service.STARTUP_RUNNING)
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_secrets_that_cannot_be_read_are_a_failed_start_not_an_endless_one():
+    """Nothing can be started with them: the app is told so instead of being
+    left on a spinner, and a fresh activation is tried at once."""
+    reads = []
+
+    def unreadable():
+        reads.append(1)
+        raise SecretsUnreadable("the stored key could not be read")
+
+    svc = OfflineService(
+        unreadable, argv=["node", "main.js"], expected_version="1.2.3",
+        sleep=lambda seconds: asyncio.sleep(30),
+    )
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: svc.state.startup == offline_service.STARTUP_FAILED)
+        assert not svc.state.running and "could not be read" in svc.state.last_error
+        svc.activation_changed()
+        assert await _until(lambda: len(reads) >= 2)
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_an_unexpected_error_in_an_attempt_is_a_failed_start(fake):
+    """A supervisor that dies on a surprise leaves the till dead and the app
+    on a spinner that never ends."""
+    make, _ = fake
+
+    def explodes(port):
+        raise RuntimeError("the health check itself broke")
+
+    svc = make(fetch_health=explodes)
+    task = asyncio.create_task(svc.run_forever())
+    try:
+        assert await _until(lambda: svc.state.startup == offline_service.STARTUP_FAILED)
+        assert "the health check itself broke" in svc.state.last_error
+        assert not task.done()
+    finally:
+        await svc.stop()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
