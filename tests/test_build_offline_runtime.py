@@ -117,13 +117,28 @@ import yaml
 
 
 @pytest.mark.parametrize(
-    "workflow,windows,mac",
+    # fit_if is the exact `if:` each workflow's FitStudioCRM step must carry.
+    # The release pipeline keeps the repository-variable gate; on this scratch
+    # branch the dev channel carries the token-only form so one nightly build
+    # can contain both offline tills. Each row is an exact string comparison,
+    # so dropping the gate from publish.yml still fails this test.
+    "workflow,windows,mac,fit_if",
     [
-        (".github/workflows/publish.yml", "build-windows-exe", "build-macos-app"),
-        (".github/workflows/build-exe-dev.yml", "build-windows", "build-macos"),
+        (
+            ".github/workflows/publish.yml",
+            "build-windows-exe",
+            "build-macos-app",
+            "${{ env.OFFLINE_REPO_TOKEN != '' && vars.FIT_OFFLINE_ENABLED == 'true' }}",
+        ),
+        (
+            ".github/workflows/build-exe-dev.yml",
+            "build-windows",
+            "build-macos",
+            "${{ env.OFFLINE_REPO_TOKEN != '' }}",
+        ),
     ],
 )
-def test_both_installers_carry_the_runtime_when_its_secrets_are_set(workflow, windows, mac):
+def test_both_installers_carry_the_runtime_when_its_secrets_are_set(workflow, windows, mac, fit_if):
     jobs = yaml.safe_load((ROOT / workflow).read_text())["jobs"]
     for job in (windows, mac):
         steps = jobs[job]["steps"]
@@ -137,7 +152,7 @@ def test_both_installers_carry_the_runtime_when_its_secrets_are_set(workflow, wi
         # variable), so a release without it builds exactly as before.
         fit = [s for s in runtimes if s.get("name") == "FitStudioCRM offline runtime"]
         assert len(fit) == 1 and len(runtimes) == 2, job
-        assert fit[0]["if"] == "${{ env.OFFLINE_REPO_TOKEN != '' && vars.FIT_OFFLINE_ENABLED == 'true' }}"
+        assert fit[0]["if"] == fit_if
         assert fit[0]["with"]["service-repo"] == "goodpesik/fitstudiocrm-offline"
         assert fit[0]["with"]["out"].endswith("offline-runtime/fitstudiocrm")
         # An empty app .env must stop the fit build; Petshandler's step keeps
