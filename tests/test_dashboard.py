@@ -130,3 +130,54 @@ def test_the_offline_modal_links_to_the_till_only_while_it_runs() -> None:
     opened = src.split("async function openOfflineModal()", 1)[1]
     before_try = opened.split("try {", 1)[0]
     assert '$("offline-open").style.display = "none";' in before_try
+
+
+# --- BH-195 --------------------------------------------------------------
+#
+# The Device Handler serves two products, and the offline window is opened for
+# one row at a time. `offlineKey` picks the product's own string when the uk
+# dictionary carries one and silently falls back to the shared (Petshandler)
+# string when it does not -- so a missing override is not a crash, it is the
+# other product's settings path shown to a FitStudioCRM shop.
+
+
+def _i18n_entries(lang: str) -> dict[str, str]:
+    """key -> value for one I18N dictionary, top indent level only."""
+    src = _dashboard_js()
+    body = src.split(f"    {lang}: {{", 1)[1].split("\n    },", 1)[0]
+    return dict(re.findall(r'^      ([a-z0-9_]+): "(.*)",$', body, re.MULTILINE))
+
+
+def _offline_products() -> list[str]:
+    src = _dashboard_js()
+    body = src.split("const OFFLINE_PRODUCTS = [", 1)[1].split("];", 1)[0]
+    return re.findall(r'id: "([a-z0-9_]+)"', body)
+
+
+def test_each_product_has_its_own_offline_hint() -> None:
+    """Without an override the fallback is Petshandler's path, which is the
+    defect this ticket fixes rather than a visible failure."""
+    products = _offline_products()
+    assert products[0] == "petshandler", "the shared keys are Petshandler's"
+    for lang in ("uk", "en"):
+        keys = _i18n_keys(lang)
+        for product in products[1:]:
+            assert f"offline_hint_{product}" in keys, (
+                f"{lang}: offline_hint falls back to Petshandler for {product}"
+            )
+
+
+def test_a_product_specific_string_never_names_another_product() -> None:
+    """The override exists precisely so the text stops naming Petshandler."""
+    names = {"petshandler": "Petshandler", "fitstudiocrm": "FitStudioCRM"}
+    for lang in ("uk", "en"):
+        for key, value in _i18n_entries(lang).items():
+            for product, name in names.items():
+                if not key.endswith(f"_{product}"):
+                    continue
+                for other, other_name in names.items():
+                    if other == product:
+                        continue
+                    assert other_name not in value, (
+                        f"{lang}.{key} is shown for {product} but names {other_name}"
+                    )
