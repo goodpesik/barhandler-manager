@@ -154,30 +154,110 @@ def _offline_products() -> list[str]:
     return re.findall(r'id: "([a-z0-9_]+)"', body)
 
 
+def _product_titles() -> dict[str, str]:
+    """product id -> the name the window prints for it."""
+    src = _dashboard_js()
+    body = src.split("const OFFLINE_PRODUCTS = [", 1)[1].split("];", 1)[0]
+    titles = dict(re.findall(r'id: "([a-z0-9_]+)", title: "([^"]+)"', body))
+    assert titles, "OFFLINE_PRODUCTS no longer lists id and title together"
+    return titles
+
+
+def _offline_override_bases() -> set[str]:
+    """The keys `offlineKey` is asked for, taken from its call sites.
+
+    Read from the source rather than listed here, so that a fourth key
+    routed through the helper is covered the day it is added.
+    """
+    bases = set(re.findall(r'offlineKey\("([a-z0-9_]+)"', _dashboard_js()))
+    assert len(bases) >= 3, f"offlineKey call sites not found: {bases}"
+    return bases
+
+
+#: The product the shared, un-suffixed keys belong to. `offlineKey` falls
+#: back to those keys, so they are what every other product gets by default.
+_SHARED_PRODUCT = "petshandler"
+
+
+def _navigation_steps(hint: str) -> list[str]:
+    """The steps a hint sends the person through, product name dropped.
+
+    A hint reads «lead-in, Product -> step -> step -> button», so the first
+    chunk carries the name and the rest is the path. Comparing paths keeps
+    the check off the wording: a copy edit moves text, not steps.
+    """
+    steps = [part.strip() for part in hint.split("\u2192")]
+    assert len(steps) > 2, f"not a navigation path: {hint}"
+    return steps[1:]
+
+
+def _offline_strings(lang: str) -> dict[str, dict[str, str]]:
+    """product -> {base key: the string the window actually shows for it}.
+
+    Mirrors `offlineKey`: the product's own entry when the dictionary has
+    one, the shared entry otherwise.
+    """
+    entries = _i18n_entries(lang)
+    shown: dict[str, dict[str, str]] = {}
+    for product in _offline_products():
+        own = {}
+        for base in _offline_override_bases():
+            assert base in entries, f"{lang}: no shared {base} to fall back to"
+            own[base] = entries.get(f"{base}_{product}", entries[base])
+        shown[product] = own
+    return shown
+
+
 def test_each_product_has_its_own_offline_hint() -> None:
-    """Without an override the fallback is Petshandler's path, which is the
-    defect this ticket fixes rather than a visible failure."""
+    """A product with no entry of its own is shown Petshandler's text, and
+    nothing fails while it happens -- so every key the helper is asked for
+    needs an override, not just the hint. And an override that walks the
+    same steps as the string it replaces is not an override: it is
+    Petshandler's settings path under another product's name.
+    """
     products = _offline_products()
-    assert products[0] == "petshandler", "the shared keys are Petshandler's"
+    assert _SHARED_PRODUCT in products, "the shared keys are Petshandler's"
+    bases = _offline_override_bases()
     for lang in ("uk", "en"):
-        keys = _i18n_keys(lang)
-        for product in products[1:]:
-            assert f"offline_hint_{product}" in keys, (
-                f"{lang}: offline_hint falls back to Petshandler for {product}"
+        entries = _i18n_entries(lang)
+        for product in products:
+            if product == _SHARED_PRODUCT:
+                continue
+            for base in bases:
+                assert f"{base}_{product}" in entries, (
+                    f"{lang}: {base} falls back to {_SHARED_PRODUCT} for {product}"
+                )
+            assert _navigation_steps(
+                entries[f"offline_hint_{product}"]
+            ) != _navigation_steps(entries["offline_hint"]), (
+                f"{lang}: the {product} hint repeats {_SHARED_PRODUCT}'s path"
             )
 
 
 def test_a_product_specific_string_never_names_another_product() -> None:
-    """The override exists precisely so the text stops naming Petshandler."""
-    names = {"petshandler": "Petshandler", "fitstudiocrm": "FitStudioCRM"}
+    """A string shown for one product must point at that product and no
+    other -- by the name it prints and by the path it sends the person
+    down. The shared keys count as Petshandler's own, so rewriting one of
+    them to name FitStudioCRM fails here as well.
+    """
+    titles = _product_titles()
     for lang in ("uk", "en"):
-        for key, value in _i18n_entries(lang).items():
-            for product, name in names.items():
-                if not key.endswith(f"_{product}"):
-                    continue
-                for other, other_name in names.items():
+        shown = _offline_strings(lang)
+        for product, strings in shown.items():
+            for base, value in strings.items():
+                for other, other_title in titles.items():
                     if other == product:
                         continue
-                    assert other_name not in value, (
-                        f"{lang}.{key} is shown for {product} but names {other_name}"
+                    assert other_title not in value, (
+                        f"{lang}: the {base} shown for {product} names {other_title}"
+                    )
+        # Two products cannot both be reached by the same steps, so a hint
+        # carrying another product's path is as wrong as one carrying its
+        # name -- and that is the form the defect took.
+        paths = {p: _navigation_steps(s["offline_hint"]) for p, s in shown.items()}
+        for product, steps in paths.items():
+            for other, other_steps in paths.items():
+                if other != product:
+                    assert steps != other_steps, (
+                        f"{lang}: {product} and {other} are sent down the same path"
                     )

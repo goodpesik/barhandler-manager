@@ -550,7 +550,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       offline_synced: "Синхронізацію виконано. Не синхронізовано операцій: {n}",
       offline_sync_failed: "Синхронізація не вдалася. Операції залишаються в черзі й будуть надіслані автоматично після відновлення звʼязку.",
       offline_desc_fitstudiocrm: "Каса FitStudioCRM працює без інтернету: продажі, зміна, реєстрація на заняття й нові клієнти зберігаються на цьому компʼютері й надсилаються на сервер автоматично після відновлення звʼязку.",
-      offline_hint_fitstudiocrm: "Увімкнення офлайн-режиму: FitStudioCRM → Налаштування → Офлайн-режим → «Увімкнути офлайн-режим».",
+      offline_hint_fitstudiocrm: "Увімкнення офлайн-режиму: FitStudioCRM → Налаштування → вкладка «Офлайн-режим» → «Увімкнути офлайн-режим».",
       offline_needs_pairing_fitstudiocrm: "потрібне повторне увімкнення у FitStudioCRM",
       offline_needs_update: "черга зупинена: потрібне оновлення Девайс менеджера",
       uplink_badge_connected: "● підключено",
@@ -708,7 +708,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       offline_synced: "Synchronisation done. Operations not synchronised: {n}",
       offline_sync_failed: "Synchronisation failed. The operations stay in the queue and will be sent automatically once the connection is back.",
       offline_desc_fitstudiocrm: "The FitStudioCRM till works without the internet: sales, the shift, class bookings and new clients are kept on this computer and sent to the server automatically once the connection is back.",
-      offline_hint_fitstudiocrm: "To switch offline mode on: FitStudioCRM → Settings → Offline mode → «Enable offline mode».",
+      offline_hint_fitstudiocrm: "To switch offline mode on: FitStudioCRM → Settings → the «Offline mode» tab → «Enable offline mode».",
       offline_needs_pairing_fitstudiocrm: "needs to be switched on again in FitStudioCRM",
       offline_needs_update: "the queue is stopped: the Device Handler needs an update",
       uplink_badge_connected: "● connected",
@@ -1527,7 +1527,8 @@ _HTML_TEMPLATE = r"""<!doctype html>
   /* The product-specific text when there is one, the shared text otherwise. */
   function offlineKey(base, product) {
     const own = base + "_" + product;
-    return product !== "petshandler" && I18N.uk[own] !== undefined ? own : base;
+    const dict = I18N[LANG] || I18N.uk;
+    return product !== "petshandler" && dict[own] !== undefined ? own : base;
   }
 
   async function refreshOfflineButton() {
