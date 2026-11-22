@@ -326,13 +326,14 @@ class OfflineService:
         #: and then, instead of leaving the person who has just switched the
         #: mode on in front of a till that has not even begun to start.
         self._wake = asyncio.Event()
-        #: Counts the activations the supervisor has been told about, and
-        #: `_attempt` is the one the round of the loop under way belongs to.
-        #: An attempt may take half a minute, and an activation arriving
-        #: inside it replaces the configuration that attempt is working with:
-        #: whatever it ends up saying — it failed, it is running — is about
-        #: something nobody is waiting for any more, and must not be written
-        #: over what the new activation says about itself.
+        #: Counts the changes to what is activated here that the supervisor
+        #: has been told about — a new activation, a changed till number, a
+        #: switch-off — and `_attempt` is the one the round of the loop under
+        #: way belongs to. An attempt may take half a minute, and a change
+        #: arriving inside it replaces the configuration that attempt is
+        #: working with: whatever it ends up saying — it failed, it is
+        #: running — is about something nobody is waiting for any more, and
+        #: must not be written over what the change says about itself.
         self._activation = 0
         self._attempt = 0
         self.state = OfflineServiceState()
@@ -423,6 +424,11 @@ class OfflineService:
         """Stop the running service now (switching offline mode off); the loop
         goes on and starts nothing until a shop is activated again."""
         self._stopped_on_purpose = True
+        # Switching off is a change of what is activated here, so it counts as
+        # one: an attempt already in flight belongs to what was switched off,
+        # and «the port is taken» or «could not start» from it would be shown
+        # as a malfunction to a shop that has just turned the mode off.
+        self._activation += 1
         # Switched off on purpose: there is nothing starting and nothing broken.
         self.state.startup = STARTUP_IDLE
         await self._stop_process()
@@ -734,13 +740,10 @@ class OfflineService:
             if self._ours(health):
                 self._remember(health)
                 misses = 0
-                if self.state.running:
+                if self._what_was_seen_still_counts():
                     # Our own child, up and answering on our version: this is
                     # the one check that sees that, so nothing may leave a
-                    # serving till reported as starting or broken. Only while
-                    # we still hold it — a service on its way out has already
-                    # said what it is (`idle` on a switch-off) and may answer
-                    # for a moment yet.
+                    # serving till reported as starting or broken.
                     self.state.startup = STARTUP_RUNNING
                 started = self.state.started_at or time.monotonic()
                 if self._failures and time.monotonic() - started >= STABLE_AFTER_SEC:
@@ -751,6 +754,25 @@ class OfflineService:
             if misses >= HEALTH_MISSES:
                 self._fail(f"did not answer /health {misses} times in a row")
                 return
+
+    def _what_was_seen_still_counts(self) -> bool:
+        """Whether a health check that has just come back is still the answer
+        about this till.
+
+        The check takes a moment, and in that moment the till may have been
+        activated again or switched off — both of which say what the phase is
+        (`starting`, `idle`) about a service that is on its way out but still
+        answers. All three have to hold: the service is ours and held by this
+        round of the loop, that round is still the current activation, and
+        nothing has asked for it to stop. Checking only before the call left
+        a renewal invisible to the app for as long as stopping the old service
+        took, which is the whole of what this phase exists to show.
+        """
+        return (
+            self.state.running
+            and self._attempt == self._activation
+            and not self._stopped_on_purpose
+        )
 
     def _remember(self, health: dict) -> None:
         """What the dashboard shows and what the update guard asks."""
@@ -839,14 +861,16 @@ class OfflineService:
         self, why: str, *, level: int = logging.WARNING, once: bool = False, started: bool = True,
     ) -> None:
         if self._attempt != self._activation:
-            # An attempt a newer activation has replaced. It has every right
-            # to fail — it was working with a configuration that is gone —
-            # but its verdict is not the new activation's, and written here it
-            # would show the person who has just switched the mode on a
-            # malfunction instead of the start they are waiting for.
+            # An attempt that a newer activation has replaced, or that the
+            # mode was switched off under. It has every right to fail — it was
+            # working with a configuration that is gone — but its verdict is
+            # not the answer any more, and written here it would show a
+            # malfunction to someone who has just switched the mode on and is
+            # waiting for a start, or just switched it off altogether.
             self._log.log(
                 level,
-                "offline service: %s — from an activation since replaced, left out of the state",
+                "offline service: %s — from an activation since replaced or switched off,"
+                " left out of the state",
                 why,
             )
             return
