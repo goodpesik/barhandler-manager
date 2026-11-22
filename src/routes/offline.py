@@ -75,6 +75,11 @@ async def status(request: Request) -> dict:
             "version": st.version,
             "restarts": st.restarts,
             "lastError": st.last_error,
+            # How the service stands beyond «running»: `idle`, `starting`,
+            # `running` or `failed`. An app that has only `running` cannot
+            # tell a till coming up from a till that will not come up, and
+            # calls both broken.
+            "startup": st.startup,
             # PET-1055 — where the offline till is served, so neither the
             # dashboard nor Petshandler has to know the number by heart.
             "port": svc.port,
@@ -190,6 +195,12 @@ async def activate(request: Request) -> dict:
             status_code=500,
             detail={"code": "activation_failed", "message": "Не вдалося зберегти дані активації."},
         )
+    svc = _service(request, wanted)
+    if svc is not None:
+        # The supervisor starts the till for this activation now, and says it
+        # is starting until it is up, so the app that has just switched the
+        # mode on shows a start under way instead of a till that is not there.
+        svc.activation_changed()
     return {"ok": True, **public}
 
 
