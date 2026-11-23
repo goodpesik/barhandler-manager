@@ -13,6 +13,7 @@ calls work as before. FitStudioCRM's till runs beside it.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from typing import Optional
 
@@ -21,10 +22,62 @@ import re
 from fastapi import APIRouter, HTTPException, Request, Response
 
 from src.services import offline_secrets, offline_state
-from src.services.offline_service import DEFAULT_PRODUCT, PRODUCTS, OfflineService
+from src.services.offline_service import DEFAULT_PRODUCT, PRODUCTS, OfflineService, safe_fiscal_path
 
 log = logging.getLogger(__name__)
 router = APIRouter()
+
+#: What a call to these routes may weigh on the wire. Everything they take is
+#: a small JSON object: an activation, a snapshot of device settings, a
+#: register form. An uploaded key container is larger and has a cap of its own
+#: (offline_state.FISCAL_KEY_MAX_REQUEST_BYTES).
+MAX_BODY_BYTES = 1024 * 1024
+
+#: The answer to a body over a route's cap. The request is refused while it is
+#: still arriving, so the caller is told the size and not the content.
+_TOO_LARGE = {"code": "body_too_large", "message": "Запит завеликий."}
+
+
+class _BodyTooLarge(Exception):
+    """The body went over the route's cap; the rest of it was never read."""
+
+
+async def _capped_body(request: Request, limit: int = MAX_BODY_BYTES) -> bytes:
+    """The request body, refused BEFORE the whole of it is held in memory.
+
+    A cap checked after the body has been read is not a cap on memory: by then
+    the whole body is in memory, and a copy of it again as soon as a field is
+    taken out of it. A declared length over the cap is refused without reading
+    anything at all, and a body that declares none (or declares less than it
+    sends) is refused as soon as more than the cap has arrived — the rest is
+    never pulled off the socket.
+    """
+    declared = request.headers.get("content-length")
+    if declared is not None and declared.isdigit() and int(declared) > limit:
+        raise _BodyTooLarge(f"{int(declared)} bytes declared, the cap is {limit}")
+    chunks: list[bytes] = []
+    read = 0
+    async for chunk in request.stream():
+        read += len(chunk)
+        if read > limit:
+            raise _BodyTooLarge(f"over the cap of {limit} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _capped_json(request: Request, limit: int = MAX_BODY_BYTES) -> Optional[dict]:
+    """The body as a JSON object, capped as above; None when it is not one."""
+    try:
+        payload = json.loads(await _capped_body(request, limit))
+    except ValueError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _refuse_too_large(request: Request, reason: str, detail: dict = _TOO_LARGE) -> HTTPException:
+    """The refusal of an oversized body, with its size named in the log."""
+    log.warning("offline: refused %s %s: %s", request.method, request.url.path, reason)
+    return HTTPException(status_code=413, detail=detail)
 
 
 def _product(request: Request, payload: Optional[dict] = None) -> str:
@@ -156,11 +209,9 @@ async def sync_now(request: Request) -> dict:
 @router.post("/activate")
 async def activate(request: Request) -> dict:
     try:
-        payload = await request.json()
-    except ValueError:
-        payload = None
-    if not isinstance(payload, dict):
-        payload = None
+        payload = await _capped_json(request)
+    except _BodyTooLarge as e:
+        raise _refuse_too_large(request, str(e))
     # The product is checked by the activation itself; only a known one picks
     # its supervisor here (an unknown one finds none and is refused below).
     wanted = str((payload or {}).get("product") or DEFAULT_PRODUCT)
@@ -226,10 +277,20 @@ async def deactivate(request: Request) -> dict:
         fiscal_sessions = len(health.get("fiscalSessions") or [])
     else:
         # Not asked, or a service that does not say (an older build): the
-        # counts the service keeps in the clear. A copy that cannot be read
-        # (or judged) is refused, never taken for «nothing owed».
+        # counts the service keeps in the clear. A count is never taken for
+        # «nothing owed» when it is not there — it comes back unjudged.
         on_disk = await asyncio.to_thread(offline_state.fiscal_owed_on_disk, appid, product)
-        fiscal_pending, fiscal_sessions = on_disk if on_disk is not None else (None, 0)
+        fiscal_pending, fiscal_sessions = on_disk.pending, on_disk.sessions
+        if on_disk.unjudged:
+            # The copy cannot say what it owes, and no restart will make it
+            # say: the till would stay switched on for good. The switch-off
+            # goes on, and the log carries what could not be read, so a shop
+            # that comes back asking about a fiscal number can be answered.
+            log.warning(
+                "offline switch-off (%s shop %s): the fiscal state of the local copy "
+                "could not be judged (%s); nothing names a document as owed, switching off goes on",
+                product, appid, on_disk.unjudged,
+            )
     try:
         offline_state.check_can_deactivate(
             queued if isinstance(queued, int) else None, fiscal_pending, fiscal_sessions,
@@ -264,9 +325,9 @@ async def deactivate(request: Request) -> dict:
 async def save_local_settings(request: Request) -> dict:
     """PET-973 — the online app leaves its device settings for the offline build."""
     try:
-        payload = await request.json()
-    except ValueError:
-        payload = None
+        payload = await _capped_json(request)
+    except _BodyTooLarge as e:
+        raise _refuse_too_large(request, str(e))
     if not isinstance(payload, dict):
         raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "Некоректний запит."})
     product = _product(request, payload)
@@ -290,11 +351,19 @@ async def save_fiscal_key(request: Request) -> dict:
 
     FC-844 — for the till named by `?product=` (or `product` in the body),
     Petshandler when not said: the file is kept in that product's own folder.
+
+    The cap on a container is a cap on this request too, so a body far bigger
+    than any container is refused while it is still arriving instead of being
+    buffered, copied and only then measured.
     """
     try:
-        payload = await request.json()
-    except ValueError:
-        payload = None
+        payload = await _capped_json(request, offline_state.FISCAL_KEY_MAX_REQUEST_BYTES)
+    except _BodyTooLarge as e:
+        raise _refuse_too_large(
+            request,
+            str(e),
+            {"code": "fiscal_key_too_large", "message": "Файл завеликий для ключа."},
+        )
     if not isinstance(payload, dict):
         log.warning("offline fiscal key refused: the body is not an object")
         raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "Некоректний запит."})
@@ -328,8 +397,11 @@ async def load_local_settings(request: Request) -> dict:
     return body
 
 
-#: A register's id as it appears in a path: the service gave it out.
-_REGISTER_ID = r"[A-Za-z0-9_.-]{1,64}"
+#: A register's id as it appears in a path: the service gave it out. It starts
+#: with a letter or a digit, so `.` and `..` are not ids — an id of dots alone
+#: turned `/registers/../grant` into the grant route and `/registers/..` into
+#: the route that removes a register.
+_REGISTER_ID = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}"
 
 #: THE REGISTER ROUTES OF THE OFFLINE SERVICE (below /api/offline-fiscal),
 #: NAMED ONE BY ONE WITH THE METHODS EACH ONE TAKES.
@@ -382,7 +454,16 @@ _FISCAL_ALLOWED: tuple[tuple["re.Pattern[str]", frozenset[str]], ...] = tuple(
 
 
 def _fiscal_route_allowed(method: str, path: str) -> bool:
-    """Whether this method and path are one of the register routes above."""
+    """Whether this method and path are one of the register routes above.
+
+    The same guard that stands where the path is pasted into the service's URL
+    runs here first, so a path that would have to be normalised is refused
+    with a 400 instead of reaching the pass-through at all.
+    """
+    try:
+        safe_fiscal_path(path)
+    except ValueError:
+        return False
     return any(
         method in methods and pattern.fullmatch(path)
         for pattern, methods in _FISCAL_ALLOWED
@@ -432,7 +513,13 @@ async def fiscal(path: str, request: Request) -> Response:
     if not _fiscal_route_allowed(request.method, path):
         log.warning("offline fiscal: refused %s %r — not a register route", request.method, path)
         raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "Некоректний запит."})
-    body = await request.body() if request.method in ("POST", "PUT", "PATCH") else None
+    if request.method in ("POST", "PUT", "PATCH"):
+        try:
+            body = await _capped_body(request)
+        except _BodyTooLarge as e:
+            raise _refuse_too_large(request, str(e))
+    else:
+        body = None
     try:
         status, answer = await svc.fiscal(request.method, path, body)
     except Exception as e:  # noqa: BLE001 — refused, timeout: the service is not there

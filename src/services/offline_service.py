@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -247,6 +248,35 @@ def _post_sync(port: int, timeout: float = SYNC_NOW_TIMEOUT) -> Optional[dict]:
 #: internet from the offline service, and the cabinet can be slow.
 FISCAL_CALL_TIMEOUT = 60.0
 
+#: One segment of a register route path: a route name the service has, or an
+#: id it handed out. It has to START with a letter or a digit, so `.` and `..`
+#: are not segments at all.
+_FISCAL_PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def safe_fiscal_path(path: str) -> str:
+    """The register route path as it may be pasted into the service's URL.
+
+    THE GUARD SITS WHERE THE PATH IS PASTED, not only where it is matched
+    against the list of routes. That list is written by hand, one pattern per
+    route, and a pattern whose id part accepts a dot segment lets
+    `/registers/../grant` through as the grant route: whoever normalises the
+    path next — the service itself, or anything in front of it — then lands the
+    call on `/grant`, a route the list never named. Here every segment has to
+    start with a letter or a digit, so there is nothing left to normalise,
+    whatever a pattern added upstream tomorrow happens to allow.
+
+    The path unchanged when it is one the service can be asked for; otherwise
+    ValueError, and nothing is sent.
+    """
+    if path == "":
+        return path
+    if not path.startswith("/"):
+        raise ValueError("a register route path has to start with a slash")
+    if not all(_FISCAL_PATH_SEGMENT.fullmatch(segment) for segment in path[1:].split("/")):
+        raise ValueError("a register route path may name only route names and register ids")
+    return path
+
 
 def _call_fiscal(port: int, method: str, path: str, body: Optional[bytes], timeout: float = FISCAL_CALL_TIMEOUT) -> tuple[int, bytes]:
     """
@@ -258,7 +288,7 @@ def _call_fiscal(port: int, method: str, path: str, body: Optional[bytes], timeo
     service that cannot be reached raises.
     """
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/api/offline-fiscal{path}",
+        f"http://127.0.0.1:{port}/api/offline-fiscal{safe_fiscal_path(path)}",
         data=body,
         method=method,
         headers={"Content-Type": "application/json"} if body is not None else {},

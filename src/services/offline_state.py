@@ -31,7 +31,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from src.config import APP_DIR
 from src.services import offline_secrets
@@ -209,25 +209,41 @@ def queued_on_disk(
     return int(n)
 
 
-def fiscal_owed_on_disk(appid: str, product: str = DEFAULT_PRODUCT) -> Optional[tuple[int, int]]:
-    """What the local copy still owes the tax service: (unsent documents, sessions).
+class FiscalOwed(NamedTuple):
+    """What the local copy says it still owes the tax service.
+
+    `unjudged` is why the copy could not be judged, and it is a THIRD answer:
+    neither «nothing owed» nor «something owed». The counts are None beside
+    it, and the caller decides what to do with a dependency it cannot read —
+    which is never «refused for good», see `check_can_deactivate`.
+    """
+
+    pending: Optional[int]
+    sessions: int
+    unjudged: Optional[str] = None
+
+
+def fiscal_owed_on_disk(appid: str, product: str = DEFAULT_PRODUCT) -> FiscalOwed:
+    """What the local copy still owes the tax service: unsent documents, sessions.
 
     For when the service cannot be asked. Whether a document was sent is
     inside its sealed row, so the service keeps the count of unsent ones in
     the clear (meta `fiscalPending`, PET-1120); an open session is a meta row
-    of its own, whose key says so without the payload. A copy from a service
-    older than that count, with any fiscal document in it, cannot be judged:
-    None, like a copy that cannot be read.
+    of its own, whose key says so without the payload.
+
+    A copy that nothing can be read out of — a damaged file, a schema without
+    these names, fiscal documents with no count of unsent ones beside them —
+    comes back `unjudged` with the reason, not as a count.
 
     A product without registers of its own (PRODUCTS[…].fiscal) owes the tax
     service nothing from this computer.
     """
     if not PRODUCTS[product].fiscal:
-        return 0, 0
+        return FiscalOwed(0, 0)
     path = shop_folder(appid, product) / "data" / "offline.sqlite"
     try:
         if not path.exists():
-            return 0, 0
+            return FiscalOwed(0, 0)
         con = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5)
         try:
             row = con.execute("SELECT value FROM meta WHERE key = 'fiscalPending'").fetchone()
@@ -239,21 +255,22 @@ def fiscal_owed_on_disk(appid: str, product: str = DEFAULT_PRODUCT) -> Optional[
             else:
                 (docs,) = con.execute("SELECT count(*) FROM entity WHERE kind = 'fiscalDocument'").fetchone()
                 if docs:
-                    log.warning("offline: shop %s has %s fiscal documents and no count of unsent ones", appid, docs)
-                    return None
+                    reason = f"{docs} fiscal documents and no count of unsent ones"
+                    log.warning("offline: fiscal state of shop %s cannot be judged: %s", appid, reason)
+                    return FiscalOwed(None, 0, reason)
                 pending = 0
         finally:
             con.close()
     except sqlite3.OperationalError as e:
         if "no such table" in str(e):
-            return 0, 0
-        log.warning("offline: fiscal state of shop %s unreadable on disk: %s", appid, e)
-        return None
+            return FiscalOwed(0, 0)
+        log.warning("offline: fiscal state of shop %s cannot be judged: %s", appid, e)
+        return FiscalOwed(None, 0, str(e))
     except (sqlite3.DatabaseError, OSError, ValueError) as e:
-        log.warning("offline: fiscal state of shop %s unreadable on disk: %s", appid, e)
-        return None
+        log.warning("offline: fiscal state of shop %s cannot be judged: %s", appid, e)
+        return FiscalOwed(None, 0, str(e))
     log.info("offline: shop %s fiscal state read from disk: %s unsent, %s sessions", appid, pending, sessions)
-    return pending, int(sessions)
+    return FiscalOwed(pending, int(sessions))
 
 
 def check_can_deactivate(
@@ -267,6 +284,16 @@ def check_can_deactivate(
     not yet handed to the tax service would be lost with it, and its fiscal
     number never arrives, which is what gets a registrar blocked; an open
     offline session has to be brought back online the same way.
+
+    WHAT IS OWED IS A REFUSAL; WHAT CANNOT BE JUDGED IS NOT.
+    `fiscal_pending` is None when the fiscal state of the copy could not be
+    read at all (`FiscalOwed.unjudged`). That used to be refused with «restart
+    the manager and try again», which is an answer no one can act on: a till
+    whose service never comes up again has nothing but the disk to be judged
+    by, and no restart makes that copy say more. The refusal stays for the
+    thing it protects — a count of unsent documents, an open session — and an
+    unjudgeable copy lets the switch-off through, with the reason in the log
+    of whoever read it.
     """
     if queued:
         raise ActivationError(
@@ -286,12 +313,6 @@ def check_can_deactivate(
         raise ActivationError(
             f"Фіскальних документів, ще не переданих до ДПС: {fiscal_pending}. "
             "Вимкнення можливе після їх передачі.",
-        )
-    if fiscal_pending is None:
-        raise ActivationError(
-            "Не вдалося перевірити фіскальні документи офлайн-каси: "
-            "офлайн-сервіс не відповідає. Перезапустіть Девайс менеджер "
-            "і спробуйте ще раз, коли офлайн-сервіс запуститься.",
         )
 
 
@@ -447,6 +468,12 @@ def save_local_settings(appid: str, items: object, product: str = DEFAULT_PRODUC
 
 #: A key container is a few kilobytes; anything beyond this is not one.
 FISCAL_KEY_MAX_BYTES = 1024 * 1024
+#: What the upload request itself may weigh: the base64 of a container at the
+#: cap (four characters carry three bytes), and room for the rest of the JSON
+#: object around it. The route refuses a bigger body while it is still
+#: arriving, so the cap holds for what is buffered and not only for what is
+#: decoded.
+FISCAL_KEY_MAX_REQUEST_BYTES = (FISCAL_KEY_MAX_BYTES // 3 + 1) * 4 + 4 + 8192
 #: What a file dropped into the fiscal-keys folder may be called.
 _KEY_FILE_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 

@@ -9,6 +9,7 @@ operations made offline have not reached the server.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import socket
 import stat
@@ -1033,7 +1034,10 @@ def _fiscal_copy(home, docs, pending=None, sessions=0, folder="offline", appid="
         (3, 2, 0, 409),  # two of three still owed
         (3, 0, 0, 200),  # all sent: not stuck because documents were ever signed
         (0, 0, 1, 409),  # a session still open
-        (1, None, 0, 409),  # an older service with documents: cannot be judged
+        # Documents with no count of unsent ones beside them: the copy cannot
+        # be judged, and no restart makes it say more — the switch-off goes
+        # on, with the reason in the log.
+        (1, None, 0, 200),
         (0, None, 0, 200),  # an older service that never signed anything
     ],
 )
@@ -1045,12 +1049,11 @@ def test_a_silent_service_is_judged_by_the_counts_on_disk(client_for, home, docs
     assert c.post("/offline/deactivate", headers=KEY).status_code == code
 
 
-def test_a_silent_service_and_a_copy_that_cannot_be_read_are_not_switched_off(client_for, home, monkeypatch):
-    """Not readable is not «nothing owed»: the copy may hold unsent documents."""
+def test_a_silent_service_and_a_copy_that_cannot_be_read_are_not_switched_off(client_for, home):
+    """A damaged copy may hold operations that never reached the server."""
     svc = FakeService(None)
     c = client_for(svc)
     c.post("/offline/activate", json=PAYLOAD, headers=KEY)
-    monkeypatch.setattr(offline_state, "queued_on_disk", lambda *a, **k: 0)
     data = home / "offline" / "bark-01" / "data"
     data.mkdir(parents=True, exist_ok=True)
     (data / "offline.sqlite").write_bytes(b"this is not a database" * 100)
@@ -1088,12 +1091,13 @@ def test_the_registers_are_closed_without_the_key_activation_or_a_plain_path(cli
 
 @pytest.mark.parametrize("health", [{}, {"fiscalPending": None}, {"fiscalPending": True}])
 def test_a_service_that_does_not_say_what_it_owes_is_judged_by_the_disk(client_for, home, health):
-    """An older service answers /health without the count: unknown is not «nothing owed»."""
+    """An older service answers /health without the count: the disk is asked instead."""
     svc = FakeService(0, health=health)
     c = client_for(svc)
     c.post("/offline/activate", json=PAYLOAD, headers=KEY)
-    _fiscal_copy(home, docs=2, pending=None)
-    assert c.post("/offline/deactivate", headers=KEY).status_code == 409
+    _fiscal_copy(home, docs=2, pending=2)
+    r = c.post("/offline/deactivate", headers=KEY)
+    assert r.status_code == 409 and "2" in r.json()["detail"]["message"]
     assert offline_state.active_appid() == "bark-01"
 
 
@@ -1384,3 +1388,222 @@ def test_the_fit_till_is_not_switched_off_with_documents_the_tax_service_has_not
     assert fit.stopped == 0 and offline_state.active_appid("fitstudiocrm") == "studio-01"
     assert (home / "offline-fitstudiocrm" / "studio-01" / "data").exists()
 
+
+# ---- FC-844, review round: the pass-through, the body cap, a copy that
+# ---- cannot be judged ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "method, path",
+    [
+        # A dot segment where a register id belongs, in each of the three
+        # shapes the list has: a route after the id, the id alone with the
+        # methods that save or remove a register, and a longer tail.
+        ("POST", "/registers/%2e%2e/grant"),
+        ("POST", "/registers/%2e/shift"),
+        ("DELETE", "/registers/%2e%2e"),
+        ("PUT", "/registers/%2e%2e"),
+        ("PATCH", "/registers/%2e"),
+        ("POST", "/registers/%2e%2e/registration/submit"),
+        # A client that does not normalise sends the segment as it stands.
+        ("POST", "/registers/..%2Fgrant"),
+        # An id that starts with a dot is not one the service hands out.
+        ("DELETE", "/registers/.hidden"),
+    ],
+)
+def test_a_dot_segment_is_not_a_register_id(client_for, method, path):
+    """A list that lets dots be an id names routes it never meant to name.
+
+    `/registers/../grant` full-matches the grant route and `/registers/..` the
+    route that removes a register; whoever normalises the path next — the
+    offline service, or anything in front of it — lands the call outside the
+    list altogether.
+    """
+    svc = FakeService(0)
+    c = client_for(svc)
+    _activate(c)
+    r = c.request(method, f"/offline/fiscal{path}", headers=KEY, json={} if method != "DELETE" else None)
+    assert r.status_code == 400, r.text
+    assert svc.fiscal_calls == []
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/registers/..", "/registers/.", "/registers/../grant", "/registers/./shift", "/registers/../registration"],
+)
+def test_no_route_pattern_takes_a_dot_segment_as_a_register_id(path):
+    """The list is closed on its own, not only because the path guard runs first."""
+    from src.routes import offline as offline_routes
+
+    assert not any(pattern.fullmatch(path) for pattern, _ in offline_routes._FISCAL_ALLOWED)
+
+
+def test_the_path_is_made_safe_where_it_is_pasted_into_the_service_url():
+    """The next pattern added to the route list cannot put a dot segment on the wire."""
+    with patch("urllib.request.urlopen", side_effect=AssertionError("nothing may be sent")):
+        for path in [
+            "/registers/../grant",
+            "/registers/..",
+            "/registers/.",
+            "/registers/.hidden",
+            "registers/r-1",
+            "/registers//r-1",
+            "/registers/r-1?product=fitstudiocrm",
+            "/registers/r-1\n/grant",
+        ]:
+            with pytest.raises(ValueError):
+                offline_service._call_fiscal(9898, "POST", path, b"{}")
+    assert offline_service.safe_fiscal_path("") == ""
+    assert offline_service.safe_fiscal_path("/registers/r-1/grant") == "/registers/r-1/grant"
+
+
+def _post_in_chunks(app, path, chunks, headers):
+    """One request whose body arrives in pieces, and how many were asked for.
+
+    The test client hands the whole body over before the app runs, so it
+    cannot tell a body refused while it arrives from one buffered and then
+    measured. The app is called with a `receive` of our own instead, and what
+    it did not ask for is what it never held.
+    """
+    import asyncio
+
+    asked = {"chunks": 0}
+    answers: list[dict] = []
+
+    async def receive():
+        if asked["chunks"] >= len(chunks):
+            return {"type": "http.disconnect"}
+        body = chunks[asked["chunks"]]
+        asked["chunks"] += 1
+        return {"type": "http.request", "body": body, "more_body": asked["chunks"] < len(chunks)}
+
+    async def send(message):
+        answers.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "scheme": "http",
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 80),
+        "headers": headers,
+    }
+    asyncio.run(app(scope, receive, send))
+    status = next(m["status"] for m in answers if m["type"] == "http.response.start")
+    return status, asked["chunks"]
+
+
+def test_a_key_upload_over_the_cap_is_refused_before_the_whole_body_is_read(client_for, home):
+    """A cap checked after the body is buffered is not a cap on memory.
+
+    The whole body is in memory by then, and a copy of it again as soon as a
+    field is taken out of it — half a gigabyte of either costs the same.
+    """
+    c = client_for(FakeService(queued=0))
+    _activate(c)
+    cap = offline_state.FISCAL_KEY_MAX_REQUEST_BYTES
+    piece = b"A" * (64 * 1024)
+    chunks = [b'{"appid": "bark-01", "fileName": "Key-6.dat", "contentBase64": "']
+    chunks += [piece] * (cap * 4 // len(piece))
+    chunks += [b'"}']
+    status, asked = _post_in_chunks(
+        c.app,
+        "/offline/fiscal-key",
+        chunks,
+        [(b"host", b"127.0.0.1"), (b"content-type", b"application/json"), (b"x-api-key", DEFAULT_API_KEY.encode())],
+    )
+    assert status == 413
+    # It was refused while the body was still arriving: the rest was never
+    # asked for.
+    assert asked * len(piece) < cap + 2 * len(piece), asked
+    assert not offline_state.fiscal_keys_folder(PAYLOAD["appid"]).exists()
+
+
+def test_a_declared_length_over_the_cap_is_refused_without_reading_the_body(client_for, home):
+    """A body that says how big it is costs nothing to refuse: it is not read at all."""
+    c = client_for(FakeService(queued=0))
+    _activate(c)
+    status, asked = _post_in_chunks(
+        c.app,
+        "/offline/fiscal-key",
+        [b'{"appid": "bark-01", "fileName": "Key-6.dat", "contentBase64": "AAAA"}'],
+        [
+            (b"host", b"127.0.0.1"),
+            (b"content-type", b"application/json"),
+            (b"content-length", str(offline_state.FISCAL_KEY_MAX_REQUEST_BYTES + 1).encode()),
+            (b"x-api-key", DEFAULT_API_KEY.encode()),
+        ],
+    )
+    assert status == 413
+    assert asked == 0
+    assert not offline_state.fiscal_keys_folder(PAYLOAD["appid"]).exists()
+
+
+def test_the_routes_that_take_a_small_object_have_a_cap_of_their_own(client_for, home):
+    from src.routes import offline as offline_routes
+
+    c = client_for(FakeService(queued=0))
+    _activate(c)
+    oversized = b"A" * (offline_routes.MAX_BODY_BYTES + 1)
+    r = c.post("/offline/local-settings", content=oversized, headers={**KEY, "Content-Type": "application/json"})
+    assert r.status_code == 413, r.text
+    assert r.json()["detail"]["code"] == "body_too_large"
+
+
+def _fit_copy_without_kind(home, appid="studio-01"):
+    """A copy whose `entity` table does not carry `kind`: «no such column»."""
+    import sqlite3
+
+    data = home / "offline-fitstudiocrm" / appid / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(data / "offline.sqlite")
+    con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    con.execute("CREATE TABLE entity (id TEXT PRIMARY KEY, data BLOB NOT NULL)")
+    con.execute("CREATE TABLE outbox (id TEXT PRIMARY KEY, status TEXT NOT NULL)")
+    con.commit()
+    con.close()
+
+
+@pytest.mark.parametrize(
+    "copy_on_disk, code",
+    [
+        ("documents with no count of unsent ones", 200),
+        ("a table without the kind column", 200),
+        ("documents the tax service has not got", 409),
+    ],
+)
+def test_a_fit_copy_that_cannot_be_judged_does_not_refuse_the_switch_off_for_good(
+    both_for, home, caplog, copy_on_disk, code,
+):
+    """«I cannot read this» must not mean «forbidden», or the till never goes off.
+
+    The refusal is there for documents the tax service has not got, and it
+    stays for them. A copy that says nothing about them is a dependency that
+    cannot be judged — and a till whose service never comes up again has
+    nothing but that copy, so refusing leaves no way out at all.
+    """
+    fit = FakeService(None, port=9899)
+    c = both_for(FakeService(0), fit)
+    c.post("/offline/activate", json=FIT, headers=KEY)
+    if copy_on_disk == "a table without the kind column":
+        _fit_copy_without_kind(home)
+    else:
+        pending = 2 if code == 409 else None
+        _fiscal_copy(home, docs=2, pending=pending, folder="offline-fitstudiocrm", appid="studio-01")
+    with caplog.at_level(logging.WARNING):
+        r = c.post("/offline/deactivate?product=fitstudiocrm", headers=KEY)
+    assert r.status_code == code, r.text
+    if code == 200:
+        assert offline_state.active_appid("fitstudiocrm") is None
+        # What could not be read is named, so a shop asking about a fiscal
+        # number later can be answered.
+        assert any("could not be judged" in m for m in caplog.messages), caplog.messages
+    else:
+        assert offline_state.active_appid("fitstudiocrm") == "studio-01"
+        assert fit.stopped == 0
