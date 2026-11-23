@@ -269,18 +269,34 @@ async def deactivate(request: Request) -> dict:
         # Not running (it never starts without its secrets) or not answering:
         # the queue is read from the local copy, so switching off does not
         # depend on the service it would switch off.
-        queued = await asyncio.to_thread(offline_state.queued_on_disk, appid, product=product)
+        on_disk_queue = await asyncio.to_thread(offline_state.queue_on_disk, appid, product=product)
+        queued = on_disk_queue.count
         log.info("offline switch-off: the service did not answer, queue on disk: %s", queued)
+        if on_disk_queue.unreadable:
+            # The copy cannot say what it still has to send, and no restart
+            # will make it say: the till would stay switched on for good. Same
+            # split as the fiscal state below — switching off goes on, and the
+            # log carries what could not be read.
+            log.warning(
+                "offline switch-off (%s shop %s): the queue of the local copy could not be read "
+                "(%s); nothing names an operation as unsent, switching off goes on",
+                product, appid, on_disk_queue.unreadable,
+            )
     pending = health.get("fiscalPending") if health else None
+    fiscal_documents = 0
     if isinstance(pending, int) and not isinstance(pending, bool):
         fiscal_pending = pending
         fiscal_sessions = len(health.get("fiscalSessions") or [])
     else:
         # Not asked, or a service that does not say (an older build): the
         # counts the service keeps in the clear. A count is never taken for
-        # «nothing owed» when it is not there — it comes back unjudged.
+        # «nothing owed» when it is not there — document rows without one are
+        # owed, and a copy that says nothing at all comes back unjudged.
         on_disk = await asyncio.to_thread(offline_state.fiscal_owed_on_disk, appid, product)
         fiscal_pending, fiscal_sessions = on_disk.pending, on_disk.sessions
+        # Document rows and no count of unsent ones beside them: owed, for
+        # every product alike — the rows themselves are what would be lost.
+        fiscal_documents = on_disk.documents
         if on_disk.unjudged:
             # The copy cannot say what it owes, and no restart will make it
             # say: the till would stay switched on for good. The switch-off
@@ -293,7 +309,10 @@ async def deactivate(request: Request) -> dict:
             )
     try:
         offline_state.check_can_deactivate(
-            queued if isinstance(queued, int) else None, fiscal_pending, fiscal_sessions,
+            queued if isinstance(queued, int) else None,
+            fiscal_pending,
+            fiscal_sessions,
+            fiscal_documents,
         )
     except offline_state.ActivationError as e:
         log.warning("offline deactivation refused: %s", e)

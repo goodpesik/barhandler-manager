@@ -321,7 +321,8 @@ def test_an_update_waits_for_unsent_operations_on_disk_when_the_service_is_down(
     assert body["busy"] is True and "3" in body["message"]
 
 
-def test_a_copy_that_raises_an_os_error_refuses_switch_off_and_does_not_hold_an_update(client_for, home, monkeypatch):
+def test_a_copy_that_raises_an_os_error_is_switched_off_and_does_not_hold_an_update(client_for, home, monkeypatch, caplog):
+    """Nothing can be read out of this copy, so nothing names anything as owed."""
     import sqlite3
 
     c = client_for(FakeService(None))
@@ -332,8 +333,10 @@ def test_a_copy_that_raises_an_os_error_refuses_switch_off_and_does_not_hold_an_
         raise PermissionError("denied")
 
     monkeypatch.setattr(sqlite3, "connect", denied)
-    assert c.post("/offline/deactivate", headers=KEY).status_code == 409
-    assert offline_state.active_appid() == "bark-01"
+    with caplog.at_level(logging.WARNING):
+        assert c.post("/offline/deactivate", headers=KEY).status_code == 200
+    assert offline_state.active_appid() is None
+    assert any("could not be read" in m for m in caplog.messages), caplog.messages
     assert c.get("/busy").json()["busy"] is False
 
 
@@ -346,15 +349,18 @@ def test_an_unreadable_copy_does_not_hold_an_update(client_for, home):
     assert c.get("/busy").json()["busy"] is False
 
 
-def test_a_silent_service_and_an_unreadable_copy_are_not_switched_off(client_for, home):
+def test_a_silent_service_and_an_unreadable_copy_are_switched_off(client_for, home, caplog):
+    """A damaged copy says nothing about a queue or a document: it is not a refusal."""
     svc = FakeService(None)
     c = client_for(svc)
     c.post("/offline/activate", json=PAYLOAD, headers=KEY)
     data = home / "offline" / "bark-01" / "data"
     data.mkdir()
     (data / "offline.sqlite").write_bytes(b"not a database at all" * 100)
-    assert c.post("/offline/deactivate", headers=KEY).status_code == 409
-    assert offline_state.active_appid() == "bark-01"
+    with caplog.at_level(logging.WARNING):
+        assert c.post("/offline/deactivate", headers=KEY).status_code == 200
+    assert offline_state.active_appid() is None
+    assert any("could not be read" in m for m in caplog.messages), caplog.messages
 
 
 def test_switching_off_stops_the_service_and_removes_the_shop(client_for, home):
@@ -1034,10 +1040,10 @@ def _fiscal_copy(home, docs, pending=None, sessions=0, folder="offline", appid="
         (3, 2, 0, 409),  # two of three still owed
         (3, 0, 0, 200),  # all sent: not stuck because documents were ever signed
         (0, 0, 1, 409),  # a session still open
-        # Documents with no count of unsent ones beside them: the copy cannot
-        # be judged, and no restart makes it say more — the switch-off goes
-        # on, with the reason in the log.
-        (1, None, 0, 200),
+        # Documents with no count of unsent ones beside them: the rows are
+        # readable and nothing says they reached the tax service, so they are
+        # owed — a till from a build that keeps no count is not switched off.
+        (1, None, 0, 409),
         (0, None, 0, 200),  # an older service that never signed anything
     ],
 )
@@ -1049,15 +1055,59 @@ def test_a_silent_service_is_judged_by_the_counts_on_disk(client_for, home, docs
     assert c.post("/offline/deactivate", headers=KEY).status_code == code
 
 
-def test_a_silent_service_and_a_copy_that_cannot_be_read_are_not_switched_off(client_for, home):
-    """A damaged copy may hold operations that never reached the server."""
+def test_a_silent_service_and_a_copy_that_cannot_be_read_go_through(client_for, home, caplog):
+    """Neither the queue nor the fiscal state can be read: nothing to refuse for.
+
+    The till has no service to ask and no copy to be judged by, so a refusal
+    here is a refusal for good.
+    """
     svc = FakeService(None)
     c = client_for(svc)
     c.post("/offline/activate", json=PAYLOAD, headers=KEY)
     data = home / "offline" / "bark-01" / "data"
     data.mkdir(parents=True, exist_ok=True)
     (data / "offline.sqlite").write_bytes(b"this is not a database" * 100)
-    assert c.post("/offline/deactivate", headers=KEY).status_code == 409
+    with caplog.at_level(logging.WARNING):
+        assert c.post("/offline/deactivate", headers=KEY).status_code == 200
+    assert offline_state.active_appid() is None
+    assert any("could not be read" in m for m in caplog.messages), caplog.messages
+    assert any("could not be judged" in m for m in caplog.messages), caplog.messages
+
+
+def _copy_with_an_unreadable_queue(home, pending=0, folder="offline", appid="bark-01"):
+    """A copy whose fiscal state reads and whose `outbox` has no `status`."""
+    import sqlite3
+
+    data = home / folder / appid / "data"
+    data.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(data / "offline.sqlite")
+    con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    con.execute("INSERT INTO meta VALUES ('fiscalPending', ?)", (str(pending),))
+    con.execute("CREATE TABLE outbox (id TEXT PRIMARY KEY, payload BLOB NOT NULL)")
+    con.commit()
+    con.close()
+
+
+def test_a_queue_that_cannot_be_read_goes_through_while_a_queue_with_items_refuses(client_for, home, caplog):
+    """The same split as the fiscal state: owed refuses, unreadable goes on."""
+    c = client_for(FakeService(None))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    _copy_with_an_unreadable_queue(home)
+    with caplog.at_level(logging.WARNING):
+        assert c.post("/offline/deactivate", headers=KEY).status_code == 200
+    assert offline_state.active_appid() is None
+    assert any(
+        "queue of the local copy could not be read" in m for m in caplog.messages
+    ), caplog.messages
+
+
+def test_a_queue_that_reads_with_operations_waiting_still_refuses(client_for, home):
+    """The refusal stays for what it protects: operations the server never got."""
+    c = client_for(FakeService(None))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    _local_copy(home, ["queued", "queued", "applied"])
+    r = c.post("/offline/deactivate", headers=KEY)
+    assert r.status_code == 409 and "2" in r.json()["detail"]["message"]
     assert offline_state.active_appid() == "bark-01"
 
 
@@ -1573,8 +1623,8 @@ def _fit_copy_without_kind(home, appid="studio-01"):
 @pytest.mark.parametrize(
     "copy_on_disk, code",
     [
-        ("documents with no count of unsent ones", 200),
         ("a table without the kind column", 200),
+        ("documents with no count of unsent ones", 409),
         ("documents the tax service has not got", 409),
     ],
 )
@@ -1584,9 +1634,11 @@ def test_a_fit_copy_that_cannot_be_judged_does_not_refuse_the_switch_off_for_goo
     """«I cannot read this» must not mean «forbidden», or the till never goes off.
 
     The refusal is there for documents the tax service has not got, and it
-    stays for them. A copy that says nothing about them is a dependency that
-    cannot be judged — and a till whose service never comes up again has
-    nothing but that copy, so refusing leaves no way out at all.
+    stays for them — including documents with no count of unsent ones, which
+    is the same rule as on the other product's till. A copy out of which not
+    even the document rows can be read is a dependency that cannot be judged,
+    and a till whose service never comes up again has nothing but that copy,
+    so refusing there leaves no way out at all.
     """
     fit = FakeService(None, port=9899)
     c = both_for(FakeService(0), fit)
@@ -1594,7 +1646,7 @@ def test_a_fit_copy_that_cannot_be_judged_does_not_refuse_the_switch_off_for_goo
     if copy_on_disk == "a table without the kind column":
         _fit_copy_without_kind(home)
     else:
-        pending = 2 if code == 409 else None
+        pending = 2 if copy_on_disk == "documents the tax service has not got" else None
         _fiscal_copy(home, docs=2, pending=pending, folder="offline-fitstudiocrm", appid="studio-01")
     with caplog.at_level(logging.WARNING):
         r = c.post("/offline/deactivate?product=fitstudiocrm", headers=KEY)

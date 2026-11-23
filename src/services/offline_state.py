@@ -170,15 +170,29 @@ def _device_number(payload: dict) -> int:
     raise ActivationError(f"Номер каси має бути цілим числом від 1 до {MAX_DEVICE_NUMBER}.")
 
 
-def queued_on_disk(
+class QueueOnDisk(NamedTuple):
+    """What the local copy says it still has to send.
+
+    `unreadable` is why the copy could not be read, and it is a THIRD answer:
+    neither a count of waiting operations nor «nothing waiting». `count` is
+    None beside it, and the caller decides what to do with a dependency it
+    cannot read — which is never «refused for good», see `check_can_deactivate`.
+    """
+
+    count: Optional[int]
+    unreadable: Optional[str] = None
+
+
+def queue_on_disk(
     appid: str, timeout: float = 5, quiet: bool = False, product: str = DEFAULT_PRODUCT,
-) -> Optional[int]:
+) -> QueueOnDisk:
     """Operations still waiting for the server, read from the local copy itself.
 
     For when the service is not running and cannot be asked — without its
     secrets it never starts, and switching off must not depend on it. The
     queue's status column is plain text (only the payload is sealed), so no
-    key is needed. None when the copy is there but cannot be read.
+    key is needed. A copy that is there but cannot be read comes back
+    `unreadable` with the reason, not as a count.
 
     `quiet` leaves out the routine lines for callers that poll (the update
     guard asks every few seconds); a copy that cannot be read is always logged.
@@ -188,7 +202,7 @@ def queued_on_disk(
         if not path.exists():
             if not quiet:
                 log.info("offline: shop %s has no local copy, nothing queued", appid)
-            return 0
+            return QueueOnDisk(0)
         con = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=timeout)
         try:
             (n,) = con.execute("SELECT count(*) FROM outbox WHERE status = 'queued'").fetchone()
@@ -198,15 +212,26 @@ def queued_on_disk(
         if "no such table" in str(e):
             if not quiet:
                 log.info("offline: shop %s local copy has no queue yet", appid)
-            return 0
+            return QueueOnDisk(0)
         log.warning("offline: queue of shop %s unreadable on disk: %s", appid, e)
-        return None
+        return QueueOnDisk(None, str(e))
     except (sqlite3.DatabaseError, OSError, ValueError) as e:
         log.warning("offline: queue of shop %s unreadable on disk: %s", appid, e)
-        return None
+        return QueueOnDisk(None, str(e))
     if not quiet or n:
         log.info("offline: shop %s queue read from disk: %s waiting", appid, n)
-    return int(n)
+    return QueueOnDisk(int(n))
+
+
+def queued_on_disk(
+    appid: str, timeout: float = 5, quiet: bool = False, product: str = DEFAULT_PRODUCT,
+) -> Optional[int]:
+    """The count alone, for callers that have nothing to say about the reason.
+
+    None keeps meaning «the copy is there and cannot be read»; `queue_on_disk`
+    carries that reason for callers that put it in their own log line.
+    """
+    return queue_on_disk(appid, timeout=timeout, quiet=quiet, product=product).count
 
 
 class FiscalOwed(NamedTuple):
@@ -216,11 +241,17 @@ class FiscalOwed(NamedTuple):
     neither «nothing owed» nor «something owed». The counts are None beside
     it, and the caller decides what to do with a dependency it cannot read —
     which is never «refused for good», see `check_can_deactivate`.
+
+    `documents` is how many fiscal documents the copy holds while the count of
+    unsent ones cannot be read. It is owed, not unjudgeable: the rows
+    themselves say there is something to lose, and `pending` is None beside
+    them because how many of them are unsent is exactly what is missing.
     """
 
     pending: Optional[int]
     sessions: int
     unjudged: Optional[str] = None
+    documents: int = 0
 
 
 def fiscal_owed_on_disk(appid: str, product: str = DEFAULT_PRODUCT) -> FiscalOwed:
@@ -232,8 +263,10 @@ def fiscal_owed_on_disk(appid: str, product: str = DEFAULT_PRODUCT) -> FiscalOwe
     of its own, whose key says so without the payload.
 
     A copy that nothing can be read out of — a damaged file, a schema without
-    these names, fiscal documents with no count of unsent ones beside them —
-    comes back `unjudged` with the reason, not as a count.
+    these names — comes back `unjudged` with the reason, not as a count.
+    Fiscal documents with no count of unsent ones beside them are a different
+    answer: the rows are readable and they are owed, see `FiscalOwed`. The
+    same rule for every product, whatever build the till came from.
 
     A product without registers of its own (PRODUCTS[…].fiscal) owes the tax
     service nothing from this computer.
@@ -255,9 +288,15 @@ def fiscal_owed_on_disk(appid: str, product: str = DEFAULT_PRODUCT) -> FiscalOwe
             else:
                 (docs,) = con.execute("SELECT count(*) FROM entity WHERE kind = 'fiscalDocument'").fetchone()
                 if docs:
-                    reason = f"{docs} fiscal documents and no count of unsent ones"
-                    log.warning("offline: fiscal state of shop %s cannot be judged: %s", appid, reason)
-                    return FiscalOwed(None, 0, reason)
+                    # A build that signs documents without keeping the count of
+                    # unsent ones in the clear. Nothing here says they reached
+                    # the tax service, and the rows go with the local copy.
+                    log.warning(
+                        "offline: shop %s holds %s fiscal documents and no count of unsent ones: "
+                        "nothing on disk says they reached the tax service",
+                        appid, docs,
+                    )
+                    return FiscalOwed(None, int(sessions), None, int(docs))
                 pending = 0
         finally:
             con.close()
@@ -277,6 +316,7 @@ def check_can_deactivate(
     queued: Optional[int],
     fiscal_pending: Optional[int] = 0,
     fiscal_sessions: int = 0,
+    fiscal_documents: int = 0,
 ) -> None:
     """Refuse while anything made offline has not reached the server or the tax service.
 
@@ -285,24 +325,25 @@ def check_can_deactivate(
     number never arrives, which is what gets a registrar blocked; an open
     offline session has to be brought back online the same way.
 
-    WHAT IS OWED IS A REFUSAL; WHAT CANNOT BE JUDGED IS NOT.
-    `fiscal_pending` is None when the fiscal state of the copy could not be
-    read at all (`FiscalOwed.unjudged`). That used to be refused with «restart
-    the manager and try again», which is an answer no one can act on: a till
-    whose service never comes up again has nothing but the disk to be judged
-    by, and no restart makes that copy say more. The refusal stays for the
-    thing it protects — a count of unsent documents, an open session — and an
-    unjudgeable copy lets the switch-off through, with the reason in the log
-    of whoever read it.
+    WHAT IS OWED IS A REFUSAL; WHAT CANNOT BE READ AT ALL IS NOT.
+    The same split for every dependency this guard has. Each count is None
+    when that part of the copy could not be read (`QueueOnDisk.unreadable`,
+    `FiscalOwed.unjudged`). That used to be refused with «restart the manager
+    and try again», which is an answer no one can act on: a till whose service
+    never comes up again has nothing but the disk to be judged by, and no
+    restart makes that copy say more. The refusal stays for the thing it
+    protects — operations waiting for the server, documents the tax service
+    has not got, an open session — and a part that cannot be read lets the
+    switch-off through, with the reason in the log of whoever read it.
+
+    `fiscal_documents` is the one count that stands without a number of unsent
+    ones beside it: document rows on disk and no count of them in the clear
+    means nothing says they were sent, so they are owed.
     """
     if queued:
         raise ActivationError(
             f"Офлайн-операцій, що ще не надійшли на сервер: {queued}. "
             "Вимкнення можливе після синхронізації.",
-        )
-    if queued is None:
-        raise ActivationError(
-            "Не вдалося перевірити чергу офлайн-операцій. Спробуйте ще раз.",
         )
     if fiscal_sessions:
         raise ActivationError(
@@ -313,6 +354,12 @@ def check_can_deactivate(
         raise ActivationError(
             f"Фіскальних документів, ще не переданих до ДПС: {fiscal_pending}. "
             "Вимкнення можливе після їх передачі.",
+        )
+    if fiscal_documents:
+        raise ActivationError(
+            f"Фіскальних документів на цьому комп'ютері: {fiscal_documents}, "
+            "і немає даних про їх передачу до ДПС. Вимкнення можливе після "
+            "повернення каси в онлайн.",
         )
 
 
