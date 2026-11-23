@@ -450,8 +450,21 @@ FISCAL_KEY_MAX_BYTES = 1024 * 1024
 #: What a file dropped into the fiscal-keys folder may be called.
 _KEY_FILE_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
+#: THE FILE KINDS THIS FISCAL STACK READS, NAMED ONE BY ONE.
+#:
+#: Key containers: `Key-6.dat` (IIT), `.pfx`/`.p12`, a PrivatBank `.jks`,
+#: IIT's older `.zs2`, a PBES2 container in PEM (`.pem`, `.key`) or DER
+#: (`.pk8`). Certificates kept beside a container: `.cer`, `.crt`, `.der`.
+#: An allow-list and not «anything but an executable»: a person who picks
+#: the wrong file in the browser is told so here, rather than on the first
+#: receipt of a day without internet.
+FISCAL_KEY_SUFFIXES: tuple[str, ...] = (
+    ".dat", ".pfx", ".p12", ".jks", ".zs2", ".pem", ".key", ".pk8",
+    ".cer", ".crt", ".der",
+)
 
-def fiscal_keys_folder(appid: str) -> Path:
+
+def fiscal_keys_folder(appid: str, product: str = DEFAULT_PRODUCT) -> Path:
     """Where the key containers of a shop's offline registers are kept.
 
     OUTSIDE the shop's own folder, and that is the whole point: switching
@@ -461,8 +474,12 @@ def fiscal_keys_folder(appid: str) -> Path:
     registers whose settings name a file that is no longer there, and nothing
     to sign a receipt with in the first shop without internet (found by the
     second review round).
+
+    Inside the product's own folder (`offline_root`), like every other file
+    of its till: two products' tills on one computer never share a container,
+    and a shop and a studio with the same appid cannot meet.
     """
-    return offline_root() / "fiscal-keys" / appid
+    return offline_root(product) / "fiscal-keys" / appid
 
 
 def _safe_key_name(file_name: str) -> str:
@@ -486,7 +503,30 @@ def _safe_key_name(file_name: str) -> str:
     return cleaned
 
 
-def save_fiscal_key(appid: str, file_name: str, content_base64: str) -> dict:
+def _check_key_suffix(name: str, appid: str, product: str) -> None:
+    """Refuse a file whose kind this fiscal stack does not read.
+
+    Before the content is decoded and long before anything is written: a file
+    that cannot be a container or a certificate has no business in the folder
+    that holds the right to sign fiscal documents. The reason goes to the log
+    in full; the person is told which kinds are taken.
+    """
+    suffix = name[name.rfind(".") :].lower() if "." in name else ""
+    if suffix not in FISCAL_KEY_SUFFIXES:
+        log.warning(
+            "offline: fiscal key refused for %s shop %s: file kind %r is not read by the fiscal stack",
+            product, appid, suffix or name,
+        )
+        raise ActivationError(
+            "Цей тип файла не підходить для ключа. "
+            "Підходять контейнери ключа (.dat, .pfx, .p12, .jks, .zs2, .pem, .key, .pk8) "
+            "та сертифікати (.cer, .crt, .der).",
+        )
+
+
+def save_fiscal_key(
+    appid: str, file_name: str, content_base64: str, product: str = DEFAULT_PRODUCT,
+) -> dict:
     """PET-1088 — keep an uploaded key container (or its certificate) on this machine.
 
     The offline service signs with a file that lives on the shop's own
@@ -497,25 +537,39 @@ def save_fiscal_key(appid: str, file_name: str, content_base64: str) -> dict:
     The file is written like every other private file of ours — through a
     temporary file and a rename, readable by this user only — and the answer is
     the path the offline register settings then carry.
+
+    FC-844 — for the till of the product named, Petshandler when not said: a
+    studio's container goes to the FitStudioCRM folder and is checked against
+    the FitStudioCRM activation.
     """
-    active = active_appid()
+    active = active_appid(product)
     if not active:
+        log.warning("offline: fiscal key refused: %s offline mode is not on here", product)
         raise ActivationError("Офлайн-режим на цьому компʼютері не увімкнено.")
     if appid != active:
+        log.warning("offline: fiscal key refused: %s offline mode here is for another shop", product)
         raise ActivationError("Офлайн-режим на цьому компʼютері увімкнено для іншого закладу.")
     name = _safe_key_name(file_name)
+    _check_key_suffix(name, appid, product)
     raw = str(content_base64 or "")
     # Four base64 characters carry three bytes: a body too big to be a
     # container is refused before it is decoded into memory.
     if len(raw) > (FISCAL_KEY_MAX_BYTES // 3 + 1) * 4 + 4:
+        log.warning("offline: fiscal key refused for %s shop %s: body over the cap", product, appid)
         raise ActivationError("Файл завеликий для ключа.")
     try:
         data = base64.b64decode(raw, validate=True)
     except (ValueError, TypeError):
+        log.warning("offline: fiscal key refused for %s shop %s: the body is not base64", product, appid)
         raise ActivationError("Файл не вдалося прочитати.")
     if not data:
+        log.warning("offline: fiscal key refused for %s shop %s: the file is empty", product, appid)
         raise ActivationError("Файл порожній.")
     if len(data) > FISCAL_KEY_MAX_BYTES:
+        log.warning(
+            "offline: fiscal key refused for %s shop %s: %d bytes is over the cap of %d",
+            product, appid, len(data), FISCAL_KEY_MAX_BYTES,
+        )
         raise ActivationError("Файл завеликий для ключа.")
     """THE CONTENT NAMES THE FILE, NOT THE NAME THE BROWSER SENT.
 
@@ -528,11 +582,15 @@ def save_fiscal_key(appid: str, file_name: str, content_base64: str) -> dict:
     """
     digest = hashlib.sha256(data).hexdigest()[:16]
     name = f"{digest}-{name}"
-    path = fiscal_keys_folder(appid) / name
+    path = fiscal_keys_folder(appid, product) / name
     offline_secrets._write_private(path, data)
-    # The name is in the log and the content never is: a key container is the
-    # right to sign fiscal documents.
-    log.info("offline: fiscal key file %s kept for shop %s (%d bytes)", name, appid, len(data))
+    # The name and the path are in the log and the content never is: a key
+    # container is the right to sign fiscal documents. Neither is the password:
+    # it never travels through this route at all.
+    log.info(
+        "offline: fiscal key file %s kept for %s shop %s (%d bytes) at %s",
+        name, product, appid, len(data), path,
+    )
     return {"path": str(path), "name": name, "bytes": len(data)}
 
 

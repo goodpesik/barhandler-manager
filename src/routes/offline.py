@@ -287,19 +287,26 @@ async def save_fiscal_key(request: Request) -> dict:
     it in the browser instead of typing a path. It is kept in the manager's own
     folder (it outlives the offline data, which goes when offline mode is
     switched off), and the answer carries the path the register settings keep.
+
+    FC-844 — for the till named by `?product=` (or `product` in the body),
+    Petshandler when not said: the file is kept in that product's own folder.
     """
     try:
         payload = await request.json()
     except ValueError:
         payload = None
     if not isinstance(payload, dict):
+        log.warning("offline fiscal key refused: the body is not an object")
         raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "Некоректний запит."})
+    product = _product(request, payload)
+    _require_registers(product)
     try:
         return await asyncio.to_thread(
             offline_state.save_fiscal_key,
             str(payload.get("appid") or ""),
             str(payload.get("fileName") or ""),
             str(payload.get("contentBase64") or ""),
+            product,
         )
     except offline_state.ActivationError as e:
         log.warning("offline fiscal key refused: %s", e)
@@ -321,11 +328,85 @@ async def load_local_settings(request: Request) -> dict:
     return body
 
 
-#: The register routes of the offline service, below /api/offline-fiscal.
-_FISCAL_PATH = re.compile(r"(/[A-Za-z0-9_-]+)*")
+#: A register's id as it appears in a path: the service gave it out.
+_REGISTER_ID = r"[A-Za-z0-9_.-]{1,64}"
+
+#: THE REGISTER ROUTES OF THE OFFLINE SERVICE (below /api/offline-fiscal),
+#: NAMED ONE BY ONE WITH THE METHODS EACH ONE TAKES.
+#:
+#: An allow-list, not «any path that looks harmless»: what is behind these
+#: routes sets up a cash register and hands documents to the tax service, and
+#: a pass-through that forwards whatever it is given forwards the next route
+#: the service grows — including one that was never meant to be reachable from
+#: a browser over the internet. A route added to a service and not named here
+#: is refused with its path in the log, which is what tells us to add it.
+#:
+#: The list covers both tills: Petshandler's registration and shift routes and
+#: FitStudioCRM's `PATCH` on a register (FC-844 — the verb its admin's own api
+#: client speaks). A method a till does not have simply never arrives.
+_FISCAL_ROUTES: tuple[tuple[str, frozenset[str]], ...] = (
+    # The registers of this computer and what state each one is in.
+    ("", frozenset({"GET"})),
+    # What the tax service has registered for the owner of a key.
+    ("/lookup", frozenset({"POST"})),
+    # Add a register; save or remove one by its id.
+    ("/registers", frozenset({"POST"})),
+    (rf"/registers/{_REGISTER_ID}", frozenset({"PUT", "PATCH", "DELETE"})),
+    # The cashier's key: opened and kept here, then checked against the
+    # tax service's own list.
+    ("/cashier-key/prepare", frozenset({"POST"})),
+    (rf"/registers/{_REGISTER_ID}/cashier-key/check", frozenset({"POST"})),
+    # The right to work offline, and which machine the РРО is held for.
+    (rf"/registers/{_REGISTER_ID}/grant", frozenset({"POST"})),
+    (rf"/registers/{_REGISTER_ID}/device", frozenset({"POST"})),
+    # Closing an offline session: hand its documents over, or drop a test
+    # session the tax service refuses for good.
+    (rf"/registers/{_REGISTER_ID}/return-online", frozenset({"POST"})),
+    (rf"/registers/{_REGISTER_ID}/discard-test-session", frozenset({"POST"})),
+    # The shift of a register (Petshandler).
+    (rf"/registers/{_REGISTER_ID}/shift", frozenset({"POST"})),
+    (rf"/registers/{_REGISTER_ID}/shift/close", frozenset({"POST"})),
+    # Registering a РРО with the tax service (Petshandler).
+    (rf"/registers/{_REGISTER_ID}/registration", frozenset({"GET", "PUT"})),
+    (rf"/registers/{_REGISTER_ID}/registration/payer", frozenset({"POST"})),
+    (rf"/registers/{_REGISTER_ID}/registration/submit", frozenset({"POST"})),
+    (rf"/registers/{_REGISTER_ID}/registration/receipt", frozenset({"POST"})),
+    (rf"/registers/{_REGISTER_ID}/registration/refresh", frozenset({"POST"})),
+)
+
+#: The same list compiled once; `fullmatch` everywhere, so a path with
+#: anything appended to it is a different path.
+_FISCAL_ALLOWED: tuple[tuple["re.Pattern[str]", frozenset[str]], ...] = tuple(
+    (re.compile(pattern), methods) for pattern, methods in _FISCAL_ROUTES
+)
 
 
-@router.api_route("/fiscal{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+def _fiscal_route_allowed(method: str, path: str) -> bool:
+    """Whether this method and path are one of the register routes above."""
+    return any(
+        method in methods and pattern.fullmatch(path)
+        for pattern, methods in _FISCAL_ALLOWED
+    )
+
+
+def _require_registers(product: str) -> None:
+    """Refuse a product whose offline till keeps no registers of its own.
+
+    Such a till fiscalises through its server after the sync (PRODUCTS[…]
+    .fiscal), so there is nothing here to pass a register route on to.
+    """
+    if not PRODUCTS[product].fiscal:
+        log.warning("offline fiscal: refused, the %s till keeps no registers of its own", product)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "offline_no_registers",
+                "message": "Офлайн-каса цього продукту не має власних РРО на цьому компʼютері.",
+            },
+        )
+
+
+@router.api_route("/fiscal{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def fiscal(path: str, request: Request) -> Response:
     """The offline registers of this computer, set up from the online app.
 
@@ -335,23 +416,33 @@ async def fiscal(path: str, request: Request) -> Response:
     register up while it still has internet, before it ever has to go offline.
     The bodies are passed through and never logged: they carry the key's
     password.
+
+    FC-844 — for the till named by `?product=`, Petshandler when not said:
+    the FitStudioCRM card reaches its own service on its own port.
     """
-    svc = _service(request)
+    product = _product(request)
+    _require_registers(product)
+    svc = _service(request, product)
     if svc is None:
+        log.warning("offline fiscal: refused, this build runs no %s offline till", product)
         raise HTTPException(status_code=503, detail={"code": "offline_unavailable", "message": "Ця збірка не підтримує офлайн-режим."})
-    if not offline_state.active_appid():
+    if not offline_state.active_appid(product):
+        log.warning("offline fiscal: refused, %s offline mode is not on here", product)
         raise HTTPException(status_code=409, detail={"code": "offline_not_active", "message": "Офлайн-режим на цьому комп'ютері не увімкнено."})
-    if not _FISCAL_PATH.fullmatch(path):
-        log.warning("offline fiscal: refused path %r", path)
+    if not _fiscal_route_allowed(request.method, path):
+        log.warning("offline fiscal: refused %s %r — not a register route", request.method, path)
         raise HTTPException(status_code=400, detail={"code": "bad_request", "message": "Некоректний запит."})
-    body = await request.body() if request.method in ("POST", "PUT") else None
+    body = await request.body() if request.method in ("POST", "PUT", "PATCH") else None
     try:
         status, answer = await svc.fiscal(request.method, path, body)
     except Exception as e:  # noqa: BLE001 — refused, timeout: the service is not there
-        log.warning("offline fiscal %s %s: the service did not answer: %s", request.method, path, e)
+        log.warning(
+            "offline fiscal %s %s (%s): the service did not answer: %s",
+            request.method, path, product, e,
+        )
         raise HTTPException(
             status_code=503,
             detail={"code": "offline_service_down", "message": "Офлайн-сервіс не відповідає. Спробуйте за хвилину."},
         )
-    log.info("offline fiscal %s %s: %s", request.method, path or "/", status)
+    log.info("offline fiscal %s %s (%s): %s", request.method, path or "/", product, status)
     return Response(content=answer, status_code=status, media_type="application/json")

@@ -58,9 +58,17 @@ class OfflineProduct:
     token_prefix: str = "pho_"
     #: The folder in APP_DIR that holds this product's shops (one per shop).
     data_folder: str = "offline"
-    #: The product's offline service keeps its own fiscal registers
-    #: (Petshandler). A product without them fiscalises after the sync.
+    #: The product's offline service keeps its own fiscal registers on this
+    #: computer: documents are signed here and owed to the tax service until
+    #: the till comes back online. A product without them fiscalises after
+    #: the sync, so this computer owes the tax service nothing.
     fiscal: bool = True
+    #: Its /health says how the till sees its server (`connection`) and
+    #: whether its queue waits for the service to be updated
+    #: (`needsUpdate`). Kept apart from `fiscal`: a till can report both, and
+    #: a till that reported neither used to be the one «without registers»
+    #: (FC-844 — the FitStudioCRM till now has registers of its own).
+    server_link: bool = False
     #: The till's receipts carry its number among the shop's computers
     #: (D<n>-0001), given at activation.
     numbered_devices: bool = False
@@ -76,8 +84,9 @@ PRODUCTS: dict[str, OfflineProduct] = {
         port=9898,
         api_hosts=("api.petshandler.com", "api-dev.petshandler.com"),
     ),
-    # FC-798 — the FitStudioCRM till (fitstudiocrm-offline). No registers of
-    # its own: offline sales are fiscalised by the server after the sync.
+    # FC-798 — the FitStudioCRM till (fitstudiocrm-offline). FC-844 — with
+    # registers of its own: it signs fiscal documents on this computer, so
+    # this computer owes the tax service until they are handed over.
     "fitstudiocrm": OfflineProduct(
         service_name="fitstudiocrm-offline",
         port=9899,
@@ -90,7 +99,7 @@ PRODUCTS: dict[str, OfflineProduct] = {
         api_path="",
         token_prefix="fso_",
         data_folder="offline-fitstudiocrm",
-        fiscal=False,
+        server_link=True,
         numbered_devices=True,
     ),
 }
@@ -302,6 +311,7 @@ class OfflineService:
         self.product = product
         self._service_name = spec.service_name
         self._fiscal = spec.fiscal
+        self._server_link = spec.server_link
         # The other products' lines carry their name, so two tills on one
         # computer are told apart in the log; Petshandler's stay as they were.
         self._log = log if product == DEFAULT_PRODUCT else log.getChild(product)
@@ -789,12 +799,15 @@ class OfflineService:
             else None,
             "appid": health.get("appid"),
         }
-        if not self._fiscal:
-            # FC-798 — a till without registers of its own says how it sees the
-            # server instead (online / no internet / server down) and whether
-            # its queue stopped until the service is updated.
+        if self._server_link:
+            # FC-798 — the till says how it sees the server (online / no
+            # internet / server down) and whether its queue stopped until the
+            # service is updated.
             self.state.extra["connection"] = health.get("connection")
             self.state.extra["needsUpdate"] = health.get("needsUpdate") is True
+        if not self._fiscal:
+            # A till that fiscalises after the sync owes the tax service
+            # nothing from this computer, so the count would say nothing.
             del self.state.extra["fiscalPending"]
 
     def _ours(self, health: Optional[dict]) -> bool:

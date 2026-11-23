@@ -1006,11 +1006,11 @@ def test_switching_off_goes_once_the_tax_service_has_everything(client_for, home
     assert offline_state.active_appid() is None
 
 
-def _fiscal_copy(home, docs, pending=None, sessions=0):
+def _fiscal_copy(home, docs, pending=None, sessions=0, folder="offline", appid="bark-01"):
     """The offline service's copy as it lays out fiscal state (counts in the clear)."""
     import sqlite3
 
-    data = home / "offline" / "bark-01" / "data"
+    data = home / folder / appid / "data"
     data.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(data / "offline.sqlite")
     con.execute("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
@@ -1243,3 +1243,144 @@ def test_the_fit_apps_word_on_offline_mode_is_its_own(both_for):
     c.get("/devices", headers={**KEY, "X-Offline-Offered": "1", "X-Offline-Product": "fitstudiocrm"})
     assert c.get("/offline/status?product=fitstudiocrm", headers=KEY).json()["offered"] is True
     assert c.get("/offline/status", headers=KEY).json()["offered"] is False
+
+
+# ---- FC-844: the registers of the FitStudioCRM till, and an uploaded key ----
+
+
+def test_the_fit_card_reaches_its_own_registers_through_the_manager(both_for):
+    """The online card calls the manager; the manager calls that till's service."""
+    pets, fit = FakeService(0), FakeService(0, port=9899)
+    c = both_for(pets, fit)
+    c.post("/offline/activate", json=FIT, headers=KEY)
+    r = c.patch(
+        "/offline/fiscal/registers/r-1?product=fitstudiocrm",
+        json={"name": "Каса 1"},
+        headers=KEY,
+    )
+    assert r.status_code == 200, r.text
+    method, path, body = fit.fiscal_calls[-1]
+    assert (method, path, json.loads(body)) == ("PATCH", "/registers/r-1", {"name": "Каса 1"})
+    assert c.get("/offline/fiscal?product=fitstudiocrm", headers=KEY).status_code == 200
+    assert fit.fiscal_calls[-1] == ("GET", "", None)
+    # The call went to the till it named, and the other one is not activated.
+    assert pets.fiscal_calls == []
+    assert c.get("/offline/fiscal", headers=KEY).status_code == 409
+
+
+@pytest.mark.parametrize(
+    "method, path",
+    [
+        # Not a register route of either service.
+        ("GET", "/health"),
+        ("POST", "/registers/r-1/sync"),
+        ("POST", "/registers/r-1/grant/again"),
+        # A register route, with a method it does not take.
+        ("DELETE", ""),
+        ("PUT", "/lookup"),
+        # A path that climbs out of the register it names.
+        ("GET", "/registers/..%2F..%2Fsync"),
+    ],
+)
+def test_only_the_named_register_routes_are_passed_on(both_for, method, path):
+    """A pass-through that forwards anything forwards the next route the service grows."""
+    fit = FakeService(0, port=9899)
+    c = both_for(FakeService(0), fit)
+    c.post("/offline/activate", json=FIT, headers=KEY)
+    r = c.request(method, f"/offline/fiscal{path}?product=fitstudiocrm", headers=KEY)
+    assert r.status_code == 400, r.text
+    assert fit.fiscal_calls == []
+
+
+@pytest.mark.parametrize(
+    "method, path",
+    [
+        ("POST", "/lookup"),
+        ("POST", "/registers"),
+        ("POST", "/cashier-key/prepare"),
+        ("POST", "/registers/r-1/cashier-key/check"),
+        ("POST", "/registers/r-1/grant"),
+        ("POST", "/registers/r-1/device"),
+        ("POST", "/registers/r-1/return-online"),
+        ("POST", "/registers/r-1/discard-test-session"),
+        ("POST", "/registers/r-1/shift/close"),
+        ("POST", "/registers/r-1/registration/submit"),
+        ("GET", "/registers/r-1/registration"),
+    ],
+)
+def test_every_register_route_of_the_service_is_passed_on(client_for, method, path):
+    """The whole surface the cards use, not only the routes one of them calls."""
+    svc = FakeService(0)
+    c = client_for(svc)
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    r = c.request(method, f"/offline/fiscal{path}", headers=KEY, json={} if method == "POST" else None)
+    assert r.status_code == 200, r.text
+    assert svc.fiscal_calls[-1][:2] == (method, path)
+
+
+def test_an_uploaded_key_goes_to_the_folder_of_the_till_it_is_for(both_for, home):
+    c = both_for(FakeService(0), FakeService(0, port=9899))
+    c.post("/offline/activate", json=FIT, headers=KEY)
+    r = c.post(
+        "/offline/fiscal-key?product=fitstudiocrm",
+        json={"appid": FIT["appid"], "fileName": "Key-6.dat", "contentBase64": "a2V5LWJ5dGVz"},
+        headers=KEY,
+    )
+    assert r.status_code == 200, r.text
+    path = Path(r.json()["path"])
+    assert path.read_bytes() == b"key-bytes"
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert path.parent == offline_state.fiscal_keys_folder(FIT["appid"], "fitstudiocrm")
+    assert home / "offline-fitstudiocrm" in path.parents
+    # The Petshandler till is not activated here, so nothing is kept for it.
+    refused = c.post(
+        "/offline/fiscal-key",
+        json={"appid": PAYLOAD["appid"], "fileName": "Key-6.dat", "contentBase64": "a2V5LWJ5dGVz"},
+        headers=KEY,
+    )
+    assert refused.status_code == 400, refused.text
+    assert not offline_state.fiscal_keys_folder(PAYLOAD["appid"]).exists()
+
+
+@pytest.mark.parametrize("file_name", ["setup.exe", "key", "Key-6.dat.txt", "run.sh", "notes.docx"])
+def test_a_file_kind_the_fiscal_stack_does_not_read_is_refused(client_for, home, file_name):
+    """And refused BEFORE anything is written: the folder is not even made."""
+    c = client_for(FakeService(queued=0))
+    _activate(c)
+    r = c.post(
+        "/offline/fiscal-key",
+        json={"appid": PAYLOAD["appid"], "fileName": file_name, "contentBase64": "a2V5LWJ5dGVz"},
+        headers=KEY,
+    )
+    assert r.status_code == 400, r.text
+    assert not offline_state.fiscal_keys_folder(PAYLOAD["appid"]).exists()
+
+
+@pytest.mark.parametrize("file_name", ["Key-6.dat", "cashier.PFX", "bank.jks", "owner.cer", "key.p12"])
+def test_the_container_kinds_this_stack_reads_are_taken(client_for, home, file_name):
+    c = client_for(FakeService(queued=0))
+    _activate(c)
+    r = c.post(
+        "/offline/fiscal-key",
+        json={"appid": PAYLOAD["appid"], "fileName": file_name, "contentBase64": "a2V5LWJ5dGVz"},
+        headers=KEY,
+    )
+    assert r.status_code == 200, r.text
+    assert Path(r.json()["path"]).read_bytes() == b"key-bytes"
+
+
+def test_the_fit_till_is_not_switched_off_with_documents_the_tax_service_has_not_got(both_for, home):
+    """Its registers sign on this computer: a wipe loses their fiscal numbers.
+
+    The service cannot be asked here, which is the dangerous case — the counts
+    the copy keeps in the clear are what is left to judge by.
+    """
+    fit = FakeService(None, port=9899)
+    c = both_for(FakeService(0), fit)
+    c.post("/offline/activate", json=FIT, headers=KEY)
+    _fiscal_copy(home, docs=3, pending=2, folder="offline-fitstudiocrm", appid="studio-01")
+    r = c.post("/offline/deactivate?product=fitstudiocrm", headers=KEY)
+    assert r.status_code == 409 and "2" in r.json()["detail"]["message"]
+    assert fit.stopped == 0 and offline_state.active_appid("fitstudiocrm") == "studio-01"
+    assert (home / "offline-fitstudiocrm" / "studio-01" / "data").exists()
+
