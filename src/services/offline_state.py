@@ -317,6 +317,8 @@ def check_can_deactivate(
     fiscal_pending: Optional[int] = 0,
     fiscal_sessions: int = 0,
     fiscal_documents: int = 0,
+    *,
+    forced: bool = False,
 ) -> None:
     """Refuse while anything made offline has not reached the server or the tax service.
 
@@ -339,7 +341,21 @@ def check_can_deactivate(
     `fiscal_documents` is the one count that stands without a number of unsent
     ones beside it: document rows on disk and no count of them in the clear
     means nothing says they were sent, so they are owed.
+
+    AND NO COUNT MAY BE ANSWERED «OWED» FOR GOOD. Every refusal here names
+    something the till is told to clear by going back online, and every one of
+    them is cleared by the very service that switching off would remove: a
+    till whose service will not start can satisfy none of them, and asking
+    again changes nothing. `forced` is the way out of that, and it is a
+    deliberate one — an explicit word on the call, never a timeout and never a
+    fallback this guard arrives at by itself. It overrides EVERY count, not
+    just the document rows: a queue that cannot be sent and a session that
+    cannot be closed are the same dead end by another name.
     """
+    if forced:
+        # FC-844 — switched off on an explicit word, with what is being given
+        # up written in the caller's log before the local copy goes.
+        return
     if queued:
         raise ActivationError(
             f"Офлайн-операцій, що ще не надійшли на сервер: {queued}. "

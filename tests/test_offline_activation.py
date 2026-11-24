@@ -1055,6 +1055,70 @@ def test_a_silent_service_is_judged_by_the_counts_on_disk(client_for, home, docs
     assert c.post("/offline/deactivate", headers=KEY).status_code == code
 
 
+def test_a_till_the_guard_would_hold_for_good_is_switched_off_on_an_explicit_force(
+    client_for, home, caplog,
+):
+    """FC-844 — document rows, no count of unsent ones, and a service that will not start.
+
+    The refusal is right and stays: nothing on disk says those documents
+    reached the tax service. What must not stay is the dead end — the refusal
+    tells the till to go back online, and going back online needs the very
+    service that switching off would remove. The way out is asked for on
+    purpose, and what is given up is written down before the copy goes.
+    """
+    c = client_for(FakeService(None))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    _fiscal_copy(home, docs=3, pending=None)
+    with caplog.at_level(logging.WARNING):
+        r = c.post("/offline/deactivate", headers=KEY)
+    assert r.status_code == 409 and "3" in r.json()["detail"]["message"]
+    assert offline_state.active_appid() == "bark-01"
+    # The refusal says which count holds the till, that the count of unsent
+    # documents is the thing missing, and how it is cleared.
+    refusal = [m for m in caplog.messages if "refused" in m]
+    assert any(
+        "fiscal document rows on disk 3" in m
+        and "count of unsent documents on disk absent" in m
+        and "force=1" in m
+        for m in refusal
+    ), refusal
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        forced = c.post("/offline/deactivate?force=1", headers=KEY)
+    assert forced.status_code == 200 and forced.json() == {"ok": True, "forced": True}
+    assert offline_state.active_appid() is None
+    # The success of an irreversible switch-off, with what it gave up and
+    # which register it was: a bare «forced off» answers no one.
+    done = [m for m in caplog.messages if "FORCED and done" in m]
+    assert len(done) == 1, caplog.messages
+    assert "3 fiscal document rows" in done[0] and "till-7f3a" in done[0], done[0]
+
+
+@pytest.mark.parametrize("query", ["", "?force=0", "?force=maybe", "?force="])
+def test_only_the_explicit_word_forces_the_switch_off(client_for, home, query):
+    """Everything that is not the word is an ordinary call, answered as before."""
+    c = client_for(FakeService(None))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    _fiscal_copy(home, docs=1, pending=None)
+    assert c.post(f"/offline/deactivate{query}", headers=KEY).status_code == 409
+    assert offline_state.active_appid() == "bark-01"
+
+
+def test_a_queue_that_cannot_be_sent_is_a_dead_end_the_same_force_clears(client_for, home):
+    """FC-844 — the override is not about fiscal rows alone.
+
+    Operations waiting for the server are cleared by the service sending
+    them, so a service that will not start holds this refusal just as
+    permanently. One flag answers every count the guard has.
+    """
+    c = client_for(FakeService(None))
+    c.post("/offline/activate", json=PAYLOAD, headers=KEY)
+    _local_copy(home, ["queued", "queued"])
+    assert c.post("/offline/deactivate", headers=KEY).status_code == 409
+    assert c.post("/offline/deactivate", json={"force": True}, headers=KEY).status_code == 200
+    assert offline_state.active_appid() is None
+
+
 def test_a_silent_service_and_a_copy_that_cannot_be_read_go_through(client_for, home, caplog):
     """Neither the queue nor the fiscal state can be read: nothing to refuse for.
 

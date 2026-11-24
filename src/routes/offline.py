@@ -92,6 +92,29 @@ def _product(request: Request, payload: Optional[dict] = None) -> str:
     return product
 
 
+#: What counts as «switch this till off anyway» on the query string or in the
+#: body. A word that has to be typed on purpose: anything else, including an
+#: absent one, is an ordinary switch-off that the guard answers as before.
+_FORCE_WORDS = frozenset({"1", "true", "yes"})
+
+
+def _forced(request: Request, payload: Optional[dict] = None) -> bool:
+    """Whether the caller asked for the switch-off to go through regardless.
+
+    FC-844 — the deliberate way out of a till the guard can refuse for good:
+    every refusal it gives is cleared by going back online, and going back
+    online needs the service that switching off would remove, so a service
+    that will not start leaves no way out at all. The flag is explicit on
+    purpose — the guard never decides by itself that enough time has passed.
+    """
+    raw = request.query_params.get("force")
+    if raw is None:
+        raw = (payload or {}).get("force")
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in _FORCE_WORDS
+
+
 def _service(request: Request, product: str = DEFAULT_PRODUCT) -> Optional[OfflineService]:
     services = getattr(request.app.state, "offline_services", None)
     if services is not None:
@@ -257,11 +280,23 @@ async def activate(request: Request) -> dict:
 
 @router.post("/deactivate")
 async def deactivate(request: Request) -> dict:
-    product = _product(request)
+    try:
+        payload = await _capped_json(request)
+    except _BodyTooLarge as e:
+        raise _refuse_too_large(request, str(e))
+    product = _product(request, payload)
+    # FC-844 — `force` is read before anything else is asked, but it changes
+    # nothing about WHAT is read: the counts are gathered either way, because
+    # they are what the forced switch-off writes down before the copy goes.
+    forced = _forced(request, payload)
     svc = _service(request, product)
     appid = offline_state.active_appid(product)
     if not appid:
         return {"ok": True}
+    # The till this computer runs, as the activation named it; taken while the
+    # activation is still there, so a forced switch-off can say which register
+    # it switched off and not just that one was.
+    register = offline_state.public_status(product)
     # What the service says right now, not what it said a minute ago.
     health = await svc.refresh() if svc is not None else None
     queued = health.get("queued") if health else None
@@ -313,10 +348,39 @@ async def deactivate(request: Request) -> dict:
             fiscal_pending,
             fiscal_sessions,
             fiscal_documents,
+            forced=forced,
         )
     except offline_state.ActivationError as e:
-        log.warning("offline deactivation refused: %s", e)
+        # Everything the refusal stands on, in one line: whoever is called
+        # about a till that will not switch off can see WHICH count holds it
+        # and that the count of unsent documents (meta `fiscalPending`) is
+        # missing on a copy from a build that keeps none — the state in which
+        # the document rows alone decide, and the only way out is a forced
+        # switch-off asked for on purpose.
+        log.warning(
+            "offline switch-off (%s shop %s, device %s) refused: %s "
+            "[queue %s, unsent fiscal documents %s, open fiscal sessions %s, "
+            "fiscal document rows on disk %s, count of unsent documents on disk %s]; "
+            "a till whose service will not start clears none of these by going online — "
+            "switching it off then needs force=1 on this call",
+            product, appid, register.get("deviceId"), e,
+            queued, fiscal_pending, fiscal_sessions, fiscal_documents,
+            "absent" if fiscal_pending is None else "present",
+        )
         raise HTTPException(status_code=409, detail={"code": "offline_queue_not_empty", "message": str(e)})
+    if forced:
+        # Said BEFORE the irreversible part, so a switch-off that dies halfway
+        # through still leaves a record of what was given up, and said with
+        # the counts rather than as a bare «forced off»: this is the line a
+        # shop asking about a fiscal number will be answered from.
+        log.warning(
+            "offline switch-off (%s shop %s, device %s) FORCED: the guard is overridden "
+            "on an explicit request and the local copy goes with "
+            "[queue %s, unsent fiscal documents %s, open fiscal sessions %s, "
+            "fiscal document rows on disk %s]",
+            product, appid, register.get("deviceId"),
+            queued, fiscal_pending, fiscal_sessions, fiscal_documents,
+        )
     # Secrets first: without them the supervisor cannot start the service
     # again in between. If they cannot be removed, nothing else is touched.
     try:
@@ -337,6 +401,14 @@ async def deactivate(request: Request) -> dict:
         # be read, so it is removed even if the service misbehaved.
         if appid:
             await asyncio.to_thread(offline_state.remove_data, appid, product)
+    if forced:
+        log.warning(
+            "offline switch-off (%s shop %s, device %s) FORCED and done: "
+            "%s fiscal document rows and %s queued operations went with the local copy",
+            product, register.get("appid"), register.get("deviceId"),
+            fiscal_documents, queued,
+        )
+        return {"ok": True, "forced": True}
     return {"ok": True}
 
 
