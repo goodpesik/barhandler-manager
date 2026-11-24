@@ -32,7 +32,7 @@ import logging
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Iterator, NamedTuple, Optional
 
 from fastapi import Request
 
@@ -258,7 +258,22 @@ def printers_with_pending_jobs(request: Request) -> list[str]:
 _PRODUCT_TITLES = {"fitstudiocrm": "FitStudioCRM"}
 
 
-def _offline_queued(request: Request, services: Optional[dict], product: str) -> Optional[int]:
+class _OfflineQueue(NamedTuple):
+    """What one product's till still has to send, in the two numbers it is
+    asked about.
+
+    FC-845 — `gate` is what an update is refused by: the till carries a
+    fiscal state it could not read inside it, because deactivating wipes the
+    copy and may not be allowed over a value nobody could open.
+    `operations` counts operations and nothing else, so it is the number a
+    person is shown; it is never above the gate, and it is never a gate.
+    """
+
+    gate: Optional[int]
+    operations: Optional[int]
+
+
+def _offline_queued(request: Request, services: Optional[dict], product: str) -> _OfflineQueue:
     """What one product's till still has to send: from its running service,
     or from its local copy when the service is down or silent."""
     from src.services.offline_service import DEFAULT_PRODUCT
@@ -267,7 +282,9 @@ def _offline_queued(request: Request, services: Optional[dict], product: str) ->
         offline = services.get(product)
     else:
         offline = getattr(request.app.state, "offline_service", None) if product == DEFAULT_PRODUCT else None
-    queued = (offline.state.extra or {}).get("queued") if offline is not None else None
+    extra = (offline.state.extra or {}) if offline is not None else {}
+    queued = extra.get("queued")
+    operations = extra.get("queuedOperations")
     if not isinstance(queued, int):
         # The service is down (no secrets) or silent: its queue is on disk,
         # read the same way switching off reads it. Unreadable stays «free»:
@@ -278,7 +295,15 @@ def _offline_queued(request: Request, services: Optional[dict], product: str) ->
         # Called on the event loop: a short wait, never the manager frozen
         # behind a locked file (the service writes in WAL mode, readers do not wait).
         queued = offline_state.queued_on_disk(appid, timeout=0.2, quiet=True, product=product) if appid else None
-    return queued
+        # The local copy is read for its operations; it carries no fiscal
+        # state, so the one number answers for both.
+        operations = queued
+    elif not isinstance(operations, int):
+        # A till older than the second count sends the gate alone, and tills
+        # update apart from the manager: the gate is then the best the
+        # display has.
+        operations = queued
+    return _OfflineQueue(queued, operations)
 
 
 def busy_refusal(request: Request) -> Optional[dict]:
@@ -312,10 +337,16 @@ def busy_refusal(request: Request) -> Optional[dict]:
 
     services = getattr(request.app.state, "offline_services", None)
     for product in PRODUCTS:
-        queued = _offline_queued(request, services, product)
-        if isinstance(queued, int) and queued > 0:
-            label = "офлайн-операції" if product == DEFAULT_PRODUCT else f"офлайн-операції {_PRODUCT_TITLES.get(product, product)}"
-            reasons.append(f"{label} ще не надійшли на сервер: {queued}")
+        queue = _offline_queued(request, services, product)
+        if isinstance(queue.gate, int) and queue.gate > 0:
+            whose = "" if product == DEFAULT_PRODUCT else f" {_PRODUCT_TITLES.get(product, product)}"
+            if isinstance(queue.operations, int) and queue.operations > 0:
+                reasons.append(f"офлайн-операції{whose} ще не надійшли на сервер: {queue.operations}")
+            else:
+                # The guard holds on a fiscal state the till could not read,
+                # and no operation stands behind it: a count here would say
+                # «0 operations wait», so the reason names the state instead.
+                reasons.append(f"стан офлайн-каси{whose} не прочитано")
     if not reasons:
         return None
     return {

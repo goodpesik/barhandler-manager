@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -58,9 +59,17 @@ class OfflineProduct:
     token_prefix: str = "pho_"
     #: The folder in APP_DIR that holds this product's shops (one per shop).
     data_folder: str = "offline"
-    #: The product's offline service keeps its own fiscal registers
-    #: (Petshandler). A product without them fiscalises after the sync.
+    #: The product's offline service keeps its own fiscal registers on this
+    #: computer: documents are signed here and owed to the tax service until
+    #: the till comes back online. A product without them fiscalises after
+    #: the sync, so this computer owes the tax service nothing.
     fiscal: bool = True
+    #: Its /health says how the till sees its server (`connection`) and
+    #: whether its queue waits for the service to be updated
+    #: (`needsUpdate`). Kept apart from `fiscal`: a till can report both, and
+    #: a till that reported neither used to be the one «without registers»
+    #: (FC-844 — the FitStudioCRM till now has registers of its own).
+    server_link: bool = False
     #: The till's receipts carry its number among the shop's computers
     #: (D<n>-0001), given at activation.
     numbered_devices: bool = False
@@ -76,8 +85,9 @@ PRODUCTS: dict[str, OfflineProduct] = {
         port=9898,
         api_hosts=("api.petshandler.com", "api-dev.petshandler.com"),
     ),
-    # FC-798 — the FitStudioCRM till (fitstudiocrm-offline). No registers of
-    # its own: offline sales are fiscalised by the server after the sync.
+    # FC-798 — the FitStudioCRM till (fitstudiocrm-offline). FC-844 — with
+    # registers of its own: it signs fiscal documents on this computer, so
+    # this computer owes the tax service until they are handed over.
     "fitstudiocrm": OfflineProduct(
         service_name="fitstudiocrm-offline",
         port=9899,
@@ -90,7 +100,7 @@ PRODUCTS: dict[str, OfflineProduct] = {
         api_path="",
         token_prefix="fso_",
         data_folder="offline-fitstudiocrm",
-        fiscal=False,
+        server_link=True,
         numbered_devices=True,
     ),
 }
@@ -238,6 +248,35 @@ def _post_sync(port: int, timeout: float = SYNC_NOW_TIMEOUT) -> Optional[dict]:
 #: internet from the offline service, and the cabinet can be slow.
 FISCAL_CALL_TIMEOUT = 60.0
 
+#: One segment of a register route path: a route name the service has, or an
+#: id it handed out. It has to START with a letter or a digit, so `.` and `..`
+#: are not segments at all.
+_FISCAL_PATH_SEGMENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def safe_fiscal_path(path: str) -> str:
+    """The register route path as it may be pasted into the service's URL.
+
+    THE GUARD SITS WHERE THE PATH IS PASTED, not only where it is matched
+    against the list of routes. That list is written by hand, one pattern per
+    route, and a pattern whose id part accepts a dot segment lets
+    `/registers/../grant` through as the grant route: whoever normalises the
+    path next — the service itself, or anything in front of it — then lands the
+    call on `/grant`, a route the list never named. Here every segment has to
+    start with a letter or a digit, so there is nothing left to normalise,
+    whatever a pattern added upstream tomorrow happens to allow.
+
+    The path unchanged when it is one the service can be asked for; otherwise
+    ValueError, and nothing is sent.
+    """
+    if path == "":
+        return path
+    if not path.startswith("/"):
+        raise ValueError("a register route path has to start with a slash")
+    if not all(_FISCAL_PATH_SEGMENT.fullmatch(segment) for segment in path[1:].split("/")):
+        raise ValueError("a register route path may name only route names and register ids")
+    return path
+
 
 def _call_fiscal(port: int, method: str, path: str, body: Optional[bytes], timeout: float = FISCAL_CALL_TIMEOUT) -> tuple[int, bytes]:
     """
@@ -249,7 +288,7 @@ def _call_fiscal(port: int, method: str, path: str, body: Optional[bytes], timeo
     service that cannot be reached raises.
     """
     req = urllib.request.Request(
-        f"http://127.0.0.1:{port}/api/offline-fiscal{path}",
+        f"http://127.0.0.1:{port}/api/offline-fiscal{safe_fiscal_path(path)}",
         data=body,
         method=method,
         headers={"Content-Type": "application/json"} if body is not None else {},
@@ -259,6 +298,26 @@ def _call_fiscal(port: int, method: str, path: str, body: Optional[bytes], timeo
             return resp.status, resp.read()
     except urllib.error.HTTPError as e:
         return e.code, e.read()
+
+
+def _queued_operations(health: dict) -> Optional[int]:
+    """How many operations the till still has to send — the number a person
+    is shown.
+
+    FC-845 — the till answers with two counts. `queued` is the GATE the
+    update and the switch-off ask, and it carries a fiscal state the till
+    could not read with it, so showing it says «one more operation waits»
+    about a sealed value no operation stands behind. `queuedOperations`
+    counts operations and nothing else.
+
+    A till older than that answer does not send the second count, and tills
+    update apart from the manager: then the gate is all there is, and the
+    display falls back to it rather than showing nothing.
+    """
+    operations = health.get("queuedOperations")
+    if isinstance(operations, int) and not isinstance(operations, bool):
+        return operations
+    return health.get("queued")
 
 
 @dataclass
@@ -302,6 +361,7 @@ class OfflineService:
         self.product = product
         self._service_name = spec.service_name
         self._fiscal = spec.fiscal
+        self._server_link = spec.server_link
         # The other products' lines carry their name, so two tills on one
         # computer are told apart in the log; Petshandler's stay as they were.
         self._log = log if product == DEFAULT_PRODUCT else log.getChild(product)
@@ -777,7 +837,12 @@ class OfflineService:
     def _remember(self, health: dict) -> None:
         """What the dashboard shows and what the update guard asks."""
         self.state.extra = {
+            # The gate: what the update guard and the switch-off ask. It is
+            # not a count of operations — see `_queued_operations`.
             "queued": health.get("queued"),
+            # The same till's operations alone, for everything a person is
+            # shown. Never above the gate, and never a gate itself.
+            "queuedOperations": _queued_operations(health),
             "dataAsOf": health.get("dataAsOf"),
             "needsPairing": bool(health.get("needsPairing")),
             # PET-1122 — the till's own shift is open: Petshandler reminds the shop to close it.
@@ -789,12 +854,15 @@ class OfflineService:
             else None,
             "appid": health.get("appid"),
         }
-        if not self._fiscal:
-            # FC-798 — a till without registers of its own says how it sees the
-            # server instead (online / no internet / server down) and whether
-            # its queue stopped until the service is updated.
+        if self._server_link:
+            # FC-798 — the till says how it sees the server (online / no
+            # internet / server down) and whether its queue stopped until the
+            # service is updated.
             self.state.extra["connection"] = health.get("connection")
             self.state.extra["needsUpdate"] = health.get("needsUpdate") is True
+        if not self._fiscal:
+            # A till that fiscalises after the sync owes the tax service
+            # nothing from this computer, so the count would say nothing.
             del self.state.extra["fiscalPending"]
 
     def _ours(self, health: Optional[dict]) -> bool:

@@ -900,6 +900,31 @@ def test_the_fit_supervisor_takes_its_own_port_by_default():
     assert OfflineService(lambda: None, argv=["n", "m"], expected_version="1").port == 9898
 
 
+# ---- FC-844: the fit till has registers of its own, and still reports the link ----
+
+
+def _fit_status(health: dict) -> dict:
+    """What the fit supervisor remembers from one /health answer."""
+    answer = {"name": "fitstudiocrm-offline", "version": "1.2.3", "queued": 0, **health}
+    svc = OfflineService(
+        lambda: None, argv=["node"], expected_version="1.2.3",
+        fetch_health=lambda port: answer, product="fitstudiocrm",
+    )
+    assert asyncio.run(svc.refresh()) is not None
+    return svc.state.extra
+
+
+def test_the_fit_status_carries_the_documents_its_registers_still_owe():
+    """Its own registers sign here, so the count the card waits on is real."""
+    assert _fit_status({"fiscalPending": 3})["fiscalPending"] == 3
+
+
+def test_the_fit_status_still_says_how_the_till_sees_its_server():
+    """Having registers of its own did not cost it the link state its banner reads."""
+    extra = _fit_status({"connection": {"state": "offline"}, "needsUpdate": True})
+    assert extra["connection"] == {"state": "offline"} and extra["needsUpdate"] is True
+
+
 # ---- FC-829: a start under way is not a malfunction ----------------------
 
 

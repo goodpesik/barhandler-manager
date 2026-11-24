@@ -1587,7 +1587,13 @@ _HTML_TEMPLATE = r"""<!doctype html>
       $("offline-status").innerHTML = status;
       $("offline-shop").textContent = on ? (st.shopName || st.appid || "—") : "—";
       $("offline-data").textContent = svc.dataAsOf ? new Date(svc.dataAsOf).toLocaleString(localeTag()) : "—";
-      $("offline-queue").textContent = on && svc.queued != null ? String(svc.queued) : "—";
+      /* FC-845 — the row counts OPERATIONS. `queued` is the gate the update
+         and the switch-off ask and carries a fiscal state the till could not
+         read with it, so it would show one operation more than there are; a
+         till too old to send the operations count leaves the gate as the only
+         number there is. */
+      const queuedOps = svc.queuedOperations != null ? svc.queuedOperations : svc.queued;
+      $("offline-queue").textContent = on && queuedOps != null ? String(queuedOps) : "—";
       $("offline-shop-row").style.display = on ? "" : "none";
       $("offline-data-row").style.display = on ? "" : "none";
       $("offline-queue-row").style.display = on ? "" : "none";
@@ -1622,7 +1628,11 @@ _HTML_TEMPLATE = r"""<!doctype html>
     try {
       const r = await api("POST", "/offline/sync?product=" + offlineProduct, true);
       if (r.failed || r.needsPairing) showToast(t("offline_sync_failed"), "err", 8000);
-      else showToast(t("offline_synced", { n: r.queued != null ? r.queued : "—" }), "ok", 5000);
+      else {
+        /* The same count of operations as the row above, for the same reason. */
+        const left = r.queuedOperations != null ? r.queuedOperations : r.queued;
+        showToast(t("offline_synced", { n: left != null ? left : "—" }), "ok", 5000);
+      }
       await openOfflineModal();
     } catch (e) {
       showToast(t("error_prefix", { err: e.message }), "err", 8000);

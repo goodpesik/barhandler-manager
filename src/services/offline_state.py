@@ -31,7 +31,7 @@ import sqlite3
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from src.config import APP_DIR
 from src.services import offline_secrets
@@ -170,15 +170,29 @@ def _device_number(payload: dict) -> int:
     raise ActivationError(f"Номер каси має бути цілим числом від 1 до {MAX_DEVICE_NUMBER}.")
 
 
-def queued_on_disk(
+class QueueOnDisk(NamedTuple):
+    """What the local copy says it still has to send.
+
+    `unreadable` is why the copy could not be read, and it is a THIRD answer:
+    neither a count of waiting operations nor «nothing waiting». `count` is
+    None beside it, and the caller decides what to do with a dependency it
+    cannot read — which is never «refused for good», see `check_can_deactivate`.
+    """
+
+    count: Optional[int]
+    unreadable: Optional[str] = None
+
+
+def queue_on_disk(
     appid: str, timeout: float = 5, quiet: bool = False, product: str = DEFAULT_PRODUCT,
-) -> Optional[int]:
+) -> QueueOnDisk:
     """Operations still waiting for the server, read from the local copy itself.
 
     For when the service is not running and cannot be asked — without its
     secrets it never starts, and switching off must not depend on it. The
     queue's status column is plain text (only the payload is sealed), so no
-    key is needed. None when the copy is there but cannot be read.
+    key is needed. A copy that is there but cannot be read comes back
+    `unreadable` with the reason, not as a count.
 
     `quiet` leaves out the routine lines for callers that poll (the update
     guard asks every few seconds); a copy that cannot be read is always logged.
@@ -188,7 +202,7 @@ def queued_on_disk(
         if not path.exists():
             if not quiet:
                 log.info("offline: shop %s has no local copy, nothing queued", appid)
-            return 0
+            return QueueOnDisk(0)
         con = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=timeout)
         try:
             (n,) = con.execute("SELECT count(*) FROM outbox WHERE status = 'queued'").fetchone()
@@ -198,36 +212,71 @@ def queued_on_disk(
         if "no such table" in str(e):
             if not quiet:
                 log.info("offline: shop %s local copy has no queue yet", appid)
-            return 0
+            return QueueOnDisk(0)
         log.warning("offline: queue of shop %s unreadable on disk: %s", appid, e)
-        return None
+        return QueueOnDisk(None, str(e))
     except (sqlite3.DatabaseError, OSError, ValueError) as e:
         log.warning("offline: queue of shop %s unreadable on disk: %s", appid, e)
-        return None
+        return QueueOnDisk(None, str(e))
     if not quiet or n:
         log.info("offline: shop %s queue read from disk: %s waiting", appid, n)
-    return int(n)
+    return QueueOnDisk(int(n))
 
 
-def fiscal_owed_on_disk(appid: str, product: str = DEFAULT_PRODUCT) -> Optional[tuple[int, int]]:
-    """What the local copy still owes the tax service: (unsent documents, sessions).
+def queued_on_disk(
+    appid: str, timeout: float = 5, quiet: bool = False, product: str = DEFAULT_PRODUCT,
+) -> Optional[int]:
+    """The count alone, for callers that have nothing to say about the reason.
+
+    None keeps meaning «the copy is there and cannot be read»; `queue_on_disk`
+    carries that reason for callers that put it in their own log line.
+    """
+    return queue_on_disk(appid, timeout=timeout, quiet=quiet, product=product).count
+
+
+class FiscalOwed(NamedTuple):
+    """What the local copy says it still owes the tax service.
+
+    `unjudged` is why the copy could not be judged, and it is a THIRD answer:
+    neither «nothing owed» nor «something owed». The counts are None beside
+    it, and the caller decides what to do with a dependency it cannot read —
+    which is never «refused for good», see `check_can_deactivate`.
+
+    `documents` is how many fiscal documents the copy holds while the count of
+    unsent ones cannot be read. It is owed, not unjudgeable: the rows
+    themselves say there is something to lose, and `pending` is None beside
+    them because how many of them are unsent is exactly what is missing.
+    """
+
+    pending: Optional[int]
+    sessions: int
+    unjudged: Optional[str] = None
+    documents: int = 0
+
+
+def fiscal_owed_on_disk(appid: str, product: str = DEFAULT_PRODUCT) -> FiscalOwed:
+    """What the local copy still owes the tax service: unsent documents, sessions.
 
     For when the service cannot be asked. Whether a document was sent is
     inside its sealed row, so the service keeps the count of unsent ones in
     the clear (meta `fiscalPending`, PET-1120); an open session is a meta row
-    of its own, whose key says so without the payload. A copy from a service
-    older than that count, with any fiscal document in it, cannot be judged:
-    None, like a copy that cannot be read.
+    of its own, whose key says so without the payload.
+
+    A copy that nothing can be read out of — a damaged file, a schema without
+    these names — comes back `unjudged` with the reason, not as a count.
+    Fiscal documents with no count of unsent ones beside them are a different
+    answer: the rows are readable and they are owed, see `FiscalOwed`. The
+    same rule for every product, whatever build the till came from.
 
     A product without registers of its own (PRODUCTS[…].fiscal) owes the tax
     service nothing from this computer.
     """
     if not PRODUCTS[product].fiscal:
-        return 0, 0
+        return FiscalOwed(0, 0)
     path = shop_folder(appid, product) / "data" / "offline.sqlite"
     try:
         if not path.exists():
-            return 0, 0
+            return FiscalOwed(0, 0)
         con = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True, timeout=5)
         try:
             row = con.execute("SELECT value FROM meta WHERE key = 'fiscalPending'").fetchone()
@@ -239,27 +288,37 @@ def fiscal_owed_on_disk(appid: str, product: str = DEFAULT_PRODUCT) -> Optional[
             else:
                 (docs,) = con.execute("SELECT count(*) FROM entity WHERE kind = 'fiscalDocument'").fetchone()
                 if docs:
-                    log.warning("offline: shop %s has %s fiscal documents and no count of unsent ones", appid, docs)
-                    return None
+                    # A build that signs documents without keeping the count of
+                    # unsent ones in the clear. Nothing here says they reached
+                    # the tax service, and the rows go with the local copy.
+                    log.warning(
+                        "offline: shop %s holds %s fiscal documents and no count of unsent ones: "
+                        "nothing on disk says they reached the tax service",
+                        appid, docs,
+                    )
+                    return FiscalOwed(None, int(sessions), None, int(docs))
                 pending = 0
         finally:
             con.close()
     except sqlite3.OperationalError as e:
         if "no such table" in str(e):
-            return 0, 0
-        log.warning("offline: fiscal state of shop %s unreadable on disk: %s", appid, e)
-        return None
+            return FiscalOwed(0, 0)
+        log.warning("offline: fiscal state of shop %s cannot be judged: %s", appid, e)
+        return FiscalOwed(None, 0, str(e))
     except (sqlite3.DatabaseError, OSError, ValueError) as e:
-        log.warning("offline: fiscal state of shop %s unreadable on disk: %s", appid, e)
-        return None
+        log.warning("offline: fiscal state of shop %s cannot be judged: %s", appid, e)
+        return FiscalOwed(None, 0, str(e))
     log.info("offline: shop %s fiscal state read from disk: %s unsent, %s sessions", appid, pending, sessions)
-    return pending, int(sessions)
+    return FiscalOwed(pending, int(sessions))
 
 
 def check_can_deactivate(
     queued: Optional[int],
     fiscal_pending: Optional[int] = 0,
     fiscal_sessions: int = 0,
+    fiscal_documents: int = 0,
+    *,
+    forced: bool = False,
 ) -> None:
     """Refuse while anything made offline has not reached the server or the tax service.
 
@@ -267,15 +326,40 @@ def check_can_deactivate(
     not yet handed to the tax service would be lost with it, and its fiscal
     number never arrives, which is what gets a registrar blocked; an open
     offline session has to be brought back online the same way.
+
+    WHAT IS OWED IS A REFUSAL; WHAT CANNOT BE READ AT ALL IS NOT.
+    The same split for every dependency this guard has. Each count is None
+    when that part of the copy could not be read (`QueueOnDisk.unreadable`,
+    `FiscalOwed.unjudged`). That used to be refused with «restart the manager
+    and try again», which is an answer no one can act on: a till whose service
+    never comes up again has nothing but the disk to be judged by, and no
+    restart makes that copy say more. The refusal stays for the thing it
+    protects — operations waiting for the server, documents the tax service
+    has not got, an open session — and a part that cannot be read lets the
+    switch-off through, with the reason in the log of whoever read it.
+
+    `fiscal_documents` is the one count that stands without a number of unsent
+    ones beside it: document rows on disk and no count of them in the clear
+    means nothing says they were sent, so they are owed.
+
+    AND NO COUNT MAY BE ANSWERED «OWED» FOR GOOD. Every refusal here names
+    something the till is told to clear by going back online, and every one of
+    them is cleared by the very service that switching off would remove: a
+    till whose service will not start can satisfy none of them, and asking
+    again changes nothing. `forced` is the way out of that, and it is a
+    deliberate one — an explicit word on the call, never a timeout and never a
+    fallback this guard arrives at by itself. It overrides EVERY count, not
+    just the document rows: a queue that cannot be sent and a session that
+    cannot be closed are the same dead end by another name.
     """
+    if forced:
+        # FC-844 — switched off on an explicit word, with what is being given
+        # up written in the caller's log before the local copy goes.
+        return
     if queued:
         raise ActivationError(
             f"Офлайн-операцій, що ще не надійшли на сервер: {queued}. "
             "Вимкнення можливе після синхронізації.",
-        )
-    if queued is None:
-        raise ActivationError(
-            "Не вдалося перевірити чергу офлайн-операцій. Спробуйте ще раз.",
         )
     if fiscal_sessions:
         raise ActivationError(
@@ -287,11 +371,11 @@ def check_can_deactivate(
             f"Фіскальних документів, ще не переданих до ДПС: {fiscal_pending}. "
             "Вимкнення можливе після їх передачі.",
         )
-    if fiscal_pending is None:
+    if fiscal_documents:
         raise ActivationError(
-            "Не вдалося перевірити фіскальні документи офлайн-каси: "
-            "офлайн-сервіс не відповідає. Перезапустіть Девайс менеджер "
-            "і спробуйте ще раз, коли офлайн-сервіс запуститься.",
+            f"Фіскальних документів на цьому комп'ютері: {fiscal_documents}, "
+            "і немає даних про їх передачу до ДПС. Вимкнення можливе після "
+            "повернення каси в онлайн.",
         )
 
 
@@ -447,11 +531,30 @@ def save_local_settings(appid: str, items: object, product: str = DEFAULT_PRODUC
 
 #: A key container is a few kilobytes; anything beyond this is not one.
 FISCAL_KEY_MAX_BYTES = 1024 * 1024
+#: What the upload request itself may weigh: the base64 of a container at the
+#: cap (four characters carry three bytes), and room for the rest of the JSON
+#: object around it. The route refuses a bigger body while it is still
+#: arriving, so the cap holds for what is buffered and not only for what is
+#: decoded.
+FISCAL_KEY_MAX_REQUEST_BYTES = (FISCAL_KEY_MAX_BYTES // 3 + 1) * 4 + 4 + 8192
 #: What a file dropped into the fiscal-keys folder may be called.
 _KEY_FILE_NAME = re.compile(r"[A-Za-z0-9._-]{1,64}")
 
+#: THE FILE KINDS THIS FISCAL STACK READS, NAMED ONE BY ONE.
+#:
+#: Key containers: `Key-6.dat` (IIT), `.pfx`/`.p12`, a PrivatBank `.jks`,
+#: IIT's older `.zs2`, a PBES2 container in PEM (`.pem`, `.key`) or DER
+#: (`.pk8`). Certificates kept beside a container: `.cer`, `.crt`, `.der`.
+#: An allow-list and not «anything but an executable»: a person who picks
+#: the wrong file in the browser is told so here, rather than on the first
+#: receipt of a day without internet.
+FISCAL_KEY_SUFFIXES: tuple[str, ...] = (
+    ".dat", ".pfx", ".p12", ".jks", ".zs2", ".pem", ".key", ".pk8",
+    ".cer", ".crt", ".der",
+)
 
-def fiscal_keys_folder(appid: str) -> Path:
+
+def fiscal_keys_folder(appid: str, product: str = DEFAULT_PRODUCT) -> Path:
     """Where the key containers of a shop's offline registers are kept.
 
     OUTSIDE the shop's own folder, and that is the whole point: switching
@@ -461,8 +564,12 @@ def fiscal_keys_folder(appid: str) -> Path:
     registers whose settings name a file that is no longer there, and nothing
     to sign a receipt with in the first shop without internet (found by the
     second review round).
+
+    Inside the product's own folder (`offline_root`), like every other file
+    of its till: two products' tills on one computer never share a container,
+    and a shop and a studio with the same appid cannot meet.
     """
-    return offline_root() / "fiscal-keys" / appid
+    return offline_root(product) / "fiscal-keys" / appid
 
 
 def _safe_key_name(file_name: str) -> str:
@@ -486,7 +593,30 @@ def _safe_key_name(file_name: str) -> str:
     return cleaned
 
 
-def save_fiscal_key(appid: str, file_name: str, content_base64: str) -> dict:
+def _check_key_suffix(name: str, appid: str, product: str) -> None:
+    """Refuse a file whose kind this fiscal stack does not read.
+
+    Before the content is decoded and long before anything is written: a file
+    that cannot be a container or a certificate has no business in the folder
+    that holds the right to sign fiscal documents. The reason goes to the log
+    in full; the person is told which kinds are taken.
+    """
+    suffix = name[name.rfind(".") :].lower() if "." in name else ""
+    if suffix not in FISCAL_KEY_SUFFIXES:
+        log.warning(
+            "offline: fiscal key refused for %s shop %s: file kind %r is not read by the fiscal stack",
+            product, appid, suffix or name,
+        )
+        raise ActivationError(
+            "Цей тип файла не підходить для ключа. "
+            "Підходять контейнери ключа (.dat, .pfx, .p12, .jks, .zs2, .pem, .key, .pk8) "
+            "та сертифікати (.cer, .crt, .der).",
+        )
+
+
+def save_fiscal_key(
+    appid: str, file_name: str, content_base64: str, product: str = DEFAULT_PRODUCT,
+) -> dict:
     """PET-1088 — keep an uploaded key container (or its certificate) on this machine.
 
     The offline service signs with a file that lives on the shop's own
@@ -497,25 +627,39 @@ def save_fiscal_key(appid: str, file_name: str, content_base64: str) -> dict:
     The file is written like every other private file of ours — through a
     temporary file and a rename, readable by this user only — and the answer is
     the path the offline register settings then carry.
+
+    FC-844 — for the till of the product named, Petshandler when not said: a
+    studio's container goes to the FitStudioCRM folder and is checked against
+    the FitStudioCRM activation.
     """
-    active = active_appid()
+    active = active_appid(product)
     if not active:
+        log.warning("offline: fiscal key refused: %s offline mode is not on here", product)
         raise ActivationError("Офлайн-режим на цьому компʼютері не увімкнено.")
     if appid != active:
+        log.warning("offline: fiscal key refused: %s offline mode here is for another shop", product)
         raise ActivationError("Офлайн-режим на цьому компʼютері увімкнено для іншого закладу.")
     name = _safe_key_name(file_name)
+    _check_key_suffix(name, appid, product)
     raw = str(content_base64 or "")
     # Four base64 characters carry three bytes: a body too big to be a
     # container is refused before it is decoded into memory.
     if len(raw) > (FISCAL_KEY_MAX_BYTES // 3 + 1) * 4 + 4:
+        log.warning("offline: fiscal key refused for %s shop %s: body over the cap", product, appid)
         raise ActivationError("Файл завеликий для ключа.")
     try:
         data = base64.b64decode(raw, validate=True)
     except (ValueError, TypeError):
+        log.warning("offline: fiscal key refused for %s shop %s: the body is not base64", product, appid)
         raise ActivationError("Файл не вдалося прочитати.")
     if not data:
+        log.warning("offline: fiscal key refused for %s shop %s: the file is empty", product, appid)
         raise ActivationError("Файл порожній.")
     if len(data) > FISCAL_KEY_MAX_BYTES:
+        log.warning(
+            "offline: fiscal key refused for %s shop %s: %d bytes is over the cap of %d",
+            product, appid, len(data), FISCAL_KEY_MAX_BYTES,
+        )
         raise ActivationError("Файл завеликий для ключа.")
     """THE CONTENT NAMES THE FILE, NOT THE NAME THE BROWSER SENT.
 
@@ -528,11 +672,15 @@ def save_fiscal_key(appid: str, file_name: str, content_base64: str) -> dict:
     """
     digest = hashlib.sha256(data).hexdigest()[:16]
     name = f"{digest}-{name}"
-    path = fiscal_keys_folder(appid) / name
+    path = fiscal_keys_folder(appid, product) / name
     offline_secrets._write_private(path, data)
-    # The name is in the log and the content never is: a key container is the
-    # right to sign fiscal documents.
-    log.info("offline: fiscal key file %s kept for shop %s (%d bytes)", name, appid, len(data))
+    # The name and the path are in the log and the content never is: a key
+    # container is the right to sign fiscal documents. Neither is the password:
+    # it never travels through this route at all.
+    log.info(
+        "offline: fiscal key file %s kept for %s shop %s (%d bytes) at %s",
+        name, product, appid, len(data), path,
+    )
     return {"path": str(path), "name": name, "bytes": len(data)}
 
 

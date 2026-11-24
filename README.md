@@ -207,6 +207,8 @@ server:
 | `/offline/sync` | POST | Синхронізувати зараз (`?product=`). |
 | `/offline/deactivate` | POST | Вимкнути офлайн-режим і видалити локальні дані закладу (`?product=`); 409, доки черга не порожня. |
 | `/offline/local-settings` | GET / POST | Налаштування пристроїв онлайн-застосунку для офлайн-збірки (`?product=` або `product` у тілі). |
+| `/offline/fiscal…` | GET / POST / PUT / PATCH / DELETE | Маршрути РРО офлайн-сервісу (`?product=`): перелік і стан кас, пошук за ключем, додавання, збереження та видалення каси, ключ касира, право на офлайн, перевірка пристрою, скасування тестової сесії, повернення в онлайн. Передаються лише названі маршрути; інший шлях або метод — 400. Без увімкненого офлайн-режиму — 409, без відповіді сервісу — 503. |
+| `/offline/fiscal-key` | POST | Завантажити файл контейнера ключа каси (`?product=` або `product` у тілі): `appid`, `fileName`, `contentBase64`. До 1 МБ; типи файлів — `.dat`, `.pfx`, `.p12`, `.jks`, `.zs2`, `.pem`, `.key`, `.pk8`, `.cer`, `.crt`, `.der`. У відповіді — шлях, під яким файл збережено. |
 
 Повні схеми payload-ів — `docs/INTEGRATION-SPEC.md`.
 
@@ -437,6 +439,8 @@ Paper width, drawer pin, code page — configured through the web app UI and sto
 | `/offline/sync` | POST | Synchronise now (`?product=`). |
 | `/offline/deactivate` | POST | Switch offline mode off and remove the shop's local data (`?product=`); 409 while the queue is not empty. |
 | `/offline/local-settings` | GET / POST | The online app's device settings for the offline build (`?product=` or `product` in the body). |
+| `/offline/fiscal…` | GET / POST / PUT / PATCH / DELETE | The register routes of the offline service (`?product=`): the register list and state, lookup by key, add, save and delete a register, the cashier's key, the offline grant, the device check, discarding a test session, returning online. Only the named routes are passed on; any other path or method → 400. Offline mode not on → 409; the service not answering → 503. |
+| `/offline/fiscal-key` | POST | Upload a register's key container (`?product=` or `product` in the body): `appid`, `fileName`, `contentBase64`. Up to 1 MB; file kinds `.dat`, `.pfx`, `.p12`, `.jks`, `.zs2`, `.pem`, `.key`, `.pk8`, `.cer`, `.crt`, `.der`. The answer carries the path the file was kept under. |
 
 Full payload schemas in `docs/INTEGRATION-SPEC.md`.
 
