@@ -673,6 +673,8 @@ def test_sync_now_runs_the_sync_and_answers_with_the_state_after_it(client_for):
         "needsPairing": False,
         "dataAsOf": "2026-10-10T00:05:00.000Z",
         "queued": 0,
+        # FC-845 — the operations alone, which is the number the card shows.
+        "queuedOperations": 0,
     }
 
 

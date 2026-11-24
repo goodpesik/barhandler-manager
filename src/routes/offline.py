@@ -226,6 +226,9 @@ async def sync_now(request: Request) -> dict:
         "needsPairing": bool(ran.get("needsPairing") or st.extra.get("needsPairing")),
         "dataAsOf": st.extra.get("dataAsOf", ran.get("dataAsOf")),
         "queued": st.extra.get("queued", ran.get("queued")),
+        # FC-845 — the operations alone, which is what the answer is shown as.
+        # The sync's own answer counts operations too, so it is the fallback.
+        "queuedOperations": st.extra.get("queuedOperations", ran.get("queued")),
     }
 
 

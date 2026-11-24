@@ -300,6 +300,26 @@ def _call_fiscal(port: int, method: str, path: str, body: Optional[bytes], timeo
         return e.code, e.read()
 
 
+def _queued_operations(health: dict) -> Optional[int]:
+    """How many operations the till still has to send — the number a person
+    is shown.
+
+    FC-845 — the till answers with two counts. `queued` is the GATE the
+    update and the switch-off ask, and it carries a fiscal state the till
+    could not read with it, so showing it says «one more operation waits»
+    about a sealed value no operation stands behind. `queuedOperations`
+    counts operations and nothing else.
+
+    A till older than that answer does not send the second count, and tills
+    update apart from the manager: then the gate is all there is, and the
+    display falls back to it rather than showing nothing.
+    """
+    operations = health.get("queuedOperations")
+    if isinstance(operations, int) and not isinstance(operations, bool):
+        return operations
+    return health.get("queued")
+
+
 @dataclass
 class OfflineServiceState:
     """What the dashboard and the menu (PET-972) show."""
@@ -817,7 +837,12 @@ class OfflineService:
     def _remember(self, health: dict) -> None:
         """What the dashboard shows and what the update guard asks."""
         self.state.extra = {
+            # The gate: what the update guard and the switch-off ask. It is
+            # not a count of operations — see `_queued_operations`.
             "queued": health.get("queued"),
+            # The same till's operations alone, for everything a person is
+            # shown. Never above the gate, and never a gate itself.
+            "queuedOperations": _queued_operations(health),
             "dataAsOf": health.get("dataAsOf"),
             "needsPairing": bool(health.get("needsPairing")),
             # PET-1122 — the till's own shift is open: Petshandler reminds the shop to close it.
