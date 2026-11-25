@@ -120,12 +120,15 @@ New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
 Set-Location $InstallDir
 
 Write-Step "fetching latest release"
-$TarballUrl = "https://github.com/$Repo/archive/refs/heads/production.zip"
+# The release asset, not the branch archive: CI builds it with the uplink
+# secret (src/_uplink_secret.py) inside. Its files sit at the archive root,
+# so it is unpacked into its own folder.
+$TarballUrl = "https://github.com/$Repo/releases/latest/download/barhandler-manager.zip"
 $Tmp        = New-Item -ItemType Directory -Path (Join-Path $env:TEMP "bhm-$(Get-Random)") -Force
 $ZipPath    = Join-Path $Tmp 'src.zip'
+$SrcRoot    = Join-Path $Tmp 'src'
 Invoke-WebRequest -Uri $TarballUrl -OutFile $ZipPath -UseBasicParsing
-Expand-Archive -Path $ZipPath -DestinationPath $Tmp -Force
-$SrcRoot = (Get-ChildItem -Path $Tmp -Directory | Select-Object -First 1).FullName
+Expand-Archive -Path $ZipPath -DestinationPath $SrcRoot -Force
 
 # Preserve user config across re-installs.
 foreach ($keep in 'config.yaml', 'printers.json', 'terminals.json') {

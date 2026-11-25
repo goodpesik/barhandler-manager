@@ -370,7 +370,13 @@ _HTML_TEMPLATE = r"""<!doctype html>
   <div id="offline-modal" class="modal-backdrop" style="display:none;">
     <div class="modal">
       <h2 data-i18n="offline_title">Офлайн режим</h2>
-      <p class="modal-desc" data-i18n="offline_desc">Каса Petshandler працює без інтернету: продажі, зміна й записи зберігаються на цьому компʼютері й надсилаються на сервер автоматично після відновлення звʼязку.</p>
+      <!-- FC-798 — which product's till: shown only when this computer has
+           more than one (Petshandler and FitStudioCRM). -->
+      <label class="modal-row" id="offline-product-row" style="display:none;">
+        <span data-i18n="offline_product_label">Продукт</span>
+        <select id="offline-product" onchange="switchOfflineProduct(this.value)"></select>
+      </label>
+      <p id="offline-desc" class="modal-desc" data-i18n="offline_desc">Каса Petshandler працює без інтернету: продажі, зміна й записи зберігаються на цьому компʼютері й надсилаються на сервер автоматично після відновлення звʼязку.</p>
       <label class="modal-row">
         <span data-i18n="offline_status_label">Статус</span>
         <span id="offline-status" class="muted">—</span>
@@ -387,12 +393,17 @@ _HTML_TEMPLATE = r"""<!doctype html>
         <span data-i18n="offline_queue_label">Не синхронізовано операцій</span>
         <span id="offline-queue" class="muted">—</span>
       </label>
-      <p id="offline-hint" class="modal-desc" data-i18n="offline_hint" style="margin-top:8px;">Увімкнення офлайн-режиму: Petshandler → Налаштування → Інтеграції → Пристрої → «Увімкнути офлайн-режим».</p>
+      <label class="modal-row" id="offline-number-row" style="display:none;">
+        <span data-i18n="offline_number_label">Номер каси</span>
+        <span id="offline-number" class="muted">—</span>
+      </label>
+      <p id="offline-hint" class="modal-desc" data-i18n="offline_hint" style="margin-top:8px;">Увімкнення офлайн-режиму: Petshandler → Налаштування → Інтеграції → Офлайн-режим → «Увімкнути офлайн-режим».</p>
       <div class="modal-actions">
         <button class="btn btn-default" data-i18n="btn_close" onclick="closeOfflineModal()">Закрити</button>
         <!-- PET-1055 — the till itself is one click away: without this the
              shop had to know http://127.0.0.1:9898 by heart. -->
         <a id="offline-open" class="btn btn-default" target="_blank" rel="noopener" data-i18n="offline_open" href="#" style="display:none;">Відкрити офлайн-касу</a>
+        <button id="offline-sync" class="btn btn-default" data-i18n="offline_sync" onclick="syncOffline()" style="display:none;">Синхронізувати</button>
         <button id="offline-disable" class="btn btn-default" data-i18n="offline_disable" onclick="disableOffline()" style="display:none;">Вимкнути</button>
       </div>
     </div>
@@ -524,7 +535,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       offline_shop_label: "Заклад",
       offline_data_label: "Дані станом на",
       offline_queue_label: "Не синхронізовано операцій",
-      offline_hint: "Увімкнення офлайн-режиму: Petshandler → Налаштування → Інтеграції → Пристрої → «Увімкнути офлайн-режим».",
+      offline_hint: "Увімкнення офлайн-режиму: Petshandler → Налаштування → Інтеграції → Офлайн-режим → «Увімкнути офлайн-режим».",
       offline_open: "Відкрити офлайн-касу",
       offline_disable: "Вимкнути",
       offline_off: "вимкнено",
@@ -533,6 +544,15 @@ _HTML_TEMPLATE = r"""<!doctype html>
       offline_needs_pairing: "потрібне повторне увімкнення в Petshandler",
       offline_disable_confirm: "Вимкнути офлайн-режим на цьому компʼютері? Локальні дані закладу буде видалено.",
       offline_disabled: "Офлайн-режим вимкнено",
+      offline_product_label: "Продукт",
+      offline_number_label: "Номер каси",
+      offline_sync: "Синхронізувати",
+      offline_synced: "Синхронізацію виконано. Не синхронізовано операцій: {n}",
+      offline_sync_failed: "Синхронізація не вдалася. Операції залишаються в черзі й будуть надіслані автоматично після відновлення звʼязку.",
+      offline_desc_fitstudiocrm: "Каса FitStudioCRM працює без інтернету: продажі, зміна, реєстрація на заняття й нові клієнти зберігаються на цьому компʼютері й надсилаються на сервер автоматично після відновлення звʼязку.",
+      offline_hint_fitstudiocrm: "Увімкнення офлайн-режиму: FitStudioCRM → Налаштування → вкладка «Офлайн-режим» → «Увімкнути офлайн-режим».",
+      offline_needs_pairing_fitstudiocrm: "потрібне повторне увімкнення у FitStudioCRM",
+      offline_needs_update: "черга зупинена: потрібне оновлення Девайс менеджера",
       uplink_badge_connected: "● підключено",
       mt_title: "Додати термінал вручну",
       mt_desc: "Резерв на випадок коли скан не побачив (CGNAT мобільного оператора, hotspot планшета з нестандартним subnet, окрема VLAN). IP терміналу дивись у його admin меню.",
@@ -673,7 +693,7 @@ _HTML_TEMPLATE = r"""<!doctype html>
       offline_shop_label: "Shop",
       offline_data_label: "Data as of",
       offline_queue_label: "Operations not synchronised",
-      offline_hint: "To switch offline mode on: Petshandler → Settings → Integrations → Devices → «Enable offline mode».",
+      offline_hint: "To switch offline mode on: Petshandler → Settings → Integrations → Offline mode → «Enable offline mode».",
       offline_open: "Open the offline till",
       offline_disable: "Switch off",
       offline_off: "off",
@@ -682,6 +702,15 @@ _HTML_TEMPLATE = r"""<!doctype html>
       offline_needs_pairing: "needs to be switched on again in Petshandler",
       offline_disable_confirm: "Switch offline mode off on this computer? The shop's local data will be removed.",
       offline_disabled: "Offline mode switched off",
+      offline_product_label: "Product",
+      offline_number_label: "Till number",
+      offline_sync: "Synchronise",
+      offline_synced: "Synchronisation done. Operations not synchronised: {n}",
+      offline_sync_failed: "Synchronisation failed. The operations stay in the queue and will be sent automatically once the connection is back.",
+      offline_desc_fitstudiocrm: "The FitStudioCRM till works without the internet: sales, the shift, class bookings and new clients are kept on this computer and sent to the server automatically once the connection is back.",
+      offline_hint_fitstudiocrm: "To switch offline mode on: FitStudioCRM → Settings → the «Offline mode» tab → «Enable offline mode».",
+      offline_needs_pairing_fitstudiocrm: "needs to be switched on again in FitStudioCRM",
+      offline_needs_update: "the queue is stopped: the Device Handler needs an update",
       uplink_badge_connected: "● connected",
       mt_title: "Add terminal manually",
       mt_desc: "A fallback for when the scan didn't find it (mobile operator CGNAT, a tablet hotspot on a non-standard subnet, a separate VLAN). Find the terminal's IP in its admin menu.",
@@ -1484,39 +1513,94 @@ _HTML_TEMPLATE = r"""<!doctype html>
 
   // ---- offline mode (PET-972) ---------------------------------------------
 
+  /* FC-798 — the products whose till this manager can run, in the order the
+     product list shows them. Petshandler first: with it alone the window
+     looks exactly as it always did. */
+  const OFFLINE_PRODUCTS = [
+    { id: "petshandler", title: "Petshandler" },
+    { id: "fitstudiocrm", title: "FitStudioCRM" },
+  ];
+  /* The products shown: the app offers the mode, or it is already on here. */
+  let offlineShown = [];
+  let offlineProduct = "petshandler";
+
+  /* The product-specific text when there is one, the shared text otherwise. */
+  function offlineKey(base, product) {
+    const own = base + "_" + product;
+    const dict = I18N[LANG] || I18N.uk;
+    return product !== "petshandler" && dict[own] !== undefined ? own : base;
+  }
+
   async function refreshOfflineButton() {
-    try {
-      const st = await api("GET", "/offline/status", true);
-      /* Only when the client app offers offline mode (it is off on
-         Petshandler's production for now), or when it is already on here and
-         has to stay reachable to be looked at or switched off. */
-      $("btn-offline").style.display =
-        st && st.available && (st.offered || st.activated) ? "" : "none";
-    } catch (_) {}
+    const shown = [];
+    for (const p of OFFLINE_PRODUCTS) {
+      try {
+        const st = await api("GET", "/offline/status?product=" + p.id, true);
+        /* Only when the client app offers offline mode (it is off on
+           Petshandler's production for now), or when it is already on here and
+           has to stay reachable to be looked at or switched off. */
+        if (st && st.available && (st.offered || st.activated)) shown.push(p.id);
+      } catch (_) {}
+    }
+    offlineShown = shown;
+    $("btn-offline").style.display = shown.length ? "" : "none";
+  }
+
+  function switchOfflineProduct(product) {
+    offlineProduct = product;
+    openOfflineModal();
   }
 
   async function openOfflineModal() {
+    if (offlineShown.length && !offlineShown.includes(offlineProduct)) offlineProduct = offlineShown[0];
     $("offline-modal").style.display = "flex";
+    const pick = $("offline-product");
+    pick.innerHTML = "";
+    for (const p of OFFLINE_PRODUCTS) {
+      if (!offlineShown.includes(p.id)) continue;
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      opt.textContent = p.title;
+      opt.selected = p.id === offlineProduct;
+      pick.appendChild(opt);
+    }
+    $("offline-product-row").style.display = offlineShown.length > 1 ? "" : "none";
+    $("offline-desc").setAttribute("data-i18n", offlineKey("offline_desc", offlineProduct));
+    $("offline-desc").textContent = t(offlineKey("offline_desc", offlineProduct));
+    $("offline-hint").setAttribute("data-i18n", offlineKey("offline_hint", offlineProduct));
+    $("offline-hint").textContent = t(offlineKey("offline_hint", offlineProduct));
     /* PET-1055 — hidden before anything is asked. A link left over from the
        time the window was open last would point at a till we have no word
        about now, and the failure below never touches it. */
     $("offline-open").style.display = "none";
+    $("offline-sync").style.display = "none";
     try {
-      const st = await api("GET", "/offline/status", true);
+      const st = await api("GET", "/offline/status?product=" + offlineProduct, true);
       const svc = st.service || {};
       const on = !!st.activated;
       let status;
       if (!on) status = "<span class='muted'>" + escHtml(t("offline_off")) + "</span>";
-      else if (svc.needsPairing) status = "<span class='err-text'>" + escHtml(t("offline_needs_pairing")) + "</span>";
+      else if (svc.needsPairing) status = "<span class='err-text'>" + escHtml(t(offlineKey("offline_needs_pairing", offlineProduct))) + "</span>";
+      else if (svc.needsUpdate) status = "<span class='err-text'>" + escHtml(t("offline_needs_update")) + "</span>";
       else if (svc.running) status = "<span class='ok-text'>" + escHtml(t("offline_on")) + "</span>";
       else status = "<span class='err-text'>" + escHtml(t("offline_on_stopped", { err: svc.lastError || "—" })) + "</span>";
       $("offline-status").innerHTML = status;
       $("offline-shop").textContent = on ? (st.shopName || st.appid || "—") : "—";
       $("offline-data").textContent = svc.dataAsOf ? new Date(svc.dataAsOf).toLocaleString(localeTag()) : "—";
-      $("offline-queue").textContent = on && svc.queued != null ? String(svc.queued) : "—";
+      /* FC-845 — the row counts OPERATIONS. `queued` is the gate the update
+         and the switch-off ask and carries a fiscal state the till could not
+         read with it, so it would show one operation more than there are; a
+         till too old to send the operations count leaves the gate as the only
+         number there is. */
+      const queuedOps = svc.queuedOperations != null ? svc.queuedOperations : svc.queued;
+      $("offline-queue").textContent = on && queuedOps != null ? String(queuedOps) : "—";
       $("offline-shop-row").style.display = on ? "" : "none";
       $("offline-data-row").style.display = on ? "" : "none";
       $("offline-queue-row").style.display = on ? "" : "none";
+      /* FC-798 — a till numbered among the shop's computers says its number. */
+      const numbered = on && st.deviceNumber != null;
+      $("offline-number").textContent = numbered ? String(st.deviceNumber) : "—";
+      $("offline-number-row").style.display = numbered ? "" : "none";
       $("offline-hint").style.display = on ? "none" : "";
       $("offline-disable").style.display = on ? "" : "none";
       $("offline-disable").disabled = false;
@@ -1526,6 +1610,10 @@ _HTML_TEMPLATE = r"""<!doctype html>
       const open = $("offline-open");
       open.href = "http://127.0.0.1:" + (svc.port || 9898) + "/";
       open.style.display = on && svc.running ? "" : "none";
+      /* FC-798 — FitStudioCRM's till is synchronised from here too;
+         Petshandler's has its button in the app. */
+      $("offline-sync").style.display = on && svc.running && offlineProduct !== "petshandler" ? "" : "none";
+      $("offline-sync").disabled = false;
     } catch (e) {
       $("offline-status").innerHTML = "<span class='err-text'>" + escHtml(t("error_prefix", { err: e.message })) + "</span>";
     }
@@ -1535,11 +1623,28 @@ _HTML_TEMPLATE = r"""<!doctype html>
     $("offline-modal").style.display = "none";
   }
 
+  async function syncOffline() {
+    $("offline-sync").disabled = true;
+    try {
+      const r = await api("POST", "/offline/sync?product=" + offlineProduct, true);
+      if (r.failed || r.needsPairing) showToast(t("offline_sync_failed"), "err", 8000);
+      else {
+        /* The same count of operations as the row above, for the same reason. */
+        const left = r.queuedOperations != null ? r.queuedOperations : r.queued;
+        showToast(t("offline_synced", { n: left != null ? left : "—" }), "ok", 5000);
+      }
+      await openOfflineModal();
+    } catch (e) {
+      showToast(t("error_prefix", { err: e.message }), "err", 8000);
+      $("offline-sync").disabled = false;
+    }
+  }
+
   async function disableOffline() {
     if (!confirm(t("offline_disable_confirm"))) return;
     $("offline-disable").disabled = true;
     try {
-      await api("POST", "/offline/deactivate", true);
+      await api("POST", "/offline/deactivate?product=" + offlineProduct, true);
       showToast(t("offline_disabled"), "ok", 5000);
       await openOfflineModal();
     } catch (e) {

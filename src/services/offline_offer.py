@@ -25,6 +25,15 @@ from typing import Mapping, Optional
 logger = logging.getLogger(__name__)
 
 HEADER = "x-offline-offered"
+#: FC-798 — which product's app speaks (`petshandler`, `fitstudiocrm`). An app
+#: that does not say is Petshandler's: it is the one that sent the word first.
+PRODUCT_HEADER = "x-offline-product"
+DEFAULT_PRODUCT = "petshandler"
+
+
+def offer_product(headers: Mapping[str, str]) -> str:
+    """The product the request's offline word is about."""
+    return (headers.get(PRODUCT_HEADER) or "").strip().lower() or DEFAULT_PRODUCT
 
 
 def parse_header(raw: Optional[str]) -> Optional[bool]:
@@ -42,6 +51,10 @@ class OfflineOffer:
         self._path = path
         self._lock = threading.Lock()
         self._offered: Optional[bool] = None
+
+    @property
+    def path(self) -> Path:
+        return self._path
 
     def load(self) -> None:
         try:

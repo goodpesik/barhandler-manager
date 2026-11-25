@@ -44,6 +44,12 @@ jobs:
           python-version: "3.12"
       - name: Install deps + PyInstaller + libusb
         run: pip install -r requirements.txt pyinstaller libusb-package
+      # PET-1596 — the shared secret the logs server checks in the uplink
+      # handshake. Unset = the build connects without it.
+      - name: Bake uplink secret
+        env:
+          UPLINK_SECRET: ${{ secrets.UPLINK_SECRET }}
+        run: python scripts/write_uplink_secret.py
       - name: Build exe
         run: pyinstaller --noconfirm bhm.spec
       # PET-971 — the Petshandler offline runtime, only when its secrets are set.
@@ -55,6 +61,19 @@ jobs:
           out: offline-runtime/petshandler
           token: ${{ env.OFFLINE_REPO_TOKEN }}
           app-env: ${{ secrets.PETSHANDLER_APP_ENV }}
+      # FC-798 — the FitStudioCRM offline runtime beside it, once its repos
+      # exist and the repository variable FIT_OFFLINE_ENABLED is 'true'.
+      - name: FitStudioCRM offline runtime
+        if: ${{ env.OFFLINE_REPO_TOKEN != '' && vars.FIT_OFFLINE_ENABLED == 'true' }}
+        uses: ./.github/actions/offline-runtime
+        with:
+          platform: win-x64
+          out: offline-runtime/fitstudiocrm
+          token: ${{ env.OFFLINE_REPO_TOKEN }}
+          app-env: ${{ secrets.FITSTUDIOCRM_APP_ENV }}
+          app-env-required: "true"
+          service-repo: goodpesik/fitstudiocrm-offline
+          app-repo: goodpesik/fitstudiocrm-app
       - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
@@ -116,6 +135,12 @@ jobs:
           python-version: "3.12"
       - name: Install deps + PyInstaller + libusb
         run: pip install -r requirements.txt pyinstaller libusb-package
+      # PET-1596 — the shared secret the logs server checks in the uplink
+      # handshake. Unset = the build connects without it.
+      - name: Bake uplink secret
+        env:
+          UPLINK_SECRET: ${{ secrets.UPLINK_SECRET }}
+        run: python scripts/write_uplink_secret.py
       - name: Build .app
         run: pyinstaller --noconfirm bhm.spec
       # PET-971 — the Petshandler offline runtime inside the .app, signed with it.
@@ -127,6 +152,18 @@ jobs:
           out: "dist/Device Handler.app/Contents/Resources/offline-runtime/petshandler"
           token: ${{ env.OFFLINE_REPO_TOKEN }}
           app-env: ${{ secrets.PETSHANDLER_APP_ENV }}
+      # FC-798 — the FitStudioCRM offline runtime beside it, signed with the app.
+      - name: FitStudioCRM offline runtime
+        if: ${{ env.OFFLINE_REPO_TOKEN != '' && vars.FIT_OFFLINE_ENABLED == 'true' }}
+        uses: ./.github/actions/offline-runtime
+        with:
+          platform: ${{ matrix.arch == 'intel' && 'darwin-x64' || 'darwin-arm64' }}
+          out: "dist/Device Handler.app/Contents/Resources/offline-runtime/fitstudiocrm"
+          token: ${{ env.OFFLINE_REPO_TOKEN }}
+          app-env: ${{ secrets.FITSTUDIOCRM_APP_ENV }}
+          app-env-required: "true"
+          service-repo: goodpesik/fitstudiocrm-offline
+          app-repo: goodpesik/fitstudiocrm-app
       - name: Sign and package
         env:
           MAC_CERT_P12_BASE64: ${{ secrets.MAC_CERT_P12_BASE64 }}

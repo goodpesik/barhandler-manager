@@ -28,6 +28,7 @@ terminals.json
 work-journal.jsonl
 app-settings.json
 offline-offer.json
+offline-offer-*.json
 
 # CLI runtime — PID of the detached server (written by `python cli.py start`)
 bhm.pid
@@ -43,4 +44,9 @@ build/
 
 # PET-971 — the offline runtime is packed at build time; a dev copy lives here.
 /offline/
+/offline-fitstudiocrm/
 /offline-runtime/
+
+# Uplink secret generated at build time from the UPLINK_SECRET GitHub secret
+# (scripts/write_uplink_secret.py). Never commit it.
+src/_uplink_secret.py

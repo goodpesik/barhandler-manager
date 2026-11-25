@@ -32,7 +32,7 @@ import logging
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Iterator, NamedTuple, Optional
 
 from fastapi import Request
 
@@ -254,6 +254,58 @@ def printers_with_pending_jobs(request: Request) -> list[str]:
     return busy
 
 
+#: How the update guard names a product's till in its message (FC-798).
+_PRODUCT_TITLES = {"fitstudiocrm": "FitStudioCRM"}
+
+
+class _OfflineQueue(NamedTuple):
+    """What one product's till still has to send, in the two numbers it is
+    asked about.
+
+    FC-845 — `gate` is what an update is refused by: the till carries a
+    fiscal state it could not read inside it, because deactivating wipes the
+    copy and may not be allowed over a value nobody could open.
+    `operations` counts operations and nothing else, so it is the number a
+    person is shown; it is never above the gate, and it is never a gate.
+    """
+
+    gate: Optional[int]
+    operations: Optional[int]
+
+
+def _offline_queued(request: Request, services: Optional[dict], product: str) -> _OfflineQueue:
+    """What one product's till still has to send: from its running service,
+    or from its local copy when the service is down or silent."""
+    from src.services.offline_service import DEFAULT_PRODUCT
+
+    if services is not None:
+        offline = services.get(product)
+    else:
+        offline = getattr(request.app.state, "offline_service", None) if product == DEFAULT_PRODUCT else None
+    extra = (offline.state.extra or {}) if offline is not None else {}
+    queued = extra.get("queued")
+    operations = extra.get("queuedOperations")
+    if not isinstance(queued, int):
+        # The service is down (no secrets) or silent: its queue is on disk,
+        # read the same way switching off reads it. Unreadable stays «free»:
+        # an update must stay possible exactly when something is broken.
+        from src.services import offline_state
+
+        appid = offline_state.active_appid(product)
+        # Called on the event loop: a short wait, never the manager frozen
+        # behind a locked file (the service writes in WAL mode, readers do not wait).
+        queued = offline_state.queued_on_disk(appid, timeout=0.2, quiet=True, product=product) if appid else None
+        # The local copy is read for its operations; it carries no fiscal
+        # state, so the one number answers for both.
+        operations = queued
+    elif not isinstance(operations, int):
+        # A till older than the second count sends the gate alone, and tills
+        # update apart from the manager: the gate is then the best the
+        # display has.
+        operations = queued
+    return _OfflineQueue(queued, operations)
+
+
 def busy_refusal(request: Request) -> Optional[dict]:
     """Чому оновлюватись просто зараз не можна — або None.
 
@@ -280,20 +332,21 @@ def busy_refusal(request: Request) -> Optional[dict]:
         reasons.append("друк у черзі: " + ", ".join(sorted(pending)))
     # PET-972 — sales made offline still waiting for the server: an update
     # replaces the offline service and could lose what it has not sent.
-    offline = getattr(request.app.state, "offline_service", None)
-    queued = (offline.state.extra or {}).get("queued") if offline is not None else None
-    if not isinstance(queued, int):
-        # The service is down (no secrets) or silent: its queue is on disk,
-        # read the same way switching off reads it. Unreadable stays «free»:
-        # an update must stay possible exactly when something is broken.
-        from src.services import offline_state
+    # FC-798 — every product's till counts; Petshandler's reads as before.
+    from src.services.offline_service import DEFAULT_PRODUCT, PRODUCTS
 
-        appid = offline_state.active_appid()
-        # Called on the event loop: a short wait, never the manager frozen
-        # behind a locked file (the service writes in WAL mode, readers do not wait).
-        queued = offline_state.queued_on_disk(appid, timeout=0.2, quiet=True) if appid else None
-    if isinstance(queued, int) and queued > 0:
-        reasons.append(f"офлайн-операції ще не надійшли на сервер: {queued}")
+    services = getattr(request.app.state, "offline_services", None)
+    for product in PRODUCTS:
+        queue = _offline_queued(request, services, product)
+        if isinstance(queue.gate, int) and queue.gate > 0:
+            whose = "" if product == DEFAULT_PRODUCT else f" {_PRODUCT_TITLES.get(product, product)}"
+            if isinstance(queue.operations, int) and queue.operations > 0:
+                reasons.append(f"офлайн-операції{whose} ще не надійшли на сервер: {queue.operations}")
+            else:
+                # The guard holds on a fiscal state the till could not read,
+                # and no operation stands behind it: a count here would say
+                # «0 operations wait», so the reason names the state instead.
+                reasons.append(f"стан офлайн-каси{whose} не прочитано")
     if not reasons:
         return None
     return {

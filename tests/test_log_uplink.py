@@ -601,3 +601,55 @@ async def test_an_event_that_cannot_be_handed_over_says_so(caplog):
 
     assert sent == []
     assert any("discovery_run" in r.message for r in caplog.records), caplog.text
+
+
+# The logs server checks a shared secret in the handshake. Release builds
+# carry it in a generated module; a build without it still connects.
+
+
+@pytest.fixture
+def baked_secret(monkeypatch):
+    import sys
+    import types
+    from src.services import uplink_secret as mod
+
+    def bake(value):
+        if value is None:
+            monkeypatch.setitem(sys.modules, "src._uplink_secret", None)
+        else:
+            fake = types.ModuleType("src._uplink_secret")
+            fake.UPLINK_SECRET = value
+            monkeypatch.setitem(sys.modules, "src._uplink_secret", fake)
+        mod.uplink_secret.cache_clear()
+
+    yield bake
+    mod.uplink_secret.cache_clear()
+
+
+def test_uplink_secret_comes_from_the_generated_module(baked_secret):
+    from src.services.uplink_secret import uplink_secret
+
+    baked_secret("  s3cret \n")
+    assert uplink_secret() == "s3cret"
+    baked_secret(None)
+    assert uplink_secret() == ""
+
+
+@pytest.mark.asyncio
+async def test_handshake_carries_the_baked_secret(baked_secret):
+    baked_secret("s3cret")
+    sio = _NamespaceDropClient(namespaces={"/managers": "sid"}, fail=False)
+    c = _client_with(sio)
+    await c._on_connect()
+    assert sio.sent[0][0] == "handshake"
+    assert sio.sent[0][1]["uplink_secret"] == "s3cret"
+
+
+@pytest.mark.asyncio
+async def test_handshake_without_a_baked_secret_still_goes_out(baked_secret):
+    baked_secret(None)
+    sio = _NamespaceDropClient(namespaces={"/managers": "sid"}, fail=False)
+    c = _client_with(sio)
+    await c._on_connect()
+    assert sio.sent[0][0] == "handshake"
+    assert "uplink_secret" not in sio.sent[0][1]
