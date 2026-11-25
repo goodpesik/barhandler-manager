@@ -79,6 +79,12 @@ jobs:
             git push origin HEAD:production
           fi
 
+      # PET-1596 — the shared secret the logs server checks in the uplink
+      # handshake. Unset = the build connects without it.
+      - name: Bake uplink secret
+        env:
+          UPLINK_SECRET: ${{ secrets.UPLINK_SECRET }}
+        run: python3 scripts/write_uplink_secret.py
       - name: Build source archives
         run: |
           mkdir -p dist
@@ -209,6 +215,12 @@ jobs:
           python-version: "3.12"
       - name: Install deps + PyInstaller + libusb
         run: pip install -r requirements.txt pyinstaller libusb-package
+      # PET-1596 — the shared secret the logs server checks in the uplink
+      # handshake. Unset = the build connects without it.
+      - name: Bake uplink secret
+        env:
+          UPLINK_SECRET: ${{ secrets.UPLINK_SECRET }}
+        run: python scripts/write_uplink_secret.py
       - name: Build exe
         run: pyinstaller --noconfirm bhm.spec
       # PET-971 — the Petshandler offline runtime, only when its secrets are set.
@@ -334,6 +346,12 @@ jobs:
           fi
       - name: Install deps + PyInstaller + libusb
         run: pip install -r requirements.txt pyinstaller libusb-package
+      # PET-1596 — the shared secret the logs server checks in the uplink
+      # handshake. Unset = the build connects without it.
+      - name: Bake uplink secret
+        env:
+          UPLINK_SECRET: ${{ secrets.UPLINK_SECRET }}
+        run: python scripts/write_uplink_secret.py
       - name: Build .app
         run: pyinstaller --noconfirm bhm.spec
       # PET-971 — the Petshandler offline runtime inside the .app, signed with it.

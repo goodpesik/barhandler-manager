@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional, Protocol
 
+from src.services.uplink_secret import uplink_secret
+
 
 MAX_LINE_BYTES = 4096
 BUFFER_LIMIT = 2000
@@ -177,6 +179,10 @@ class LogUplinkClient:
         # the network — the one thing the remote diagnostics are for — runs in
         # exactly such a thread (`asyncio.to_thread`, a blocking TCP sweep).
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+        # Resolve the build-time secret now, so its «missing» warning is
+        # written before the socket exists and not between connect and the
+        # handshake.
+        uplink_secret()
         self._sio.on("connect", self._on_connect, namespace="/managers")
         self._sio.on("disconnect", self._on_disconnect, namespace="/managers")
         self._sio.on("diagnostic", self._on_diagnostic, namespace="/managers")
@@ -455,10 +461,11 @@ class LogUplinkClient:
             self._log.debug(f"uplink emit {event} skipped: {e!r}")
 
     async def _on_connect(self) -> None:
-        self._log.info(f"uplink connected to {self._cfg['url']}")
+        # The handshake goes first: a server that requires the uplink secret
+        # drops every message sent before it.
         tenant_id = self._cfg.get("tenant_id", "")
         tenant_name = self._cfg.get("tenant_name", "")
-        await self._safe_emit("handshake", {
+        handshake = {
             # install_id is the stable per-install key the logs server
             # groups everything by. tenant_id (appid) + tenant_name say
             # WHO is logged in here; `tenant` is the legacy subdomain
@@ -470,7 +477,12 @@ class LogUplinkClient:
             "version": self._version,
             "platform": _platform.platform(),
             "started_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        secret = uplink_secret()
+        if secret:
+            handshake["uplink_secret"] = secret
+        await self._safe_emit("handshake", handshake)
+        self._log.info(f"uplink connected to {self._cfg['url']}")
         if self._handler is not None:
             self._handler.flush_buffer()
 

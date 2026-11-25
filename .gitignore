@@ -46,3 +46,7 @@ build/
 /offline/
 /offline-fitstudiocrm/
 /offline-runtime/
+
+# Uplink secret generated at build time from the UPLINK_SECRET GitHub secret
+# (scripts/write_uplink_secret.py). Never commit it.
+src/_uplink_secret.py
