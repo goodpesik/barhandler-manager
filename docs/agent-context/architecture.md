@@ -65,7 +65,7 @@ barhandler-manager/
 
 - Branch model: `main` (dev) → `production` (releases).
 - CI on push to `production` (`.github/workflows/publish.yml`): auto-bumps VERSION + creates GitHub release with tag `v0.3.X`.
-- Installer tarball-URL: `https://github.com/goodpesik/barhandler-manager/archive/refs/heads/production.tar.gz` (HEAD of production, NOT a tag). Means rollback = force-push, no easy revert.
+- Installer source archive: the release asset `https://github.com/goodpesik/barhandler-manager/releases/latest/download/barhandler-manager.tar.gz` (`barhandler-manager.zip` for `install.ps1`), built by `publish.yml` with `src/_uplink_secret.py` inside. Files sit at the archive root (no top-level folder). Rollback = publish an older release as latest.
 - Latest release: `https://github.com/goodpesik/barhandler-manager/releases/latest/download/install.sh` (+ `install-android.sh`).
 - Operator updates: dashboard "Оновити" button → `POST /system/update` → spawns `update.sh` → curls installer with `--force`. Manager restarts itself.
 

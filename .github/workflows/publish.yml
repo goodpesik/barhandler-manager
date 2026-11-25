@@ -79,6 +79,12 @@ jobs:
             git push origin HEAD:production
           fi
 
+      # PET-1596 — the shared secret the logs server checks in the uplink
+      # handshake. Unset = the build connects without it.
+      - name: Bake uplink secret
+        env:
+          UPLINK_SECRET: ${{ secrets.UPLINK_SECRET }}
+        run: python3 scripts/write_uplink_secret.py
       - name: Build source archives
         run: |
           mkdir -p dist
@@ -94,6 +100,11 @@ jobs:
           zip -rq "dist/barhandler-manager-${VERSION}.zip" . \
               -x 'dist/*' '.git/*' '.venv/*' '*.pyc' '__pycache__/*' \
               'printers.json' 'terminals.json'
+          # Unversioned copies: the install scripts download these from
+          # /releases/latest/download/. They carry src/_uplink_secret.py
+          # from the step above, which the branch archive does not.
+          cp "dist/barhandler-manager-${VERSION}.tar.gz" dist/barhandler-manager.tar.gz
+          cp "dist/barhandler-manager-${VERSION}.zip" dist/barhandler-manager.zip
 
       - name: Stage installers as named assets
         run: |
@@ -175,6 +186,8 @@ jobs:
           files: |
             dist/barhandler-manager-${{ steps.version.outputs.version }}.tar.gz
             dist/barhandler-manager-${{ steps.version.outputs.version }}.zip
+            dist/barhandler-manager.tar.gz
+            dist/barhandler-manager.zip
             dist/install.sh
             dist/install-android.sh
             dist/install.ps1
@@ -209,6 +222,12 @@ jobs:
           python-version: "3.12"
       - name: Install deps + PyInstaller + libusb
         run: pip install -r requirements.txt pyinstaller libusb-package
+      # PET-1596 — the shared secret the logs server checks in the uplink
+      # handshake. Unset = the build connects without it.
+      - name: Bake uplink secret
+        env:
+          UPLINK_SECRET: ${{ secrets.UPLINK_SECRET }}
+        run: python scripts/write_uplink_secret.py
       - name: Build exe
         run: pyinstaller --noconfirm bhm.spec
       # PET-971 — the Petshandler offline runtime, only when its secrets are set.
@@ -334,6 +353,12 @@ jobs:
           fi
       - name: Install deps + PyInstaller + libusb
         run: pip install -r requirements.txt pyinstaller libusb-package
+      # PET-1596 — the shared secret the logs server checks in the uplink
+      # handshake. Unset = the build connects without it.
+      - name: Bake uplink secret
+        env:
+          UPLINK_SECRET: ${{ secrets.UPLINK_SECRET }}
+        run: python scripts/write_uplink_secret.py
       - name: Build .app
         run: pyinstaller --noconfirm bhm.spec
       # PET-971 — the Petshandler offline runtime inside the .app, signed with it.

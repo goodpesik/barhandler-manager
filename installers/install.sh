@@ -244,11 +244,15 @@ mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
 say "fetching latest release"
-TARBALL_URL="https://github.com/${REPO}/archive/refs/heads/production.tar.gz"
+# The release asset, not the branch archive: CI builds it with the uplink
+# secret (src/_uplink_secret.py) inside. Its files sit at the archive root,
+# so it is unpacked into its own folder.
+TARBALL_URL="https://github.com/${REPO}/releases/latest/download/barhandler-manager.tar.gz"
 TMP="$(mktemp -d)"
 curl -fsSL "$TARBALL_URL" -o "$TMP/src.tar.gz" || die "couldn't fetch release tarball"
-tar -xzf "$TMP/src.tar.gz" -C "$TMP"
-SRC_ROOT="$(find "$TMP" -maxdepth 1 -mindepth 1 -type d | head -n1)"
+SRC_ROOT="$TMP/src"
+mkdir -p "$SRC_ROOT"
+tar -xzf "$TMP/src.tar.gz" -C "$SRC_ROOT"
 
 # Preserve user config across re-installs — but only EXCLUDE files
 # from rsync when they actually exist in $INSTALL_DIR. The previous
