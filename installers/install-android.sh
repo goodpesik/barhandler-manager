@@ -136,7 +136,10 @@ fi
 
 # --- download release ------------------------------------------------
 mkdir -p "$INSTALL_DIR"
-TARBALL_URL="https://github.com/${REPO}/archive/refs/heads/production.tar.gz"
+# The release asset, not the branch archive: CI builds it with the uplink
+# secret (src/_uplink_secret.py) inside. Its files sit at the archive root,
+# so it is unpacked into its own folder.
+TARBALL_URL="https://github.com/${REPO}/releases/latest/download/barhandler-manager.tar.gz"
 TMP="$(mktemp -d)"
 
 # Try curl, then wget as fallback. Either covers Termux's libcurl-ABI
@@ -152,8 +155,9 @@ fetch_tarball() {
     return 1
 }
 fetch_tarball || die "couldn't fetch release tarball (tried curl + wget)"
-tar -xzf "$TMP/src.tar.gz" -C "$TMP"
-SRC_ROOT="$(find "$TMP" -maxdepth 1 -mindepth 1 -type d | head -n1)"
+SRC_ROOT="$TMP/src"
+mkdir -p "$SRC_ROOT"
+tar -xzf "$TMP/src.tar.gz" -C "$SRC_ROOT"
 
 # Preserve user config — but ONLY exclude from rsync when the file
 # actually exists. On a fresh install $INSTALL_DIR has nothing, the
