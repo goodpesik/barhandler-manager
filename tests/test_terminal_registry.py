@@ -668,3 +668,21 @@ def test_an_unreadable_file_that_cannot_be_kept_aside_is_never_written_over(
 
     assert path.read_bytes() == broken
     assert registry.all_registrations() == []
+
+
+def test_an_entry_this_version_cannot_parse_survives_the_next_save(tmp_path: Path) -> None:
+    """Skipped on load and missing from memory, such an entry was simply not
+    written by the next register() — the shop's terminal deleted by an
+    unrelated change."""
+    path = tmp_path / "terminals.json"
+    unknown = {"descriptor": {"id": "future-1", "kind": "a-bank-from-the-future"}}
+    path.write_text(json.dumps({"terminals": [unknown]}), encoding="utf-8")
+    registry = TerminalRegistry(path=path)
+    registry.load()
+    registry.remember_descriptors([_descriptor()])
+
+    registry.register(TerminalRegistrationRequest(id="abc123"))
+
+    stored = json.loads(path.read_text(encoding="utf-8"))["terminals"]
+    assert unknown in stored
+    assert len(stored) == 2

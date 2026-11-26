@@ -20,12 +20,17 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+from src.devices.station_text import (
+    keep_unreadable_copy,
+    read_station_text,
+    write_station_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -56,18 +61,25 @@ class StationSettings:
         #: makes the blob just saved the oldest one — evicted inside the very
         #: call that reports success. A counter cannot step back.
         self._saves = 0
+        # Set when the file could not be read nor copied aside: saving then
+        # would write only this run's shops over the only copy of the others.
+        self._save_refused: Optional[str] = None
 
     def load(self) -> None:
         if not self.path.exists():
             return
+        # Read like the registries: a byte order mark (Notepad) or an older
+        # code page is still the shops' settings. A file that cannot be read
+        # at all is copied aside first — the next save writes only what is
+        # in memory, and that would drop every other shop for good.
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = json.loads(read_station_text(self.path)[0])
+            shops = raw.get("shops") if isinstance(raw, dict) else None
+            if not isinstance(shops, dict):
+                raise ValueError("no shops in the file")
         except Exception as exc:  # noqa: BLE001
             logger.warning("app-settings unreadable, starting empty: %s", exc)
-            return
-        shops = raw.get("shops") if isinstance(raw, dict) else None
-        if not isinstance(shops, dict):
-            logger.warning("app-settings has no shops, starting empty")
+            self._save_refused = keep_unreadable_copy(self.path)
             return
         with self._lock:
             self._shops = {
@@ -89,18 +101,10 @@ class StationSettings:
         logger.info("app-settings: device settings of %s shop(s)", len(self._shops))
 
     def _save_locked(self) -> None:
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        # The bytes are forced to the disk before the rename, because the
-        # rename being atomic only says the file is either the old one or
-        # the new one — not that the new one has reached the platter. A
-        # power cut right after can otherwise leave NTFS holding the new
-        # name over a zero-length file, which is the very loss the
-        # temporary file is here to prevent.
-        with open(tmp, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps({"shops": self._shops}, ensure_ascii=False))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, self.path)
+        # Atomic and forced to the disk, as the registries write theirs.
+        if self._save_refused is not None:
+            raise OSError(self._save_refused)
+        write_station_json(self.path, {"shops": self._shops})
 
     def save(self, appid: str, items: object) -> dict:
         """Keep this shop's settings. Answers the blob's id and time, so the

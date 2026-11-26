@@ -242,6 +242,10 @@ class TerminalRegistry:
         # Set when terminals.json could not be read nor copied aside:
         # saving then would destroy the only copy of the shop's terminals.
         self._save_refused: Optional[str] = None
+        # Entries of terminals.json this version cannot parse. Kept verbatim
+        # so every save puts them back, as the printer registry does: an
+        # unrelated change must not delete a terminal we could not read.
+        self._unreadable: list = []
 
     # ---------- persistence ----------
 
@@ -274,11 +278,13 @@ class TerminalRegistry:
             logger.warning("terminals.json unreadable: %s", exc)
             self._save_refused = keep_unreadable_copy(self.path)
             return
+        self._unreadable = []
         for entry in raw.get("terminals", []):
             try:
                 reg = TerminalRegistration.model_validate(entry)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("skipping bad terminal registration: %s", exc)
+                logger.warning("skipping bad terminal registration (kept in the file): %s", exc)
+                self._unreadable.append(entry)
                 continue
             self._registrations[reg.descriptor.id] = reg
         logger.info("loaded %d registered terminals", len(self._registrations))
@@ -606,7 +612,8 @@ class TerminalRegistry:
         if self._save_refused is not None:
             raise OSError(self._save_refused)
         payload = {
-            "terminals": [r.model_dump() for r in registrations.values()],
+            "terminals": [r.model_dump() for r in registrations.values()]
+            + self._unreadable,
         }
         write_station_json(self.path, payload)
 
