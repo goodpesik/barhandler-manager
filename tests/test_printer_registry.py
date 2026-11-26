@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import builtins
 import io
+import json
 import os
 from pathlib import Path
 
 import pytest
 
+from src.devices import station_text
 from src.devices.registry import PrinterRegistry
 from src.models.printer import PrinterKind, RegistrationRequest
 
@@ -95,15 +97,64 @@ def test_a_save_that_dies_mid_write_leaves_every_printer_on_disk(
     assert len(reloaded.all_registrations()) == 1
 
 
+def _default_text_encoding(monkeypatch: pytest.MonkeyPatch, encoding: str) -> None:
+    """Text files opened without an encoding use `encoding` — the ANSI
+    code page a Windows station hands Python. Both seams are patched for
+    the reason given in `_break_writes_under`."""
+    for module, real in ((io, io.open), (builtins, builtins.open)):
+        def opener(file, mode="r", *args, _real=real, **kwargs):  # type: ignore[no-untyped-def]
+            if "b" not in mode and not args and "encoding" not in kwargs:
+                kwargs["encoding"] = encoding
+            return _real(file, mode, *args, **kwargs)
+
+        monkeypatch.setattr(module, "open", opener)
+
+
+def test_a_cyrillic_nickname_is_stored_on_a_western_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """On a station whose code page is cp1252 a Cyrillic nickname cannot
+    be written in that code page. The registration was already changed
+    in memory, so the manager answered 500 while its own list showed the
+    change: the till never re-read the table, and the printer was gone
+    again after the manager restarted."""
+    _default_text_encoding(monkeypatch, "cp1252")
+    path = tmp_path / "printers.json"
+    _registry_with_one_printer(path, nickname="Принтер чеків")
+
+    reloaded = PrinterRegistry(path=path)
+    reloaded.load()
+
+    assert [r.nickname for r in reloaded.all_registrations()] == ["Принтер чеків"]
+
+
+def test_a_file_written_in_the_stations_code_page_is_still_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Up to this version printers.json was written in the station's
+    code page. Such a file is on the tills now and has to be read, not
+    refused: refused, it counts as no printers and the next register()
+    writes over the shop's others."""
+    monkeypatch.setattr(station_text, "station_encoding", lambda: "cp1251")
+    path = tmp_path / "printers.json"
+    registry = _registry_with_one_printer(path, nickname="Бар")
+    entry = registry.all_registrations()[0].model_dump(mode="json")
+    entry["nickname"] = "Бар «Чорна кава»"
+    path.write_bytes(
+        json.dumps({"printers": [entry]}, ensure_ascii=False).encode("cp1251")
+    )
+
+    reloaded = PrinterRegistry(path=path)
+    reloaded.load()
+
+    assert [r.nickname for r in reloaded.all_registrations()] == ["Бар «Чорна кава»"]
+
+
 def test_a_cyrillic_nickname_round_trips_through_save_and_load(
     tmp_path: Path,
 ) -> None:
-    """`save()` and `load()` have to agree on the encoding. They do by
-    using none at all — the station's own code page on both sides. An
-    explicit one on the writing side only is what review found in the
-    terminal registry: «Каса 1» came back as mojibake on a Ukrainian
-    Windows, and on a Western one the read raised and the file counted
-    as no printers, after which the next save overwrote the lot."""
+    """`save()` writes UTF-8 and `load()` reads UTF-8 first, so the
+    nickname comes back the way the operator typed it."""
     path = tmp_path / "printers.json"
     _registry_with_one_printer(path, nickname="Бар «Чорна кава»")
 
@@ -112,3 +163,173 @@ def test_a_cyrillic_nickname_round_trips_through_save_and_load(
 
     assert len(reloaded.all_registrations()) == 1
     assert reloaded.all_registrations()[0].nickname == "Бар «Чорна кава»"
+    assert "Бар «Чорна кава»" in path.read_bytes().decode("utf-8")
+
+
+def _saves_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every write of the registry file fails before it reaches the disk:
+    a full disk, a read-only folder, an antivirus lock on the rename."""
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise OSError("the disk refused the write")
+
+    monkeypatch.setattr(os, "replace", refuse)
+
+
+def test_a_register_that_cannot_be_stored_changes_nothing_in_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A change the disk refused must not show in the list: the manager
+    answers an error, and a list that still showed the change would lose
+    it silently on the next restart."""
+    registry = _registry_with_one_printer(tmp_path / "printers.json")
+    before = [r.model_dump() for r in registry.all_registrations()]
+    second = registry.add_manual_descriptor(host="10.0.0.13", port=9100)
+    first_id = registry.all_registrations()[0].descriptor.id
+    _saves_fail(monkeypatch)
+
+    with pytest.raises(OSError):
+        registry.register(RegistrationRequest(
+            id=second.id, kind=PrinterKind.label, nickname="Етикетки",
+        ))
+    with pytest.raises(OSError):
+        registry.register(RegistrationRequest(
+            id=first_id, kind=PrinterKind.label, nickname="Інша роль",
+        ))
+
+    assert [r.model_dump() for r in registry.all_registrations()] == before
+
+
+def test_an_unregister_that_cannot_be_stored_keeps_the_printer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _registry_with_one_printer(tmp_path / "printers.json")
+    printer_id = registry.all_registrations()[0].descriptor.id
+    _saves_fail(monkeypatch)
+
+    with pytest.raises(OSError):
+        registry.unregister(printer_id)
+
+    assert [r.descriptor.id for r in registry.all_registrations()] == [printer_id]
+
+
+def test_a_file_with_a_byte_order_mark_is_read(tmp_path: Path) -> None:
+    """Notepad saves UTF-8 with a byte order mark. Refused, the file
+    counts as no printers and the next register() writes over them."""
+    path = tmp_path / "printers.json"
+    _registry_with_one_printer(path, nickname="Бар")
+    path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+
+    reloaded = PrinterRegistry(path=path)
+    reloaded.load()
+
+    assert [r.nickname for r in reloaded.all_registrations()] == ["Бар"]
+
+
+def test_an_unreadable_file_is_kept_aside_before_the_next_save(
+    tmp_path: Path,
+) -> None:
+    """A file this version cannot read is copied aside on load, so the
+    next register(), which writes only what is in memory, does not
+    destroy the shop's printers for good."""
+    path = tmp_path / "printers.json"
+    broken = b'{"printers": [ {"nickname": "half'
+    path.write_bytes(broken)
+    registry = PrinterRegistry(path=path)
+    registry.load()
+    descriptor = registry.add_manual_descriptor(host="10.0.0.12", port=9100)
+    registry.register(RegistrationRequest(
+        id=descriptor.id, kind=PrinterKind.receipt, nickname="Bar",
+    ))
+
+    kept = [p.read_bytes() for p in tmp_path.glob("printers.json.unreadable-*")]
+    assert kept == [broken]
+
+
+def test_an_unreadable_file_that_cannot_be_kept_aside_is_never_written_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "printers.json"
+    broken = b'{"printers": [ {"nickname": "half'
+    path.write_bytes(broken)
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise OSError("the folder is read-only")
+
+    monkeypatch.setattr("src.devices.station_text.shutil.copyfile", refuse)
+    registry = PrinterRegistry(path=path)
+    registry.load()
+    descriptor = registry.add_manual_descriptor(host="10.0.0.12", port=9100)
+
+    with pytest.raises(OSError):
+        registry.register(RegistrationRequest(
+            id=descriptor.id, kind=PrinterKind.receipt, nickname="Bar",
+        ))
+
+    assert path.read_bytes() == broken
+    assert registry.all_registrations() == []
+
+
+def test_a_file_that_is_not_a_printer_list_is_treated_as_unreadable(tmp_path: Path) -> None:
+    """Valid JSON of the wrong shape crashed the manager's start."""
+    path = tmp_path / "printers.json"
+    path.write_bytes(b"[1, 2]")
+    registry = PrinterRegistry(path=path)
+
+    registry.load()
+
+    assert registry.all_registrations() == []
+    assert [p.read_bytes() for p in tmp_path.glob("printers.json.unreadable-*")] == [b"[1, 2]"]
+
+
+def test_registering_a_printer_kept_unparsed_replaces_that_entry(tmp_path: Path) -> None:
+    path = tmp_path / "printers.json"
+    probe = PrinterRegistry(path=tmp_path / "probe.json")
+    printer_id = probe.add_manual_descriptor(host="10.0.0.12", port=9100).id
+    unparsed = {"descriptor": {"id": printer_id}, "kind": "a-role-from-the-future"}
+    other = {"descriptor": {"id": "future-1"}, "kind": "a-role-from-the-future"}
+    path.write_text(json.dumps({"printers": [unparsed, other]}), encoding="utf-8")
+    registry = PrinterRegistry(path=path)
+    registry.load()
+
+    _register_bar(registry)
+    registry.unregister(printer_id)
+
+    assert json.loads(path.read_text(encoding="utf-8"))["printers"] == [other]
+
+
+def _register_bar(registry: PrinterRegistry) -> None:
+    descriptor = registry.add_manual_descriptor(host="10.0.0.12", port=9100)
+    registry.register(RegistrationRequest(
+        id=descriptor.id, kind=PrinterKind.receipt, nickname="Bar",
+    ))
+
+
+def test_an_unchanged_unreadable_file_is_kept_aside_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every start of a manager over the same broken file added one more copy."""
+    stamps = iter(["20261126-120000", "20261126-120500"])
+    monkeypatch.setattr("src.devices.station_text.time.strftime", lambda _fmt: next(stamps))
+    path = tmp_path / "printers.json"
+    path.write_bytes(b'{"printers": [')
+
+    PrinterRegistry(path=path).load()
+    PrinterRegistry(path=path).load()
+
+    assert len(list(tmp_path.glob("printers.json.unreadable-*"))) == 1
+
+
+def test_two_unreadable_files_within_one_second_are_both_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The copy is named by the second; the second copy in that second
+    overwrote the first."""
+    monkeypatch.setattr("src.devices.station_text.time.strftime", lambda _fmt: "20261126-120000")
+    path = tmp_path / "printers.json"
+    path.write_bytes(b'{"printers": [')
+    PrinterRegistry(path=path).load()
+    path.write_bytes(b'{"printers": [{')
+    PrinterRegistry(path=path).load()
+
+    kept = sorted(p.read_bytes() for p in tmp_path.glob("printers.json.unreadable-*"))
+    assert kept == [b'{"printers": [', b'{"printers": [{']

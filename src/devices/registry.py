@@ -8,15 +8,19 @@ in memory; we close everything on shutdown.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from pathlib import Path
 from typing import Dict, Optional
 
 from src.devices.printer import PrinterDevice
 from src.devices.scan import discover_all
 from src.devices.printer_models import protocol_for_model
+from src.devices.station_text import (
+    keep_unreadable_copy,
+    parse_device_list,
+    read_station_text,
+    store_registry,
+)
 from src.models.printer import (
     NetworkAddress,
     PrintProtocol,
@@ -55,6 +59,9 @@ class PrinterRegistry:
         # every save() puts them back: nobody asked us to delete a registration
         # just because we could not read it (BH-178).
         self._unreadable: list = []
+        # Set when printers.json could not be read nor copied aside: saving
+        # then would destroy the only copy of the shop's printers.
+        self._save_refused: Optional[str] = None
 
     # ---------- persistence ----------
 
@@ -62,13 +69,14 @@ class PrinterRegistry:
         if not self.path.exists():
             return
         try:
-            raw = json.loads(self.path.read_text())
+            entries = parse_device_list(read_station_text(self.path)[0], "printers")
         except Exception as exc:
             logger.warning("printers.json unreadable: %s", exc)
+            self._save_refused = keep_unreadable_copy(self.path)
             return
         upgraded = False
         self._unreadable = []
-        for entry in raw.get("printers", []):
+        for entry in entries:
             try:
                 reg = PrinterRegistration.model_validate(entry)
             except Exception as exc:
@@ -115,6 +123,10 @@ class PrinterRegistry:
         logger.info("loaded %d registered printers", len(self._registrations))
 
     def save(self) -> None:
+        """Store the registrations held in memory."""
+        self._unreadable = self._write(self._registrations)
+
+    def _write(self, registrations: Dict[str, PrinterRegistration]) -> list:
         """Replace printers.json in one step.
 
         Writing over the file in place truncates it first, so a power cut
@@ -132,31 +144,22 @@ class PrinterRegistry:
         leave NTFS holding the new name over a zero-length file, which is
         the very loss the temporary file is here to prevent.
 
-        NO EXPLICIT ENCODING ON PURPOSE, and do not add one here alone:
-        `load()` reads with a bare `read_text()`, so both halves use the
-        station's own code page and agree with each other, which is the
-        whole requirement. Giving `save()` a `utf-8` it does not give
-        `load()` is exactly the bug review found in the terminal registry
-        — the nicknames there came back as mojibake on a Ukrainian
-        Windows and raised on a Western one, which reads as no devices at
-        all. Moving this file to UTF-8 means teaching `load()` to read
-        both, as the terminal registry now does, and that is a change of
-        its own.
+        Written as UTF-8, never in the station's code page: on a Western
+        Windows (cp1252) a Cyrillic nickname cannot be encoded at all, and
+        the write raised after the registration had already changed in
+        memory — the manager answered 500, the till did not re-read its
+        table, and the change was lost on the next restart. `load()`
+        reads UTF-8 first and the code page only for a file an older
+        manager wrote (`read_station_text`).
         """
         # Entries we could not parse ride along untouched. Writing only what we
         # understood would delete them, and every registration change calls
         # this — so the loss would arrive later, by an unrelated hand (BH-178,
         # found by the second review round).
-        payload = {
-            "printers": [r.model_dump() for r in self._registrations.values()]
-            + self._unreadable,
-        }
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with open(tmp, "w", newline="\n") as handle:
-            handle.write(json.dumps(payload, indent=2, ensure_ascii=False))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, self.path)
+        # Answers the unparsed entries it wrote back, for `_commit` to keep.
+        return store_registry(
+            self.path, "printers", registrations, self._unreadable, self._save_refused,
+        )
 
     # ---------- discovery ----------
 
@@ -245,7 +248,9 @@ class PrinterRegistry:
         if req.label_gap is not None:
             kwargs["label_gap"] = req.label_gap
         reg = PrinterRegistration(**kwargs)
-        self._registrations[descriptor.id] = reg
+        # Stored first, swapped in after: a write the disk refuses leaves
+        # the list as it was, so the error the route answers is the truth.
+        self._commit({**self._registrations, descriptor.id: reg})
         # BH-160 — закешований пристрій тримає СТАРИЙ конфіг: ширину паперу,
         # протокол, режим рендеру, пін каси. Доти `register()` його не чіпав
         # (на відміну від `unregister()`), тож перереєстрація з іншою роллю чи
@@ -253,8 +258,14 @@ class PrinterRegistry:
         # тиснув тест — і отримував стару поведінку. Знайдено живим прогоном:
         # реєстрація на 58 мм лишала джоби 80-мілімитровими.
         self._drop_cached_device(descriptor.id)
-        self.save()
         return reg
+
+    def _commit(self, registrations: Dict[str, PrinterRegistration]) -> None:
+        """Write `registrations` to disk, and only then make them current."""
+        # An unparsed entry replaced by this change is gone for good from
+        # here on: an unregister later must not bring it back.
+        self._unreadable = self._write(registrations)
+        self._registrations = registrations
 
     def _drop_cached_device(self, printer_id: str) -> None:
         """Викинути закешований пристрій, щоб наступний друк зібрав його
@@ -353,9 +364,8 @@ class PrinterRegistry:
     def unregister(self, printer_id: str) -> None:
         if printer_id not in self._registrations:
             raise UnknownPrinter(printer_id)
-        self._registrations.pop(printer_id)
+        self._commit({k: v for k, v in self._registrations.items() if k != printer_id})
         self._drop_cached_device(printer_id)
-        self.save()
 
     # ---------- device access ----------
 

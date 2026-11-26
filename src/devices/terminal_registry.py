@@ -9,15 +9,17 @@ maintained here so the route layer never imports a specific vendor.
 
 from __future__ import annotations
 
-import codecs
-import json
-import locale
 import logging
-import os
 import shutil
 from pathlib import Path
 from typing import Dict, Optional, Type
 
+from src.devices.station_text import (
+    keep_unreadable_copy,
+    parse_device_list,
+    read_station_text,
+    store_registry,
+)
 from src.models.terminal import (
     MerchantBinding,
     TerminalDescriptor,
@@ -76,26 +78,6 @@ _ADAPTER_FOR_KIND: Dict[TerminalKind, Type[TerminalAdapter]] = {
     # Oschadbank
     TerminalKind.oschad_pos: OschadTerminalAdapter,
 }
-
-
-def _station_encoding() -> str:
-    """The code page a manager older than PET-1304 wrote this file in.
-
-    Up to v1.0.10 both halves of the registry used the station's own
-    encoding, which on a Ukrainian Windows is cp1251 and on a Western
-    one cp1252 — the ANSI code page, whatever `read_text()` without an
-    encoding picks. It is only ever used to READ such a file; nothing
-    is written in it any more.
-
-    On Windows that is the ANSI code page itself (`mbcs`), not the
-    locale setting of today's interpreter: the file was written by a
-    build that had no say in the matter, and this one could be started
-    in UTF-8 mode, which would leave the old file unreadable and the
-    shop with no terminals.
-    """
-    if os.name == "nt":
-        return "mbcs"
-    return locale.getpreferredencoding(False) or "utf-8"
 
 
 def _address_of(reg: TerminalRegistration) -> str:
@@ -257,6 +239,13 @@ class TerminalRegistry:
         # a manager older than PET-1304 is in the station's own code
         # page, and it is rewritten as UTF-8 once — see `_read_text`.
         self._stored_as_utf8 = True
+        # Set when terminals.json could not be read nor copied aside:
+        # saving then would destroy the only copy of the shop's terminals.
+        self._save_refused: Optional[str] = None
+        # Entries of terminals.json this version cannot parse. Kept verbatim
+        # so every save puts them back, as the printer registry does: an
+        # unrelated change must not delete a terminal we could not read.
+        self._unreadable: list = []
 
     # ---------- persistence ----------
 
@@ -273,46 +262,29 @@ class TerminalRegistry:
 
         So: UTF-8 first, and only a file that is not valid UTF-8 is
         tried in the station's code page — which is what v1.0.10 wrote.
-        Cyrillic in a single-byte code page is never valid UTF-8, so
-        the two cannot be confused. Such a file is marked for one
+        Cyrillic in a single-byte code page is valid UTF-8 only by rare
+        accident, so the two are practically never confused. Such a file is marked for one
         rewrite, after which it is UTF-8 like every other.
         """
-        data = self.path.read_bytes()
-        try:
-            self._stored_as_utf8 = True
-            return data.decode("utf-8")
-        except UnicodeDecodeError:
-            fallback = _station_encoding()
-            if codecs.lookup(fallback).name == "utf-8":
-                # Nothing else to try — the file is simply broken, and
-                # the re-raise has to happen in here while that is still
-                # the exception being handled; outside, a bare `raise`
-                # is a RuntimeError and the log would name the wrong
-                # reason the file could not be read.
-                raise
-        text = data.decode(fallback)
-        self._stored_as_utf8 = False
-        logger.info(
-            "%s was written by an older manager in this station's code "
-            "page (%s) — read as such and rewritten as UTF-8, so the "
-            "terminal nicknames stay readable",
-            self.path, fallback,
-        )
+        text, self._stored_as_utf8 = read_station_text(self.path)
         return text
 
     def load(self) -> None:
         if not self.path.exists():
             return
         try:
-            raw = json.loads(self._read_text())
+            entries = parse_device_list(self._read_text(), "terminals")
         except Exception as exc:  # noqa: BLE001
             logger.warning("terminals.json unreadable: %s", exc)
+            self._save_refused = keep_unreadable_copy(self.path)
             return
-        for entry in raw.get("terminals", []):
+        self._unreadable = []
+        for entry in entries:
             try:
                 reg = TerminalRegistration.model_validate(entry)
             except Exception as exc:  # noqa: BLE001
-                logger.warning("skipping bad terminal registration: %s", exc)
+                logger.warning("skipping bad terminal registration (kept in the file): %s", exc)
+                self._unreadable.append(entry)
                 continue
             self._registrations[reg.descriptor.id] = reg
         logger.info("loaded %d registered terminals", len(self._registrations))
@@ -594,6 +566,28 @@ class TerminalRegistry:
         return None
 
     def save(self) -> None:
+        """Store the registrations held in memory."""
+        self._unreadable = self._write(self._registrations)
+
+    def _commit(
+        self,
+        registrations: Dict[str, TerminalRegistration],
+        legacy_ids: Dict[str, str],
+    ) -> None:
+        """Write `registrations` to disk, and only then make them current.
+
+        A write the disk refuses (full disk, read-only folder, an
+        antivirus lock on the rename) leaves memory as it was, so the
+        error the route answers is the truth and a restart loses nothing
+        the dashboard showed.
+        """
+        # An unparsed entry replaced by this change is gone for good from
+        # here on: an unregister later must not bring it back.
+        self._unreadable = self._write(registrations)
+        self._registrations = registrations
+        self._legacy_ids = legacy_ids
+
+    def _write(self, registrations: Dict[str, TerminalRegistration]) -> list:
         """Replace terminals.json in one step.
 
         Writing over the file in place truncates it first, so a power cut
@@ -617,15 +611,10 @@ class TerminalRegistry:
         each other is the whole requirement, and a nickname is Cyrillic
         in every shop we have.
         """
-        payload = {
-            "terminals": [r.model_dump() for r in self._registrations.values()],
-        }
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(payload, indent=2, ensure_ascii=False))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, self.path)
+        # Answers the unparsed entries it wrote back, for `_commit` to keep.
+        return store_registry(
+            self.path, "terminals", registrations, self._unreadable, self._save_refused,
+        )
 
     # ---------- discovery cache ----------
 
@@ -737,18 +726,20 @@ class TerminalRegistry:
             else (existing.merchants if existing else [])
         )
         known_ids = list(existing.known_ids) if existing else []
+        registrations = dict(self._registrations)
+        legacy_ids = dict(self._legacy_ids)
         if resolved is not None and resolved != descriptor.id:
             # Re-registering moved this terminal to another id: drop the
             # old key instead of leaving a second copy behind, and keep
             # answering to it.
-            self._registrations.pop(resolved, None)
+            registrations.pop(resolved, None)
             if resolved not in known_ids:
                 known_ids.append(resolved)
-            self._legacy_ids = {
+            legacy_ids = {
                 old: (descriptor.id if new == resolved else new)
-                for old, new in self._legacy_ids.items()
+                for old, new in legacy_ids.items()
             }
-            self._legacy_ids[resolved] = descriptor.id
+            legacy_ids[resolved] = descriptor.id
         known_ids = [i for i in known_ids if i != descriptor.id]
         reg = TerminalRegistration(
             descriptor=descriptor,
@@ -759,8 +750,8 @@ class TerminalRegistry:
             merchants=merchants,
             known_ids=known_ids,
         )
-        self._registrations[descriptor.id] = reg
-        self.save()
+        registrations[descriptor.id] = reg
+        self._commit(registrations, legacy_ids)
         return reg
 
     def update_merchants(
@@ -768,10 +759,15 @@ class TerminalRegistry:
     ) -> TerminalRegistration:
         """Replace the merchant binding list — used by the Settings UI
         after the operator fills in nicknames."""
-        reg = self.get_registration(terminal_id)
-        reg.merchants = merchants
-        self.save()
-        return reg
+        resolved = self._resolve(terminal_id)
+        if resolved is None:
+            raise UnknownTerminal(terminal_id)
+        updated = self._registrations[resolved].model_copy(update={"merchants": merchants})
+        self._commit(
+            {**self._registrations, resolved: updated},
+            self._legacy_ids,
+        )
+        return updated
 
     def merge_merchant_list(
         self,
@@ -815,19 +811,20 @@ class TerminalRegistry:
                 nickname=nickname_index.get(key) or m.nickname,
             ))
         if reg is not None:
-            reg.merchants = merged
-            self.save()
+            self._commit(
+                {**self._registrations, resolved: reg.model_copy(update={"merchants": merged})},
+                self._legacy_ids,
+            )
         return merged
 
     def unregister(self, terminal_id: str) -> None:
         resolved = self._resolve(terminal_id)
         if resolved is None:
             raise UnknownTerminal(terminal_id)
-        self._registrations.pop(resolved)
-        self._legacy_ids = {
-            old: new for old, new in self._legacy_ids.items() if new != resolved
-        }
-        self.save()
+        self._commit(
+            {k: v for k, v in self._registrations.items() if k != resolved},
+            {old: new for old, new in self._legacy_ids.items() if new != resolved},
+        )
 
     # ---------- adapter access ----------
 

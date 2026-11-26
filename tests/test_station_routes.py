@@ -252,3 +252,84 @@ def test_an_oversized_key_is_refused(client: TestClient, auth_headers: dict) -> 
         "/station/settings", headers=auth_headers, json={"appid": SHOP, "items": {"k" * 300: "1"}},
     )
     assert r.status_code == 400
+
+
+def _refuse_copy(*_args, **_kwargs) -> None:
+    raise OSError("antivirus holds the folder")
+
+
+def test_a_notepad_saved_settings_file_keeps_every_shop(tmp_path) -> None:
+    """Notepad adds a byte order mark. Read as plain UTF-8 the file was
+    'unreadable', the store started empty, and the next shop's save wrote
+    only that shop — the other shops' printer roles were gone."""
+    import json
+    from src.services.station_settings import StationSettings
+
+    path = tmp_path / "app-settings.json"
+    shops = {"shops": {"shop-a": {"id": "x", "order": 1, "items": {"printer": "Каса 1"}}}}
+    path.write_bytes(b"\xef\xbb\xbf" + json.dumps(shops, ensure_ascii=False).encode("utf-8"))
+    store = StationSettings(path)
+    store.load()
+
+    store.save("shop-b", {"a": "1"})
+
+    reloaded = StationSettings(path)
+    reloaded.load()
+    assert reloaded.shops() == ["shop-a", "shop-b"]
+
+
+def test_an_unreadable_settings_file_that_cannot_be_kept_aside_is_never_written_over(
+    tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.services.station_settings import StationSettings
+
+    monkeypatch.setattr("src.devices.station_text.shutil.copyfile", _refuse_copy)
+    path = tmp_path / "app-settings.json"
+    path.write_bytes(b'{"shops": {"shop-a": ')
+    broken = path.read_bytes()
+    store = StationSettings(path)
+    store.load()
+
+    with pytest.raises(OSError):
+        store.save("shop-b", {"a": "1"})
+
+    assert path.read_bytes() == broken
+    assert store.shops() == []
+
+
+def test_a_shop_this_version_cannot_read_survives_the_next_save(tmp_path) -> None:
+    """A malformed shop was dropped on load without a word, and the next
+    save of any other shop wrote the file without it."""
+    import json
+    from src.services.station_settings import StationSettings
+
+    path = tmp_path / "app-settings.json"
+    odd = {"id": "x", "items": ["a list, not settings"]}
+    path.write_text(json.dumps({"shops": {"shop-a": odd}}), encoding="utf-8")
+    store = StationSettings(path)
+    store.load()
+
+    store.save("shop-b", {"a": "1"})
+
+    stored = json.loads(path.read_text(encoding="utf-8"))["shops"]
+    assert stored["shop-a"] == odd
+    assert set(stored) == {"shop-a", "shop-b"}
+
+
+def test_saving_a_shop_kept_unread_replaces_that_entry(tmp_path) -> None:
+    import json
+    from src.services.station_settings import StationSettings
+
+    path = tmp_path / "app-settings.json"
+    path.write_text(json.dumps({"shops": {"shop-a": "broken"}}), encoding="utf-8")
+    store = StationSettings(path)
+    store.load()
+
+    store.save("shop-a", {"a": "1"})
+    stored = json.loads(path.read_text(encoding="utf-8"))["shops"]
+    assert stored["shop-a"]["items"] == {"a": "1"}
+
+    # Pushed out by ten newer shops, the kept entry must not come back.
+    for n in range(10):
+        store.save(f"shop-{n}", {"a": "1"})
+    assert "shop-a" not in json.loads(path.read_text(encoding="utf-8"))["shops"]

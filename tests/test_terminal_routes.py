@@ -1321,3 +1321,45 @@ def test_the_refusal_names_the_operation_the_answer_belongs_to(
     assert detail["operation"] == "charge"
     assert detail["terminal_id"] == fake_terminal.id
     assert detail["amount"] == 24500
+
+
+@pytest.mark.parametrize("url, body, file_key", [
+    ("/devices/register-manual", {"host": "10.0.0.12", "port": 9100, "kind": "receipt"}, "registry_path"),
+    ("/terminal/register-manual", {"host": "10.0.0.42", "port": 3000, "kind": "mono_pos"}, "terminal_registry_path"),
+])
+def test_a_device_change_that_cannot_be_stored_answers_what_to_do(
+    config: dict, auth_headers: dict, monkeypatch: pytest.MonkeyPatch,
+    url: str, body: dict, file_key: str,
+) -> None:
+    """With the device file unreadable and not copied aside every change is
+    refused — and the route answered a bare 500 the app could not explain."""
+    Path(config["server"][file_key]).write_bytes(b'{"half')
+
+    def refuse_copy(*_args: object, **_kwargs: object) -> None:
+        raise OSError("antivirus holds the folder")
+
+    monkeypatch.setattr("src.devices.station_text.shutil.copyfile", refuse_copy)
+    with patch("src.devices.scan.discover_usb", return_value=[]), \
+         patch("src.devices.scan.discover_network", return_value=[]), \
+         patch("src.devices.scan.discover_bluetooth", return_value=[]):
+        with TestClient(create_app(config)) as client:
+            response = client.post(url, headers=auth_headers, json=body)
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["code"] == "device_list_not_saved"
+
+
+def test_a_device_change_the_disk_refuses_answers_what_to_do(
+    client: TestClient, auth_headers: dict, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse_write(*_args: object, **_kwargs: object) -> None:
+        raise OSError("the disk is full")
+
+    monkeypatch.setattr("src.devices.station_text.write_station_json", refuse_write)
+    response = client.post(
+        "/devices/register-manual", headers=auth_headers,
+        json={"host": "10.0.0.12", "port": 9100, "kind": "receipt"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"]["code"] == "device_list_not_saved"
