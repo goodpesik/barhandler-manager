@@ -10,16 +10,17 @@ from __future__ import annotations
 
 import json
 import logging
-import os
-import shutil
-import time
 from pathlib import Path
 from typing import Dict, Optional
 
 from src.devices.printer import PrinterDevice
 from src.devices.scan import discover_all
 from src.devices.printer_models import protocol_for_model
-from src.devices.station_text import read_station_text
+from src.devices.station_text import (
+    keep_unreadable_copy,
+    read_station_text,
+    write_station_json,
+)
 from src.models.printer import (
     NetworkAddress,
     PrintProtocol,
@@ -71,7 +72,7 @@ class PrinterRegistry:
             raw = json.loads(read_station_text(self.path)[0])
         except Exception as exc:
             logger.warning("printers.json unreadable: %s", exc)
-            self._keep_unreadable_file()
+            self._save_refused = keep_unreadable_copy(self.path)
             return
         upgraded = False
         self._unreadable = []
@@ -121,24 +122,6 @@ class PrinterRegistry:
                 )
         logger.info("loaded %d registered printers", len(self._registrations))
 
-    def _keep_unreadable_file(self) -> None:
-        """Copy a printers.json this version cannot read next to it.
-
-        The registry starts empty after such a load, and the next save
-        writes only what is in memory, so without this copy the shop's
-        printers would be gone for good. When the copy itself fails,
-        saving is refused for this run: the file stays as it is.
-        """
-        stamp = time.strftime("%Y%m%d-%H%M%S")
-        kept = self.path.with_name(f"{self.path.name}.unreadable-{stamp}")
-        try:
-            shutil.copyfile(self.path, kept)
-        except OSError as exc:
-            self._save_refused = f"printers.json is unreadable and could not be copied aside: {exc}"
-            logger.warning("%s; printer changes are not stored in this run", self._save_refused)
-            return
-        logger.warning("unreadable printers.json copied to %s before any change", kept)
-
     def save(self) -> None:
         """Store the registrations held in memory."""
         self._write(self._registrations)
@@ -179,12 +162,7 @@ class PrinterRegistry:
             "printers": [r.model_dump() for r in registrations.values()]
             + self._unreadable,
         }
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(payload, indent=2, ensure_ascii=False))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, self.path)
+        write_station_json(self.path, payload)
 
     # ---------- discovery ----------
 

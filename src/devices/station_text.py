@@ -12,10 +12,14 @@ JSON practically never is.
 from __future__ import annotations
 
 import codecs
+import json
 import locale
 import logging
 import os
+import shutil
+import time
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -59,3 +63,40 @@ def read_station_text(path: Path) -> tuple[str, bool]:
         path, fallback,
     )
     return text, False
+
+
+def keep_unreadable_copy(path: Path) -> Optional[str]:
+    """Copy a registry file this version cannot read next to it.
+
+    The registry starts empty after such a load, and the next save
+    writes only what is in memory, so without this copy the shop's
+    devices would be gone for good. Answers why saving must be refused
+    for this run when the copy itself fails (the file then stays as it
+    is), and None when the copy is kept.
+    """
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    kept = path.with_name(f"{path.name}.unreadable-{stamp}")
+    try:
+        shutil.copyfile(path, kept)
+    except OSError as exc:
+        refused = f"{path.name} is unreadable and could not be copied aside: {exc}"
+        logger.warning("%s; device changes are not stored in this run", refused)
+        return refused
+    logger.warning("unreadable %s copied to %s before any change", path.name, kept)
+    return None
+
+
+def write_station_json(path: Path, payload: dict) -> None:
+    """Replace `path` with `payload` in one step, as UTF-8.
+
+    Written to a temporary file in the same folder (so the rename stays
+    on one filesystem and is atomic), forced to the disk, then renamed
+    over the old file: a power cut at any point leaves either the old
+    file or the new one, never a half-written or zero-length one.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+        handle.write(json.dumps(payload, indent=2, ensure_ascii=False))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)

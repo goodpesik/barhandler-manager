@@ -580,3 +580,91 @@ def test_the_winners_own_old_ids_still_resolve_after_a_rekey(
     kept = registry.get_registration("an-even-older-id")
     assert kept.descriptor.id == current_id
     assert kept.nickname == "Бар 1"
+
+
+def _refuse_writes(*args: object, **kwargs: object) -> None:
+    """A full disk, a read-only folder, an antivirus lock on the rename."""
+    raise OSError("the disk refused the write")
+
+
+_CHANGES = {
+    "register": lambda r, pos_id: r.register(TerminalRegistrationRequest(
+        id=pos_id, kind=TerminalKind.mono_pos, nickname="Інша назва",
+    )),
+    "register_moving_the_id": lambda r, pos_id: (
+        r.remember_descriptors([_descriptor(host="10.0.0.99", sid=pos_id)]),
+        r.register(TerminalRegistrationRequest(id=pos_id, nickname="Бар 2")),
+    ),
+    "update_merchants": lambda r, pos_id: r.update_merchants(pos_id, [
+        MerchantBinding(merchant_id="M9", terminal_id="T9", nickname="Нова"),
+    ]),
+    "merge_merchant_list": lambda r, pos_id: r.merge_merchant_list(pos_id, [
+        MerchantBinding(merchant_id="M9", terminal_id="T9"),
+    ]),
+    "unregister": lambda r, pos_id: r.unregister(pos_id),
+}
+
+
+@pytest.mark.parametrize("change", sorted(_CHANGES))
+def test_a_change_that_cannot_be_stored_changes_nothing_in_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    """A change the disk refused must not show: the route answers an
+    error, and a registry that still showed the change would lose it
+    silently on the next restart. The old id the POS holds keeps
+    resolving to the same registration too."""
+    path = tmp_path / "terminals.json"
+    path.write_text(json.dumps({"terminals": [
+        _stored_under_its_legacy_id(
+            "10.0.0.5", nickname="Бар 1",
+            merchants=[{"merchant_id": "M1", "terminal_id": "T1", "nickname": "Бар"}],
+        ),
+    ]}))
+    pos_id = legacy_network_terminal_id("10.0.0.5", 3000, _SERIAL)
+    registry = TerminalRegistry(path=path)
+    registry.load()
+    current_id = registry.get_registration(pos_id).descriptor.id
+    before = [r.model_dump() for r in registry.all_registrations()]
+    monkeypatch.setattr("src.devices.station_text.os.replace", _refuse_writes)
+
+    with pytest.raises(OSError):
+        _CHANGES[change](registry, pos_id)
+
+    assert [r.model_dump() for r in registry.all_registrations()] == before
+    assert registry.get_registration(pos_id).descriptor.id == current_id
+
+
+def _registry_over_a_broken_file(path: Path) -> TerminalRegistry:
+    path.write_bytes(b'{"terminals": [ {"nickname": "half')
+    registry = TerminalRegistry(path=path)
+    registry.load()
+    registry.remember_descriptors([_descriptor()])
+    return registry
+
+
+def test_an_unreadable_file_is_kept_aside_before_the_next_save(tmp_path: Path) -> None:
+    """The next register() writes only what is in memory; without the copy
+    the shop's terminals in the broken file would be gone for good."""
+    path = tmp_path / "terminals.json"
+    registry = _registry_over_a_broken_file(path)
+    broken = path.read_bytes()
+
+    registry.register(TerminalRegistrationRequest(id="abc123"))
+
+    kept = [p.read_bytes() for p in tmp_path.glob("terminals.json.unreadable-*")]
+    assert kept == [broken]
+
+
+def test_an_unreadable_file_that_cannot_be_kept_aside_is_never_written_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.devices.station_text.shutil.copyfile", _refuse_writes)
+    path = tmp_path / "terminals.json"
+    registry = _registry_over_a_broken_file(path)
+    broken = path.read_bytes()
+
+    with pytest.raises(OSError):
+        registry.register(TerminalRegistrationRequest(id="abc123"))
+
+    assert path.read_bytes() == broken
+    assert registry.all_registrations() == []

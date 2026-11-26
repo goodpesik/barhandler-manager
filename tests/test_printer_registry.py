@@ -255,7 +255,7 @@ def test_an_unreadable_file_that_cannot_be_kept_aside_is_never_written_over(
     def refuse(*args: object, **kwargs: object) -> None:
         raise OSError("the folder is read-only")
 
-    monkeypatch.setattr("src.devices.registry.shutil.copyfile", refuse)
+    monkeypatch.setattr("src.devices.station_text.shutil.copyfile", refuse)
     registry = PrinterRegistry(path=path)
     registry.load()
     descriptor = registry.add_manual_descriptor(host="10.0.0.12", port=9100)

@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import shutil
 from pathlib import Path
 from typing import Dict, Optional, Type
 
-from src.devices.station_text import read_station_text
+from src.devices.station_text import (
+    keep_unreadable_copy,
+    read_station_text,
+    write_station_json,
+)
 from src.models.terminal import (
     MerchantBinding,
     TerminalDescriptor,
@@ -236,6 +239,9 @@ class TerminalRegistry:
         # a manager older than PET-1304 is in the station's own code
         # page, and it is rewritten as UTF-8 once — see `_read_text`.
         self._stored_as_utf8 = True
+        # Set when terminals.json could not be read nor copied aside:
+        # saving then would destroy the only copy of the shop's terminals.
+        self._save_refused: Optional[str] = None
 
     # ---------- persistence ----------
 
@@ -266,6 +272,7 @@ class TerminalRegistry:
             raw = json.loads(self._read_text())
         except Exception as exc:  # noqa: BLE001
             logger.warning("terminals.json unreadable: %s", exc)
+            self._save_refused = keep_unreadable_copy(self.path)
             return
         for entry in raw.get("terminals", []):
             try:
@@ -553,6 +560,26 @@ class TerminalRegistry:
         return None
 
     def save(self) -> None:
+        """Store the registrations held in memory."""
+        self._write(self._registrations)
+
+    def _commit(
+        self,
+        registrations: Dict[str, TerminalRegistration],
+        legacy_ids: Dict[str, str],
+    ) -> None:
+        """Write `registrations` to disk, and only then make them current.
+
+        A write the disk refuses (full disk, read-only folder, an
+        antivirus lock on the rename) leaves memory as it was, so the
+        error the route answers is the truth and a restart loses nothing
+        the dashboard showed.
+        """
+        self._write(registrations)
+        self._registrations = registrations
+        self._legacy_ids = legacy_ids
+
+    def _write(self, registrations: Dict[str, TerminalRegistration]) -> None:
         """Replace terminals.json in one step.
 
         Writing over the file in place truncates it first, so a power cut
@@ -576,15 +603,12 @@ class TerminalRegistry:
         each other is the whole requirement, and a nickname is Cyrillic
         in every shop we have.
         """
+        if self._save_refused is not None:
+            raise OSError(self._save_refused)
         payload = {
-            "terminals": [r.model_dump() for r in self._registrations.values()],
+            "terminals": [r.model_dump() for r in registrations.values()],
         }
-        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(json.dumps(payload, indent=2, ensure_ascii=False))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, self.path)
+        write_station_json(self.path, payload)
 
     # ---------- discovery cache ----------
 
@@ -696,18 +720,20 @@ class TerminalRegistry:
             else (existing.merchants if existing else [])
         )
         known_ids = list(existing.known_ids) if existing else []
+        registrations = dict(self._registrations)
+        legacy_ids = dict(self._legacy_ids)
         if resolved is not None and resolved != descriptor.id:
             # Re-registering moved this terminal to another id: drop the
             # old key instead of leaving a second copy behind, and keep
             # answering to it.
-            self._registrations.pop(resolved, None)
+            registrations.pop(resolved, None)
             if resolved not in known_ids:
                 known_ids.append(resolved)
-            self._legacy_ids = {
+            legacy_ids = {
                 old: (descriptor.id if new == resolved else new)
-                for old, new in self._legacy_ids.items()
+                for old, new in legacy_ids.items()
             }
-            self._legacy_ids[resolved] = descriptor.id
+            legacy_ids[resolved] = descriptor.id
         known_ids = [i for i in known_ids if i != descriptor.id]
         reg = TerminalRegistration(
             descriptor=descriptor,
@@ -718,8 +744,8 @@ class TerminalRegistry:
             merchants=merchants,
             known_ids=known_ids,
         )
-        self._registrations[descriptor.id] = reg
-        self.save()
+        registrations[descriptor.id] = reg
+        self._commit(registrations, legacy_ids)
         return reg
 
     def update_merchants(
@@ -727,10 +753,15 @@ class TerminalRegistry:
     ) -> TerminalRegistration:
         """Replace the merchant binding list — used by the Settings UI
         after the operator fills in nicknames."""
-        reg = self.get_registration(terminal_id)
-        reg.merchants = merchants
-        self.save()
-        return reg
+        resolved = self._resolve(terminal_id)
+        if resolved is None:
+            raise UnknownTerminal(terminal_id)
+        updated = self._registrations[resolved].model_copy(update={"merchants": merchants})
+        self._commit(
+            {**self._registrations, resolved: updated},
+            self._legacy_ids,
+        )
+        return updated
 
     def merge_merchant_list(
         self,
@@ -774,19 +805,20 @@ class TerminalRegistry:
                 nickname=nickname_index.get(key) or m.nickname,
             ))
         if reg is not None:
-            reg.merchants = merged
-            self.save()
+            self._commit(
+                {**self._registrations, resolved: reg.model_copy(update={"merchants": merged})},
+                self._legacy_ids,
+            )
         return merged
 
     def unregister(self, terminal_id: str) -> None:
         resolved = self._resolve(terminal_id)
         if resolved is None:
             raise UnknownTerminal(terminal_id)
-        self._registrations.pop(resolved)
-        self._legacy_ids = {
-            old: new for old, new in self._legacy_ids.items() if new != resolved
-        }
-        self.save()
+        self._commit(
+            {k: v for k, v in self._registrations.items() if k != resolved},
+            {old: new for old, new in self._legacy_ids.items() if new != resolved},
+        )
 
     # ---------- adapter access ----------
 
