@@ -2,9 +2,11 @@
 
 Both files are written as UTF-8. Older managers wrote them in the
 station's code page, and such files are still on the tills, so a read
-tries UTF-8 first and the code page only for a file that is not valid
-UTF-8. Cyrillic in a single-byte code
-page is never valid UTF-8, so the two cannot be confused.
+tries UTF-8 first (with or without a byte order mark, which Notepad
+adds) and the code page only for a file that is not valid UTF-8.
+Cyrillic text in a single-byte code page is valid UTF-8 only by rare
+accident (a short pair such as "Рё"); a whole file of nicknames and
+JSON practically never is.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ def read_station_text(path: Path) -> tuple[str, bool]:
     """The contents of `path` and whether they were stored as UTF-8."""
     data = path.read_bytes()
     try:
-        return data.decode("utf-8"), True
+        return data.decode("utf-8-sig"), True
     except UnicodeDecodeError:
         fallback = station_encoding()
         if codecs.lookup(fallback).name == "utf-8":

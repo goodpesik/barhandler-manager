@@ -164,3 +164,106 @@ def test_a_cyrillic_nickname_round_trips_through_save_and_load(
     assert len(reloaded.all_registrations()) == 1
     assert reloaded.all_registrations()[0].nickname == "Бар «Чорна кава»"
     assert "Бар «Чорна кава»" in path.read_bytes().decode("utf-8")
+
+
+def _saves_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every write of the registry file fails before it reaches the disk:
+    a full disk, a read-only folder, an antivirus lock on the rename."""
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise OSError("the disk refused the write")
+
+    monkeypatch.setattr(os, "replace", refuse)
+
+
+def test_a_register_that_cannot_be_stored_changes_nothing_in_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A change the disk refused must not show in the list: the manager
+    answers an error, and a list that still showed the change would lose
+    it silently on the next restart."""
+    registry = _registry_with_one_printer(tmp_path / "printers.json")
+    before = [r.model_dump() for r in registry.all_registrations()]
+    second = registry.add_manual_descriptor(host="10.0.0.13", port=9100)
+    first_id = registry.all_registrations()[0].descriptor.id
+    _saves_fail(monkeypatch)
+
+    with pytest.raises(OSError):
+        registry.register(RegistrationRequest(
+            id=second.id, kind=PrinterKind.label, nickname="Етикетки",
+        ))
+    with pytest.raises(OSError):
+        registry.register(RegistrationRequest(
+            id=first_id, kind=PrinterKind.label, nickname="Інша роль",
+        ))
+
+    assert [r.model_dump() for r in registry.all_registrations()] == before
+
+
+def test_an_unregister_that_cannot_be_stored_keeps_the_printer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = _registry_with_one_printer(tmp_path / "printers.json")
+    printer_id = registry.all_registrations()[0].descriptor.id
+    _saves_fail(monkeypatch)
+
+    with pytest.raises(OSError):
+        registry.unregister(printer_id)
+
+    assert [r.descriptor.id for r in registry.all_registrations()] == [printer_id]
+
+
+def test_a_file_with_a_byte_order_mark_is_read(tmp_path: Path) -> None:
+    """Notepad saves UTF-8 with a byte order mark. Refused, the file
+    counts as no printers and the next register() writes over them."""
+    path = tmp_path / "printers.json"
+    _registry_with_one_printer(path, nickname="Бар")
+    path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+
+    reloaded = PrinterRegistry(path=path)
+    reloaded.load()
+
+    assert [r.nickname for r in reloaded.all_registrations()] == ["Бар"]
+
+
+def test_an_unreadable_file_is_kept_aside_before_the_next_save(
+    tmp_path: Path,
+) -> None:
+    """A file this version cannot read is copied aside on load, so the
+    next register(), which writes only what is in memory, does not
+    destroy the shop's printers for good."""
+    path = tmp_path / "printers.json"
+    broken = b'{"printers": [ {"nickname": "half'
+    path.write_bytes(broken)
+    registry = PrinterRegistry(path=path)
+    registry.load()
+    descriptor = registry.add_manual_descriptor(host="10.0.0.12", port=9100)
+    registry.register(RegistrationRequest(
+        id=descriptor.id, kind=PrinterKind.receipt, nickname="Bar",
+    ))
+
+    kept = [p.read_bytes() for p in tmp_path.glob("printers.json.unreadable-*")]
+    assert kept == [broken]
+
+
+def test_an_unreadable_file_that_cannot_be_kept_aside_is_never_written_over(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "printers.json"
+    broken = b'{"printers": [ {"nickname": "half'
+    path.write_bytes(broken)
+
+    def refuse(*args: object, **kwargs: object) -> None:
+        raise OSError("the folder is read-only")
+
+    monkeypatch.setattr("src.devices.registry.shutil.copyfile", refuse)
+    registry = PrinterRegistry(path=path)
+    registry.load()
+    descriptor = registry.add_manual_descriptor(host="10.0.0.12", port=9100)
+
+    with pytest.raises(OSError):
+        registry.register(RegistrationRequest(
+            id=descriptor.id, kind=PrinterKind.receipt, nickname="Bar",
+        ))
+
+    assert path.read_bytes() == broken
+    assert registry.all_registrations() == []

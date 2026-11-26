@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
+import time
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -56,6 +58,9 @@ class PrinterRegistry:
         # every save() puts them back: nobody asked us to delete a registration
         # just because we could not read it (BH-178).
         self._unreadable: list = []
+        # Set when printers.json could not be read nor copied aside: saving
+        # then would destroy the only copy of the shop's printers.
+        self._save_refused: Optional[str] = None
 
     # ---------- persistence ----------
 
@@ -66,6 +71,7 @@ class PrinterRegistry:
             raw = json.loads(read_station_text(self.path)[0])
         except Exception as exc:
             logger.warning("printers.json unreadable: %s", exc)
+            self._keep_unreadable_file()
             return
         upgraded = False
         self._unreadable = []
@@ -115,7 +121,29 @@ class PrinterRegistry:
                 )
         logger.info("loaded %d registered printers", len(self._registrations))
 
+    def _keep_unreadable_file(self) -> None:
+        """Copy a printers.json this version cannot read next to it.
+
+        The registry starts empty after such a load, and the next save
+        writes only what is in memory, so without this copy the shop's
+        printers would be gone for good. When the copy itself fails,
+        saving is refused for this run: the file stays as it is.
+        """
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        kept = self.path.with_name(f"{self.path.name}.unreadable-{stamp}")
+        try:
+            shutil.copyfile(self.path, kept)
+        except OSError as exc:
+            self._save_refused = f"printers.json is unreadable and could not be copied aside: {exc}"
+            logger.warning("%s; printer changes are not stored in this run", self._save_refused)
+            return
+        logger.warning("unreadable printers.json copied to %s before any change", kept)
+
     def save(self) -> None:
+        """Store the registrations held in memory."""
+        self._write(self._registrations)
+
+    def _write(self, registrations: Dict[str, PrinterRegistration]) -> None:
         """Replace printers.json in one step.
 
         Writing over the file in place truncates it first, so a power cut
@@ -145,8 +173,10 @@ class PrinterRegistry:
         # understood would delete them, and every registration change calls
         # this — so the loss would arrive later, by an unrelated hand (BH-178,
         # found by the second review round).
+        if self._save_refused is not None:
+            raise OSError(self._save_refused)
         payload = {
-            "printers": [r.model_dump() for r in self._registrations.values()]
+            "printers": [r.model_dump() for r in registrations.values()]
             + self._unreadable,
         }
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
@@ -243,7 +273,9 @@ class PrinterRegistry:
         if req.label_gap is not None:
             kwargs["label_gap"] = req.label_gap
         reg = PrinterRegistration(**kwargs)
-        self._registrations[descriptor.id] = reg
+        # Stored first, swapped in after: a write the disk refuses leaves
+        # the list as it was, so the error the route answers is the truth.
+        self._commit({**self._registrations, descriptor.id: reg})
         # BH-160 — закешований пристрій тримає СТАРИЙ конфіг: ширину паперу,
         # протокол, режим рендеру, пін каси. Доти `register()` його не чіпав
         # (на відміну від `unregister()`), тож перереєстрація з іншою роллю чи
@@ -251,8 +283,12 @@ class PrinterRegistry:
         # тиснув тест — і отримував стару поведінку. Знайдено живим прогоном:
         # реєстрація на 58 мм лишала джоби 80-мілімитровими.
         self._drop_cached_device(descriptor.id)
-        self.save()
         return reg
+
+    def _commit(self, registrations: Dict[str, PrinterRegistration]) -> None:
+        """Write `registrations` to disk, and only then make them current."""
+        self._write(registrations)
+        self._registrations = registrations
 
     def _drop_cached_device(self, printer_id: str) -> None:
         """Викинути закешований пристрій, щоб наступний друк зібрав його
@@ -351,9 +387,8 @@ class PrinterRegistry:
     def unregister(self, printer_id: str) -> None:
         if printer_id not in self._registrations:
             raise UnknownPrinter(printer_id)
-        self._registrations.pop(printer_id)
+        self._commit({k: v for k, v in self._registrations.items() if k != printer_id})
         self._drop_cached_device(printer_id)
-        self.save()
 
     # ---------- device access ----------
 

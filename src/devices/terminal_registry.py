@@ -252,8 +252,8 @@ class TerminalRegistry:
 
         So: UTF-8 first, and only a file that is not valid UTF-8 is
         tried in the station's code page — which is what v1.0.10 wrote.
-        Cyrillic in a single-byte code page is never valid UTF-8, so
-        the two cannot be confused. Such a file is marked for one
+        Cyrillic in a single-byte code page is valid UTF-8 only by rare
+        accident, so the two are practically never confused. Such a file is marked for one
         rewrite, after which it is UTF-8 like every other.
         """
         text, self._stored_as_utf8 = read_station_text(self.path)
