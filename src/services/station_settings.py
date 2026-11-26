@@ -64,6 +64,10 @@ class StationSettings:
         # Set when the file could not be read nor copied aside: saving then
         # would write only this run's shops over the only copy of the others.
         self._save_refused: Optional[str] = None
+        #: Shops of the file this version cannot read, kept as they were so
+        #: every save writes them back: an unrelated shop's save must not
+        #: delete them. A shop saved again here replaces its kept entry.
+        self._unread_shops: dict[str, object] = {}
 
     def load(self) -> None:
         if not self.path.exists():
@@ -82,11 +86,17 @@ class StationSettings:
             self._save_refused = keep_unreadable_copy(self.path)
             return
         with self._lock:
-            self._shops = {
-                appid: blob
-                for appid, blob in shops.items()
-                if isinstance(appid, str) and isinstance(blob, dict) and isinstance(blob.get("items"), dict)
-            }
+            self._shops = {}
+            self._unread_shops = {}
+            for appid, blob in shops.items():
+                if isinstance(blob, dict) and isinstance(blob.get("items"), dict):
+                    self._shops[appid] = blob
+                else:
+                    logger.warning(
+                        "app-settings: the settings of shop %s are not readable "
+                        "by this version; kept in the file unchanged", appid,
+                    )
+                    self._unread_shops[appid] = blob
             # The order of the file is the order of the saves it remembers.
             for order, blob in enumerate(self._shops.values(), start=1):
                 stored = blob.get("order")
@@ -104,7 +114,9 @@ class StationSettings:
         # Atomic and forced to the disk, as the registries write theirs.
         if self._save_refused is not None:
             raise OSError(self._save_refused)
-        write_station_json(self.path, {"shops": self._shops})
+        unread = {k: v for k, v in self._unread_shops.items() if k not in self._shops}
+        write_station_json(self.path, {"shops": {**unread, **self._shops}})
+        self._unread_shops = unread
 
     def save(self, appid: str, items: object) -> dict:
         """Keep this shop's settings. Answers the blob's id and time, so the

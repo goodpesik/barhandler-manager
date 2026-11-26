@@ -11,13 +11,15 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 import logging
 
-from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security.api_key import APIKeyHeader
 
 from src.config import APP_DIR
 from src.constants import DEFAULT_API_KEY
 from src.devices.registry import PrinterRegistry
+from src.devices.station_text import DeviceListNotStored
 from src.devices.terminal_registry import TerminalRegistry
 from src.routes import (
     dashboard, devices, drawer, fiscal_it, health, offline, print_routes, station, system, terminal,
@@ -455,6 +457,24 @@ def create_app(config: dict) -> FastAPI:
     async def verify_key(key: str = Security(API_KEY_HEADER)):
         if key != api_key:
             raise HTTPException(status_code=401, detail="Invalid API key")
+
+    @app.exception_handler(DeviceListNotStored)
+    async def device_list_not_stored(_request: Request, _exc: DeviceListNotStored) -> JSONResponse:
+        # Every route that registers, removes or renames a printer or a
+        # terminal ends up here when the change could not be stored (the
+        # registry has logged why). One place, so a new route cannot answer
+        # a bare 500 the app has no words for.
+        return JSONResponse(
+            status_code=500,
+            content={"detail": {
+                "code": "device_list_not_saved",
+                "message": (
+                    "Не вдалося зберегти список пристроїв на цьому комп'ютері. "
+                    "Перезапустіть Девайс менеджер; якщо помилка повториться, "
+                    "зверніться до служби підтримки."
+                ),
+            }},
+        )
 
     app.include_router(health.router)
     app.include_router(version.router)

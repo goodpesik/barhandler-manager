@@ -295,3 +295,41 @@ def test_an_unreadable_settings_file_that_cannot_be_kept_aside_is_never_written_
 
     assert path.read_bytes() == broken
     assert store.shops() == []
+
+
+def test_a_shop_this_version_cannot_read_survives_the_next_save(tmp_path) -> None:
+    """A malformed shop was dropped on load without a word, and the next
+    save of any other shop wrote the file without it."""
+    import json
+    from src.services.station_settings import StationSettings
+
+    path = tmp_path / "app-settings.json"
+    odd = {"id": "x", "items": ["a list, not settings"]}
+    path.write_text(json.dumps({"shops": {"shop-a": odd}}), encoding="utf-8")
+    store = StationSettings(path)
+    store.load()
+
+    store.save("shop-b", {"a": "1"})
+
+    stored = json.loads(path.read_text(encoding="utf-8"))["shops"]
+    assert stored["shop-a"] == odd
+    assert set(stored) == {"shop-a", "shop-b"}
+
+
+def test_saving_a_shop_kept_unread_replaces_that_entry(tmp_path) -> None:
+    import json
+    from src.services.station_settings import StationSettings
+
+    path = tmp_path / "app-settings.json"
+    path.write_text(json.dumps({"shops": {"shop-a": "broken"}}), encoding="utf-8")
+    store = StationSettings(path)
+    store.load()
+
+    store.save("shop-a", {"a": "1"})
+    stored = json.loads(path.read_text(encoding="utf-8"))["shops"]
+    assert stored["shop-a"]["items"] == {"a": "1"}
+
+    # Pushed out by ten newer shops, the kept entry must not come back.
+    for n in range(10):
+        store.save(f"shop-{n}", {"a": "1"})
+    assert "shop-a" not in json.loads(path.read_text(encoding="utf-8"))["shops"]

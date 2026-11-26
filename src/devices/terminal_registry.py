@@ -9,7 +9,6 @@ maintained here so the route layer never imports a specific vendor.
 
 from __future__ import annotations
 
-import json
 import logging
 import shutil
 from pathlib import Path
@@ -17,8 +16,9 @@ from typing import Dict, Optional, Type
 
 from src.devices.station_text import (
     keep_unreadable_copy,
+    parse_device_list,
     read_station_text,
-    write_station_json,
+    store_registry,
 )
 from src.models.terminal import (
     MerchantBinding,
@@ -273,13 +273,13 @@ class TerminalRegistry:
         if not self.path.exists():
             return
         try:
-            raw = json.loads(self._read_text())
+            entries = parse_device_list(self._read_text(), "terminals")
         except Exception as exc:  # noqa: BLE001
             logger.warning("terminals.json unreadable: %s", exc)
             self._save_refused = keep_unreadable_copy(self.path)
             return
         self._unreadable = []
-        for entry in raw.get("terminals", []):
+        for entry in entries:
             try:
                 reg = TerminalRegistration.model_validate(entry)
             except Exception as exc:  # noqa: BLE001
@@ -567,7 +567,7 @@ class TerminalRegistry:
 
     def save(self) -> None:
         """Store the registrations held in memory."""
-        self._write(self._registrations)
+        self._unreadable = self._write(self._registrations)
 
     def _commit(
         self,
@@ -581,11 +581,13 @@ class TerminalRegistry:
         error the route answers is the truth and a restart loses nothing
         the dashboard showed.
         """
-        self._write(registrations)
+        # An unparsed entry replaced by this change is gone for good from
+        # here on: an unregister later must not bring it back.
+        self._unreadable = self._write(registrations)
         self._registrations = registrations
         self._legacy_ids = legacy_ids
 
-    def _write(self, registrations: Dict[str, TerminalRegistration]) -> None:
+    def _write(self, registrations: Dict[str, TerminalRegistration]) -> list:
         """Replace terminals.json in one step.
 
         Writing over the file in place truncates it first, so a power cut
@@ -609,13 +611,10 @@ class TerminalRegistry:
         each other is the whole requirement, and a nickname is Cyrillic
         in every shop we have.
         """
-        if self._save_refused is not None:
-            raise OSError(self._save_refused)
-        payload = {
-            "terminals": [r.model_dump() for r in registrations.values()]
-            + self._unreadable,
-        }
-        write_station_json(self.path, payload)
+        # Answers the unparsed entries it wrote back, for `_commit` to keep.
+        return store_registry(
+            self.path, "terminals", registrations, self._unreadable, self._save_refused,
+        )
 
     # ---------- discovery cache ----------
 

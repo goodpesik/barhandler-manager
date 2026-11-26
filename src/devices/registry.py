@@ -8,7 +8,6 @@ in memory; we close everything on shutdown.
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Dict, Optional
@@ -18,8 +17,9 @@ from src.devices.scan import discover_all
 from src.devices.printer_models import protocol_for_model
 from src.devices.station_text import (
     keep_unreadable_copy,
+    parse_device_list,
     read_station_text,
-    write_station_json,
+    store_registry,
 )
 from src.models.printer import (
     NetworkAddress,
@@ -69,14 +69,14 @@ class PrinterRegistry:
         if not self.path.exists():
             return
         try:
-            raw = json.loads(read_station_text(self.path)[0])
+            entries = parse_device_list(read_station_text(self.path)[0], "printers")
         except Exception as exc:
             logger.warning("printers.json unreadable: %s", exc)
             self._save_refused = keep_unreadable_copy(self.path)
             return
         upgraded = False
         self._unreadable = []
-        for entry in raw.get("printers", []):
+        for entry in entries:
             try:
                 reg = PrinterRegistration.model_validate(entry)
             except Exception as exc:
@@ -124,9 +124,9 @@ class PrinterRegistry:
 
     def save(self) -> None:
         """Store the registrations held in memory."""
-        self._write(self._registrations)
+        self._unreadable = self._write(self._registrations)
 
-    def _write(self, registrations: Dict[str, PrinterRegistration]) -> None:
+    def _write(self, registrations: Dict[str, PrinterRegistration]) -> list:
         """Replace printers.json in one step.
 
         Writing over the file in place truncates it first, so a power cut
@@ -156,13 +156,10 @@ class PrinterRegistry:
         # understood would delete them, and every registration change calls
         # this — so the loss would arrive later, by an unrelated hand (BH-178,
         # found by the second review round).
-        if self._save_refused is not None:
-            raise OSError(self._save_refused)
-        payload = {
-            "printers": [r.model_dump() for r in registrations.values()]
-            + self._unreadable,
-        }
-        write_station_json(self.path, payload)
+        # Answers the unparsed entries it wrote back, for `_commit` to keep.
+        return store_registry(
+            self.path, "printers", registrations, self._unreadable, self._save_refused,
+        )
 
     # ---------- discovery ----------
 
@@ -265,7 +262,9 @@ class PrinterRegistry:
 
     def _commit(self, registrations: Dict[str, PrinterRegistration]) -> None:
         """Write `registrations` to disk, and only then make them current."""
-        self._write(registrations)
+        # An unparsed entry replaced by this change is gone for good from
+        # here on: an unregister later must not bring it back.
+        self._unreadable = self._write(registrations)
         self._registrations = registrations
 
     def _drop_cached_device(self, printer_id: str) -> None:

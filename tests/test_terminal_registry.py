@@ -686,3 +686,39 @@ def test_an_entry_this_version_cannot_parse_survives_the_next_save(tmp_path: Pat
     stored = json.loads(path.read_text(encoding="utf-8"))["terminals"]
     assert unknown in stored
     assert len(stored) == 2
+
+
+@pytest.mark.parametrize("contents", [b"[1, 2]", b'"terminals"', b'{"terminals": {"a": 1}}'])
+def test_a_file_that_is_not_a_terminal_list_is_treated_as_unreadable(
+    tmp_path: Path, contents: bytes,
+) -> None:
+    """Valid JSON of the wrong shape crashed the manager's start: `load()`
+    runs in the lifespan, unguarded. It is an unreadable file like any
+    other — copied aside, and the start goes on with no terminals."""
+    path = tmp_path / "terminals.json"
+    path.write_bytes(contents)
+    registry = TerminalRegistry(path=path)
+
+    registry.load()
+
+    assert registry.all_registrations() == []
+    kept = [p.read_bytes() for p in tmp_path.glob("terminals.json.unreadable-*")]
+    assert kept == [contents]
+
+
+def test_registering_an_id_kept_unparsed_replaces_that_entry(tmp_path: Path) -> None:
+    """The unparsed entry rode along beside the fresh registration of the
+    same terminal, and the file then held two entries for one id."""
+    path = tmp_path / "terminals.json"
+    unparsed = {"descriptor": {"id": "abc123", "kind": "a-bank-from-the-future"}}
+    other = {"descriptor": {"id": "future-1", "kind": "a-bank-from-the-future"}}
+    path.write_text(json.dumps({"terminals": [unparsed, other]}), encoding="utf-8")
+    registry = TerminalRegistry(path=path)
+    registry.load()
+    registry.remember_descriptors([_descriptor()])
+
+    registry.register(TerminalRegistrationRequest(id="abc123"))
+    registry.unregister("abc123")
+
+    stored = json.loads(path.read_text(encoding="utf-8"))["terminals"]
+    assert stored == [other]

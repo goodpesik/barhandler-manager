@@ -65,6 +65,84 @@ def read_station_text(path: Path) -> tuple[str, bool]:
     return text, False
 
 
+class DeviceListNotStored(OSError):
+    """A change to printers.json or terminals.json did not reach the disk.
+
+    The app answers it with one message for every route that changes a
+    device (see `server.create_app`), so none of them can forget it.
+    """
+
+
+def parse_device_list(text: str, key: str) -> list:
+    """The entries under `key` of a registry file's text.
+
+    Raises for anything that is not an object holding a list there:
+    such a file is unreadable, not empty. An object without the
+    key at all is a registry with nothing in it.
+    """
+    # Not an object at all fails on `.get` with the same effect.
+    entries = json.loads(text).get(key, [])
+    if not isinstance(entries, list):
+        raise ValueError(f"{key!r} is not a list")
+    return entries
+
+
+def _entry_id(entry: object) -> Optional[str]:
+    descriptor = entry.get("descriptor") if isinstance(entry, dict) else None
+    entry_id = descriptor.get("id") if isinstance(descriptor, dict) else None
+    return entry_id if isinstance(entry_id, str) else None
+
+
+def unparsed_entries_beside(unparsed: list, ids: object) -> list:
+    """The unparsed entries to write back next to the registrations `ids`.
+
+    An entry whose id is registered again has been replaced by that
+    registration; writing both would leave two entries for one device.
+    """
+    taken = set(ids)
+    return [e for e in unparsed if _entry_id(e) not in taken]
+
+
+def store_device_list(path: Path, payload: dict, refused: Optional[str]) -> None:
+    """Write a registry file, or raise DeviceListNotStored saying why not."""
+    if refused is not None:
+        logger.error("%s change not stored: %s", path.name, refused)
+        raise DeviceListNotStored(refused)
+    try:
+        write_station_json(path, payload)
+    except OSError as exc:
+        logger.error("%s change not stored: %s", path.name, exc)
+        raise DeviceListNotStored(f"{path.name} could not be written: {exc}") from exc
+
+
+def store_registry(
+    path: Path, key: str, registrations: dict, unparsed: list, refused: Optional[str],
+) -> list:
+    """Write `registrations` (id -> model) under `key`, the unparsed entries
+    they do not replace beside them. Answers those unparsed entries."""
+    kept = unparsed_entries_beside(unparsed, registrations)
+    payload = {key: [r.model_dump() for r in registrations.values()] + kept}
+    store_device_list(path, payload, refused)
+    return kept
+
+
+def _latest_copy(path: Path) -> Optional[Path]:
+    copies = list(path.parent.glob(f"{path.name}.unreadable-*"))
+    if not copies:
+        return None
+    return max(copies, key=lambda p: (p.stat().st_mtime_ns, p.name))
+
+
+def _free_copy_name(path: Path) -> Path:
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    kept = path.with_name(f"{path.name}.unreadable-{stamp}")
+    suffix = 1
+    while kept.exists():
+        suffix += 1
+        kept = path.with_name(f"{path.name}.unreadable-{stamp}-{suffix}")
+    return kept
+
+
 def keep_unreadable_copy(path: Path) -> Optional[str]:
     """Copy a registry file this version cannot read next to it.
 
@@ -73,10 +151,19 @@ def keep_unreadable_copy(path: Path) -> Optional[str]:
     devices would be gone for good. Answers why saving must be refused
     for this run when the copy itself fails (the file then stays as it
     is), and None when the copy is kept.
+
+    A file identical to the latest copy is kept already: a manager
+    started again and again over the same broken file adds no copies.
+    Two different files within one second get two names.
     """
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    kept = path.with_name(f"{path.name}.unreadable-{stamp}")
     try:
+        latest = _latest_copy(path)
+        if latest is not None and latest.read_bytes() == path.read_bytes():
+            logger.warning(
+                "unreadable %s is already kept as %s; no new copy", path.name, latest.name,
+            )
+            return None
+        kept = _free_copy_name(path)
         shutil.copyfile(path, kept)
     except OSError as exc:
         refused = f"{path.name} is unreadable and could not be copied aside: {exc}"

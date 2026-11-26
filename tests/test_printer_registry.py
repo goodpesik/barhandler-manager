@@ -267,3 +267,69 @@ def test_an_unreadable_file_that_cannot_be_kept_aside_is_never_written_over(
 
     assert path.read_bytes() == broken
     assert registry.all_registrations() == []
+
+
+def test_a_file_that_is_not_a_printer_list_is_treated_as_unreadable(tmp_path: Path) -> None:
+    """Valid JSON of the wrong shape crashed the manager's start."""
+    path = tmp_path / "printers.json"
+    path.write_bytes(b"[1, 2]")
+    registry = PrinterRegistry(path=path)
+
+    registry.load()
+
+    assert registry.all_registrations() == []
+    assert [p.read_bytes() for p in tmp_path.glob("printers.json.unreadable-*")] == [b"[1, 2]"]
+
+
+def test_registering_a_printer_kept_unparsed_replaces_that_entry(tmp_path: Path) -> None:
+    path = tmp_path / "printers.json"
+    probe = PrinterRegistry(path=tmp_path / "probe.json")
+    printer_id = probe.add_manual_descriptor(host="10.0.0.12", port=9100).id
+    unparsed = {"descriptor": {"id": printer_id}, "kind": "a-role-from-the-future"}
+    other = {"descriptor": {"id": "future-1"}, "kind": "a-role-from-the-future"}
+    path.write_text(json.dumps({"printers": [unparsed, other]}), encoding="utf-8")
+    registry = PrinterRegistry(path=path)
+    registry.load()
+
+    _register_bar(registry)
+    registry.unregister(printer_id)
+
+    assert json.loads(path.read_text(encoding="utf-8"))["printers"] == [other]
+
+
+def _register_bar(registry: PrinterRegistry) -> None:
+    descriptor = registry.add_manual_descriptor(host="10.0.0.12", port=9100)
+    registry.register(RegistrationRequest(
+        id=descriptor.id, kind=PrinterKind.receipt, nickname="Bar",
+    ))
+
+
+def test_an_unchanged_unreadable_file_is_kept_aside_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every start of a manager over the same broken file added one more copy."""
+    stamps = iter(["20261126-120000", "20261126-120500"])
+    monkeypatch.setattr("src.devices.station_text.time.strftime", lambda _fmt: next(stamps))
+    path = tmp_path / "printers.json"
+    path.write_bytes(b'{"printers": [')
+
+    PrinterRegistry(path=path).load()
+    PrinterRegistry(path=path).load()
+
+    assert len(list(tmp_path.glob("printers.json.unreadable-*"))) == 1
+
+
+def test_two_unreadable_files_within_one_second_are_both_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The copy is named by the second; the second copy in that second
+    overwrote the first."""
+    monkeypatch.setattr("src.devices.station_text.time.strftime", lambda _fmt: "20261126-120000")
+    path = tmp_path / "printers.json"
+    path.write_bytes(b'{"printers": [')
+    PrinterRegistry(path=path).load()
+    path.write_bytes(b'{"printers": [{')
+    PrinterRegistry(path=path).load()
+
+    kept = sorted(p.read_bytes() for p in tmp_path.glob("printers.json.unreadable-*"))
+    assert kept == [b'{"printers": [', b'{"printers": [{']
