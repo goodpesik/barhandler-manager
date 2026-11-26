@@ -17,6 +17,7 @@ from typing import Dict, Optional
 from src.devices.printer import PrinterDevice
 from src.devices.scan import discover_all
 from src.devices.printer_models import protocol_for_model
+from src.devices.station_text import read_station_text
 from src.models.printer import (
     NetworkAddress,
     PrintProtocol,
@@ -62,7 +63,7 @@ class PrinterRegistry:
         if not self.path.exists():
             return
         try:
-            raw = json.loads(self.path.read_text())
+            raw = json.loads(read_station_text(self.path)[0])
         except Exception as exc:
             logger.warning("printers.json unreadable: %s", exc)
             return
@@ -132,16 +133,13 @@ class PrinterRegistry:
         leave NTFS holding the new name over a zero-length file, which is
         the very loss the temporary file is here to prevent.
 
-        NO EXPLICIT ENCODING ON PURPOSE, and do not add one here alone:
-        `load()` reads with a bare `read_text()`, so both halves use the
-        station's own code page and agree with each other, which is the
-        whole requirement. Giving `save()` a `utf-8` it does not give
-        `load()` is exactly the bug review found in the terminal registry
-        — the nicknames there came back as mojibake on a Ukrainian
-        Windows and raised on a Western one, which reads as no devices at
-        all. Moving this file to UTF-8 means teaching `load()` to read
-        both, as the terminal registry now does, and that is a change of
-        its own.
+        Written as UTF-8, never in the station's code page: on a Western
+        Windows (cp1252) a Cyrillic nickname cannot be encoded at all, and
+        the write raised after the registration had already changed in
+        memory — the manager answered 500, the till did not re-read its
+        table, and the change was lost on the next restart. `load()`
+        reads UTF-8 first and the code page only for a file an older
+        manager wrote (`read_station_text`).
         """
         # Entries we could not parse ride along untouched. Writing only what we
         # understood would delete them, and every registration change calls
@@ -152,7 +150,7 @@ class PrinterRegistry:
             + self._unreadable,
         }
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
-        with open(tmp, "w", newline="\n") as handle:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(json.dumps(payload, indent=2, ensure_ascii=False))
             handle.flush()
             os.fsync(handle.fileno())

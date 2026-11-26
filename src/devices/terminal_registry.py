@@ -9,15 +9,14 @@ maintained here so the route layer never imports a specific vendor.
 
 from __future__ import annotations
 
-import codecs
 import json
-import locale
 import logging
 import os
 import shutil
 from pathlib import Path
 from typing import Dict, Optional, Type
 
+from src.devices.station_text import read_station_text
 from src.models.terminal import (
     MerchantBinding,
     TerminalDescriptor,
@@ -76,26 +75,6 @@ _ADAPTER_FOR_KIND: Dict[TerminalKind, Type[TerminalAdapter]] = {
     # Oschadbank
     TerminalKind.oschad_pos: OschadTerminalAdapter,
 }
-
-
-def _station_encoding() -> str:
-    """The code page a manager older than PET-1304 wrote this file in.
-
-    Up to v1.0.10 both halves of the registry used the station's own
-    encoding, which on a Ukrainian Windows is cp1251 and on a Western
-    one cp1252 — the ANSI code page, whatever `read_text()` without an
-    encoding picks. It is only ever used to READ such a file; nothing
-    is written in it any more.
-
-    On Windows that is the ANSI code page itself (`mbcs`), not the
-    locale setting of today's interpreter: the file was written by a
-    build that had no say in the matter, and this one could be started
-    in UTF-8 mode, which would leave the old file unreadable and the
-    shop with no terminals.
-    """
-    if os.name == "nt":
-        return "mbcs"
-    return locale.getpreferredencoding(False) or "utf-8"
 
 
 def _address_of(reg: TerminalRegistration) -> str:
@@ -277,27 +256,7 @@ class TerminalRegistry:
         the two cannot be confused. Such a file is marked for one
         rewrite, after which it is UTF-8 like every other.
         """
-        data = self.path.read_bytes()
-        try:
-            self._stored_as_utf8 = True
-            return data.decode("utf-8")
-        except UnicodeDecodeError:
-            fallback = _station_encoding()
-            if codecs.lookup(fallback).name == "utf-8":
-                # Nothing else to try — the file is simply broken, and
-                # the re-raise has to happen in here while that is still
-                # the exception being handled; outside, a bare `raise`
-                # is a RuntimeError and the log would name the wrong
-                # reason the file could not be read.
-                raise
-        text = data.decode(fallback)
-        self._stored_as_utf8 = False
-        logger.info(
-            "%s was written by an older manager in this station's code "
-            "page (%s) — read as such and rewritten as UTF-8, so the "
-            "terminal nicknames stay readable",
-            self.path, fallback,
-        )
+        text, self._stored_as_utf8 = read_station_text(self.path)
         return text
 
     def load(self) -> None:

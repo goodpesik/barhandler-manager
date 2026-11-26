@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from src.devices import terminal_registry
+from src.devices import station_text
 from src.devices.terminal_registry import TerminalRegistry, UnknownTerminal
 from src.models.terminal import (
     MerchantBinding,
@@ -480,7 +480,7 @@ def test_a_cyrillic_nickname_round_trips_through_save_and_load(
     the file reads as no terminals at all, after which the first
     registration writes over every terminal the shop had."""
     monkeypatch.setattr(
-        terminal_registry, "_station_encoding", lambda: "cp1251",
+        station_text, "station_encoding", lambda: "cp1251",
     )
     path = tmp_path / "terminals.json"
     registry = TerminalRegistry(path=path)
@@ -505,7 +505,7 @@ def test_a_file_written_in_the_stations_code_page_is_still_read(
     registrations, and the next register() overwrites it — and it is
     put back as UTF-8 so this is the last start that has to guess."""
     monkeypatch.setattr(
-        terminal_registry, "_station_encoding", lambda: "cp1251",
+        station_text, "station_encoding", lambda: "cp1251",
     )
     path = tmp_path / "terminals.json"
     descriptor = _descriptor()
